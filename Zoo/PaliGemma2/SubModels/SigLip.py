@@ -19,7 +19,16 @@ from typing import Any, Tuple
 import torch
 from torch import nn
 
-__all__ = ["SigLipVisionConfig", "SigLipVisionEmbeddings"]
+__all__ = [
+    "SigLipVisionConfig",
+    "SigLipVisionEmbeddings",
+    "SigLipAttention",
+    "SigLipMLP",
+    "SigLipEncoderLayer",
+    "SigLipEncoder",
+    "SigLipVisionTransformer",
+    "SigLipVisionModel",
+]
 
 
 @dataclass
@@ -45,6 +54,8 @@ class SigLipVisionConfig:
     projection_dim: int = 2304
     num_channels: int = 3
     image_size: int = 224
+    layer_norm_eps: float = 1e-5
+    attention_dropout: float = 0.0
     extra: Any = None
 
     def __post_init__(self) -> None:
@@ -136,14 +147,30 @@ class SigLipVisionEmbeddings(nn.Module):
 
 
 class SigLipAttention(nn.Module):
-    def __init__(self, config) -> None:
+    """Multi-head scaled dot-product attention module.
+
+    Implements standard scaled dot-product attention with multiple heads,
+    projecting input onto query, key, and value spaces before computing attention.
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        hidden_state (torch.Tensor): Input tensor of shape `(B, seq_len, embed_dim)`.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Attention output of shape `(B, seq_len, embed_dim)`
+            and attention weights of shape `(B, num_heads, seq_len, seq_len)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim**-0.5
-        self.dropout = config.attention_dropout
+        self.embed_dim: int = config.hidden_size
+        self.num_heads: int = config.num_attention_heads
+        self.head_dim: int = self.embed_dim // self.num_heads
+        self.scale: float = self.head_dim**-0.5
+        self.dropout: float = config.attention_dropout
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -185,17 +212,33 @@ class SigLipAttention(nn.Module):
 
 
 class SigLipMLP(nn.Module):
-    def __init__(self, config) -> None:
+    """Feed-forward network (MLP) module.
+
+    A two-layer MLP with GELU activation, used as the feed-forward
+    component in transformer encoder layers.
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        hidden_state (torch.Tensor): Input tensor of shape `(B, seq_len, embed_dim)`.
+
+    Returns:
+        torch.Tensor: Output tensor of shape `(B, seq_len, embed_dim)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.intermediate_dim = config.intermediate_size
+        self.embed_dim: int = config.hidden_size
+        self.intermediate_dim: int = config.intermediate_size
 
         self.fc1 = nn.Linear(self.embed_dim, self.intermediate_dim)
         self.fc2 = nn.Linear(self.intermediate_dim, self.embed_dim)
         self.activation = nn.GELU()
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Compute MLP forward pass."""
         x = self.fc1(hidden_state)
         x = self.activation(x)
         x = self.fc2(x)
@@ -203,20 +246,36 @@ class SigLipMLP(nn.Module):
 
 
 class SigLipEncoderLayer(nn.Module):
-    def __init__(self, config) -> None:
+    """Single transformer encoder layer with attention and feed-forward networks.
+
+    Combines multi-head self-attention with an MLP in a residual configuration
+    using layer normalization (pre-norm architecture).
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        hidden_state (torch.Tensor): Input tensor of shape `(B, seq_len, embed_dim)`.
+
+    Returns:
+        torch.Tensor: Output tensor of shape `(B, seq_len, embed_dim)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
         self.attention = SigLipAttention(config)
         self.mlp = SigLipMLP(config)
-        self.layer_norm1 = nn.LayerNorm(config.hidden_size)
-        self.layer_norm2 = nn.LayerNorm(config.hidden_size)
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        # Self-attention block
+        """Compute encoder layer forward pass with pre-normalization."""
+        # Self-attention block with residual connection
         attn_output, _ = self.attention(self.layer_norm1(hidden_state))
         hidden_state = hidden_state + attn_output
 
-        # MLP block
+        # MLP block with residual connection
         mlp_output = self.mlp(self.layer_norm2(hidden_state))
         hidden_state = hidden_state + mlp_output
 
@@ -224,7 +283,22 @@ class SigLipEncoderLayer(nn.Module):
 
 
 class SigLipEncoder(nn.Module):
-    def __init__(self, config) -> None:
+    """Stack of transformer encoder layers.
+
+    Applies a sequence of transformer encoder layers to progressively
+    refine the token representations through self-attention and feed-forward.
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        hidden_state (torch.Tensor): Input tensor of shape `(B, seq_len, embed_dim)`.
+
+    Returns:
+        torch.Tensor: Output tensor of shape `(B, seq_len, embed_dim)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
@@ -232,22 +306,40 @@ class SigLipEncoder(nn.Module):
         )
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Pass input through all encoder layers sequentially."""
         for layer in self.layers:
             hidden_state = layer(hidden_state)
         return hidden_state
 
 
 class SigLipVisionTransformer(nn.Module):
-    def __init__(self, config) -> None:
+    """Vision transformer backbone for patch-based image encoding.
+
+    Combines patch embeddings with positional information, applies a stack
+    of transformer encoder layers, and includes post-normalization for stable
+    feature outputs.
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        pixel_values (torch.Tensor): Input images of shape `(B, C, H, W)`.
+
+    Returns:
+        torch.Tensor: Encoded patch embeddings of shape `(B, num_patches, embed_dim)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
-        embed_dim = config.hidden_size
+        embed_dim: int = config.hidden_size
 
         self.embeddings = SigLipVisionEmbeddings(config)
         self.encoder = SigLipEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode images into patch embeddings through the vision transformer."""
         x = self.embeddings(pixel_values)
         x = self.encoder(x)
         x = self.post_layernorm(x)
@@ -255,10 +347,26 @@ class SigLipVisionTransformer(nn.Module):
 
 
 class SigLipVisionModel(nn.Module):
-    def __init__(self, config) -> None:
+    """High-level vision model wrapper for SigLip vision transformer.
+
+    Provides a unified interface to the vision transformer, encapsulating
+    the complete image encoding pipeline.
+
+    Args:
+        config: SigLipVisionConfig instance with model hyperparameters.
+
+    Forward Args:
+        pixel_values (torch.Tensor): Input images of shape `(B, C, H, W)`.
+
+    Returns:
+        torch.Tensor: Encoded patch embeddings of shape `(B, num_patches, embed_dim)`.
+    """
+
+    def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
         self.vision_model = SigLipVisionTransformer(config)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode input images into patch embeddings."""
         return self.vision_model(pixel_values)
