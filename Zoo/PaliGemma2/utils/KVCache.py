@@ -41,6 +41,18 @@ class KVCache:
         """
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
+        
+    def num_items(self) -> int:
+        """Return the number of cached items (tokens) in the cache.
+        Assumes all layers have the same sequence length in their cached tensors.
+        Returns:
+            int: The number of cached tokens, determined by the sequence length
+                dimension of the first layer's cached key tensor. Returns 0 if
+                the cache is empty.
+        """
+        if not self.key_cache:
+            return 0
+        return self.key_cache[0].shape[2]  # seq_length dimension
 
     def update(
         self,
