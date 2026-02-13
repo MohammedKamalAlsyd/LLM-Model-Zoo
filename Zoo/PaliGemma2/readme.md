@@ -6,7 +6,7 @@ A modular, from-scratch implementation of the **PaliGemma 2** Vision-Language Mo
 
 PaliGemma 2 follows a standard multimodal architecture: it "sees" by encoding images into patches, projects those patches into the language model's embedding space, and then "speaks" by generating text based on the combined visual and textual context.
 
-![PaliGemma 2 Architecture](Zoo/PaliGemma2/assets/HigeViewModelArchitecture.png)
+![PaliGemma 2 Architecture](./assets/HigeViewModelArchitecture.png)
 
 ## 🔄 Logic Flow & Inference Pipeline
 
@@ -15,31 +15,31 @@ The following chart illustrates how data flows from the user input through the s
 ```mermaid
 graph TD
     %% Input Stage
-    User([User Input]) -->|Raw Image| P_Img[Processor: Resize & Normalize]
-    User -->|Text Prompt| P_Txt[Processor: Tokenize & Add Special Tokens]
+    User[User Input] -->|Raw Image| P_Img[Processor Resize and Normalize]
+    User -->|Text Prompt| P_Txt[Processor Tokenize and Add Tokens]
 
     %% Vision Encoding Stage
     subgraph Vision_Tower [SigLip Vision Encoder]
         direction TB
-        P_Img -->|Pixel Values (3, 224, 224)| SigLip[SigLip Transformer]
+        P_Img -->|Pixel Values 3x224x224| SigLip[SigLip Transformer]
         SigLip -->|Patch Embeddings| SigLip_Out[Vision Embeddings]
     end
 
     %% Projection Stage
     subgraph Connection [Multi-Modal Projector]
-        SigLip_Out -->|Linear Layer| Projector[Project to 2304 dim]
-        Projector -->|Visual Tokens| Concat
+        SigLip_Out -->|Linear Layer| Projector[Project to 2304 Dim]
+        Projector -->|Visual Tokens| Concat[Concatenation]
     end
 
     %% Language Modeling Stage
     subgraph Language_Model [Gemma 2 Decoder]
         P_Txt -->|Input IDs| Embed[Text Embeddings]
 
-        Concat(Concatenation) -->|Merged: <Image Tokens> + <Text Tokens>| Decoder[Gemma 2 Layers]
         Embed --> Concat
+        Concat -->|Merged Image and Text Tokens| Decoder[Gemma 2 Layers]
 
         Decoder -->|Hidden States| LM_Head[LM Head]
-        LM_Head -->|Logits| Sampler{Greedy / Sampling}
+        LM_Head -->|Logits| Sampler[Greedy or Sampling]
 
         Sampler -->|Next Token| Output_Buf[Generated Token Buffer]
 
@@ -49,8 +49,8 @@ graph TD
     end
 
     %% Output Stage
-    Output_Buf -->|End of Sequence?| Detokenizer[Detokenizer]
-    Detokenizer --> Final([Final Text Prediction])
+    Output_Buf -->|End of Sequence| Detokenizer[Detokenizer]
+    Detokenizer --> Final[Final Text Prediction]
 
     style Vision_Tower fill:#e1f5fe,stroke:#01579b
     style Language_Model fill:#e8f5e9,stroke:#1b5e20
