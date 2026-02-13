@@ -58,8 +58,9 @@ class Gemma2Config:
         bos_token_id (int): Beginning-of-sequence token ID.
         image_token_id (int): Special token ID for images.
         attention_dropout (float): Dropout rate in attention.
-        rope_base (int): Base for RoPE embeddings.
+        rope_theta (int): Base for RoPE embeddings (Renamed from rope_base).
         query_pre_attn_scalar (float): Scaling factor for queries.
+        attention_bias (bool): Whether to use bias in attention projections.
         attn_logit_softcapping (Optional[float]): Softcap for attention logits.
         final_logit_softcapping (Optional[float]): Softcap for final logits.
     """
@@ -79,8 +80,9 @@ class Gemma2Config:
     bos_token_id: int
     image_token_id: int
     attention_dropout: float
-    rope_base: int
+    rope_theta: int
     query_pre_attn_scalar: float
+    attention_bias: bool = True
     attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: Optional[float] = None
 
@@ -260,7 +262,7 @@ class Gemma2RotaryEmbedding(nn.Module):
         Returns:
             Tuple[torch.Tensor, float]: Inverse frequencies and attention scaling factor.
         """
-        base = config.rope_base
+        base = config.rope_theta
         dim = (
             getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads
@@ -473,17 +475,18 @@ class Gemma2Attention(nn.Module):
         self.scaling: float = config.query_pre_attn_scalar**-0.5
         self.attention_dropout_layer = nn.Dropout(config.attention_dropout)
 
+        # Gemma 2 uses bias=True by default for projections, unlike Llama
         self.q_proj = nn.Linear(
-            self.hidden_size, self.num_attention_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-        self.out_proj = nn.Linear(
-            self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
         self.attn_logit_softcapping: Optional[float] = config.attn_logit_softcapping
 
@@ -618,7 +621,7 @@ class Gemma2Attention(nn.Module):
 
         # Merge heads and project to output
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.out_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
     
@@ -715,7 +718,7 @@ class Gemma2DecoderLayer(nn.Module):
         Returns:
             torch.Tensor: Output hidden states of same shape as input.
         """
-        # Self-attention block with pre-normalization and residual
+        # Self-attention block with sandwich normalization
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_output, attn_weights = self.self_attn(
@@ -725,14 +728,16 @@ class Gemma2DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             cache_position=cache_position,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Post-norm applies to the output of the attention mechanism, not the residual stream
+        attn_output = self.post_attention_layernorm(attn_output)
         hidden_states = residual + attn_output
 
-        # Feed-forward block with pre-normalization and residual
+        # Feed-forward block with sandwich normalization
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         mlp_output = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # Post-norm applies to the output of the MLP, not the residual stream
+        mlp_output = self.post_feedforward_layernorm(mlp_output)
         hidden_states = residual + mlp_output
 
         return hidden_states
@@ -843,6 +848,7 @@ class Gemma2ForCausalLM(nn.Module):
             config (Gemma2Config): Model configuration.
         """
         super().__init__()
+        self.config = config
         self.model = Gemma2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -875,10 +881,14 @@ class Gemma2ForCausalLM(nn.Module):
             cache_position=position_ids,  # Use position_ids as cache_position for RoPE
         )
         
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()  # Ensure logits are in float32 for numerical stability
         
+        # Final Logit Soft-Capping
+        if self.config.final_logit_softcapping is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
         
-        logits = self.lm_head(hidden_states)
         return {"logits": logits}
