@@ -486,7 +486,6 @@ class Gemma2Attention(nn.Module):
             self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
         )
         self.attn_logit_softcapping: Optional[float] = config.attn_logit_softcapping
-        self.rotary_emb = Gemma2RotaryEmbedding(config)
 
     def attention_forward(
         self,
@@ -737,3 +736,149 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states = residual + mlp_output
 
         return hidden_states
+    
+    
+class Gemma2Model(nn.Module):
+    """Complete Gemma2 language model.
+
+    Combines token embeddings, multiple decoder layers, and final output projection.
+    Designed for autoregressive language modeling with efficient attention and
+    stable training.
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        token_embedding (nn.Embedding): Token embedding layer.
+        layers (nn.ModuleList): List of decoder layers.
+        final_layernorm (Gemma2RMSNorm): Final layer normalization before output.
+        output_projection (nn.Linear): Projection to vocabulary logits.
+    """
+
+    def __init__(self, config: Gemma2Config) -> None:
+        """Initialize Gemma2 model.
+
+        Args:
+            config (Gemma2Config): Model configuration.
+        """
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        
+        # Layer definitions
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        self.layers = nn.ModuleList(
+            [Gemma2DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Gemma2RotaryEmbedding(config)
+        
+        
+    def forward(self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass through the complete Gemma2 model.
+
+        Args:
+            input_ids (torch.LongTensor): Input token IDs.
+            attention_mask (Optional[torch.Tensor]): Attention mask.
+            past_key_values (Optional[Tuple]): Cached KV for incremental decoding.
+            cache_position (Optional[torch.LongTensor]): Cache positions.
+
+        Returns:
+            torch.Tensor: Output logits of shape (batch, seq_len, vocab_size).
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        
+        # Embedding lookup
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+
+        # Rotary embedding
+        positional_embedding = self.rotary_emb(hidden_states, cache_position=cache_position)
+
+        # normalized
+        # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
+        # See https://github.com/huggingface/transformers/pull/29402
+        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
+        hidden_states = hidden_states * normalizer
+
+        # Decoder layers
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                positional_embedding=positional_embedding,
+                attention_mask=attention_mask,
+                past_key_value=past_key_values,
+                cache_position=cache_position,
+            )
+
+        # Final normalization
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+    
+    
+class Gemma2ForCausalLM(nn.Module):
+    """Gemma2 model with language modeling head for causal language modeling.
+
+    Combines the base Gemma2Model with a final linear layer to project hidden states
+    to vocabulary logits for autoregressive generation.
+
+    Attributes:
+        model (Gemma2Model): Base Gemma2 model.
+        lm_head (nn.Linear): Linear layer to project hidden states to vocab logits.
+    """
+
+    def __init__(self, config: Gemma2Config) -> None:
+        """Initialize Gemma2ForCausalLM.
+
+        Args:
+            config (Gemma2Config): Model configuration.
+        """
+        super().__init__()
+        self.model = Gemma2Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def tie_weights(self) -> None:
+        """Tie the weights of the language modeling head to the token embeddings."""
+        self.lm_head.weight = self.model.embed_tokens.weight
+        
+    def forward(self,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                inputs_embeds: Optional[torch.Tensor] = None,
+                past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Forward pass through the Gemma2 model and language modeling head.
+
+        Args:
+            attention_mask (Optional[torch.Tensor]): Attention mask.
+            position_ids (Optional[torch.LongTensor]): Position IDs for rotary embeddings.
+            inputs_embeds (Optional[torch.Tensor]): Input embeddings (if not using input_ids).
+            past_key_values (Optional[Tuple]): Cached KV for incremental decoding.
+        Returns:
+            torch.Tensor: Output logits of shape (batch, seq_len, vocab_size).
+        """
+        outputs = self.model(
+            input_ids=None,  # input_ids are not used when inputs_embeds are provided
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            cache_position=position_ids,  # Use position_ids as cache_position for RoPE
+        )
+        
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()  # Ensure logits are in float32 for numerical stability
+        
+        
+        logits = self.lm_head(hidden_states)
+        return {"logits": logits}
