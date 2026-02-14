@@ -10,7 +10,7 @@ values provided in the reference JSON.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 from torch import nn
 import torch
 
@@ -21,7 +21,6 @@ from SubModels.PaliGemmaProjector import PaliGemmaMultiModalProjector
 from utils.KVCache import KVCache
 
 
-@dataclass
 class PaliGemma2Config:
     """
     Top-level configuration for the PaliGemma2 multimodal model.
@@ -42,49 +41,37 @@ class PaliGemma2Config:
     projection_dim: int = 2304
     torch_dtype: str = "bfloat16"
 
-    def __post_init__(self) -> None:
+    def __init__(self, main_config: dict[str, Any]) -> None:
         """
         Initialize sub-configs using values from the provided JSON
         if they were not explicitly passed.
         """
 
-        if self.text_config is None:
-            self.text_config = Gemma2Config(
-                vocab_size=257216,
-                hidden_size=2304,
-                intermediate_size=9216,
-                num_attention_heads=8,
-                num_hidden_layers=26,
-                num_key_value_heads=4,
-                sliding_window=4096,
-                head_dim=2304 // 8,
-                max_position_embeddings=4096,
-                rms_norm_eps=1e-6,
-                pad_token_id=0,
-                eos_token_id=1,  # primary EOS (JSON had [1, 107])
-                bos_token_id=2,
-                image_token_id=257152,
-                attention_dropout=0.0,
-                rope_theta=100000,
-                query_pre_attn_scalar=256,
-                attention_bias=True,
-                attn_logit_softcapping=50.0,
-                final_logit_softcapping=30.0,
-            )
+        self.config = main_config  # Store the main config for reference
 
-        if self.vision_config is None:
-            self.vision_config = SigLipVisionConfig(
-                hidden_size=1152,
-                intermediate_size=4304,
-                num_attention_heads=16,
-                num_hidden_layers=27,
-                patch_size=14,
-                projection_dim=2304,
-                image_size=224,
-                num_channels=3,
-                attention_dropout=0.0,
-                layer_norm_eps=1e-5,
-            )
+        # Access the needed values from the main config
+        self.bos_token_id = main_config.get("bos_token_id", 2)
+        self.eos_token_id = main_config.get("eos_token_id", 1)
+        self.pad_token_id = main_config.get("pad_token_id", 0)
+
+        # Sub-model configs
+        text_config_dict = main_config.get("text_config", {})
+        vision_config_dict = main_config.get("vision_config", {})
+
+        # Ensure text_config_dict is a dictionary before unpacking
+        keys_to_keep = Gemma2Config.__dataclass_fields__.keys()
+        filtered_dict = {k: v for k, v in text_config_dict.items() if k in keys_to_keep}
+        filtered_dict["pad_token_id"] = self.pad_token_id
+        filtered_dict["eos_token_id"] = self.eos_token_id
+        filtered_dict["bos_token_id"] = self.bos_token_id
+        self.text_config = Gemma2Config(**filtered_dict)
+
+        # Ensure vision_config_dict is a dictionary before unpacking
+        keys_to_keep = SigLipVisionConfig.__dataclass_fields__.keys()
+        filtered_dict = {
+            k: v for k, v in vision_config_dict.items() if k in keys_to_keep
+        }
+        self.vision_config = SigLipVisionConfig(**filtered_dict)
 
 
 class PaliGemma2ForConditionalGeneration(nn.Module):
@@ -114,17 +101,17 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             hidden_size=config.projection_dim,
             vision_projection_dim=config.vision_config.projection_dim,
         )
-        
+
     def tie_weights(self):
         return self.language_model.tie_weights()
 
     def _merge_input_ids_with_image_features(
         self,
-        image_features: torch.Tensor,          # (B, N_img, H)
-        inputs_embeds: torch.Tensor,            # (B, T, H)
-        input_ids: torch.Tensor,                # (B, T)
-        attention_mask: torch.Tensor,            # (B, T)
-        kv_cache: Optional[KVCache] = None,       # kept generic on purpose
+        image_features: torch.Tensor,  # (B, N_img, H)
+        inputs_embeds: torch.Tensor,  # (B, T, H)
+        input_ids: torch.Tensor,  # (B, T)
+        attention_mask: torch.Tensor,  # (B, T)
+        kv_cache: Optional[KVCache] = None,  # kept generic on purpose
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Replace image token embeddings with projected vision features
@@ -138,7 +125,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         # --------------------------------------------------
         # Scale image features (Gemma-style)
         # --------------------------------------------------
-        image_features = image_features / (hidden_size ** 0.5)
+        image_features = image_features / (hidden_size**0.5)
 
         # Final embedding buffer
         final_embeddings = torch.zeros(
@@ -175,7 +162,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         # Build causal attention mask
         # --------------------------------------------------
         q_len = seq_len
-        
+
         if kv_cache is None:
             # Prefill phase (no cache)
             causal_mask = torch.zeros(
@@ -185,9 +172,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             # Decode phase (single token query)
             assert q_len == 1
             kv_len = kv_cache.num_items() + 1
-            causal_mask = torch.zeros(
-                batch_size, 1, kv_len, device=device, dtype=dtype
-            )
+            causal_mask = torch.zeros(batch_size, 1, kv_len, device=device, dtype=dtype)
 
         # Add head dimension: (B, 1, Q, K)
         causal_mask = causal_mask.unsqueeze(1)
@@ -204,7 +189,6 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             position_ids = position_ids.masked_fill(attention_mask == 0, 1)
 
         return final_embeddings, causal_mask, position_ids
-
 
     def forward(
         self,

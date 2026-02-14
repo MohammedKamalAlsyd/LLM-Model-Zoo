@@ -45,7 +45,7 @@ def load_hf_model(model_path: Union[str, Path], device: str = "cpu") -> Tuple[Pa
         raise FileNotFoundError(f"config.json not found in {model_path}")
     with config_file.open("r", encoding="utf-8") as f:
         model_config = json.load(f)
-    config = PaliGemma2Config(**model_config)
+    config = PaliGemma2Config(model_config)
 
     # Instantiate model and move to device
     model = PaliGemma2ForConditionalGeneration(config).to(device)

@@ -50,14 +50,9 @@ class Gemma2Config:
         num_hidden_layers (int): Number of transformer layers.
         num_key_value_heads (int): Number of key-value heads for GQA.
         sliding_window (int): Window size for sliding window attention.
-        head_dim (int): Dimension per attention head.
-        max_position_embeddings (int): Maximum sequence length.
-        rms_norm_eps (float): Epsilon for RMSNorm stability.
         pad_token_id (int): Padding token ID.
         eos_token_id (int): End-of-sequence token ID.
         bos_token_id (int): Beginning-of-sequence token ID.
-        image_token_id (int): Special token ID for images.
-        attention_dropout (float): Dropout rate in attention.
         rope_theta (int): Base for RoPE embeddings (Renamed from rope_base).
         query_pre_attn_scalar (float): Scaling factor for queries.
         attention_bias (bool): Whether to use bias in attention projections.
@@ -72,17 +67,12 @@ class Gemma2Config:
     num_hidden_layers: int
     num_key_value_heads: int
     sliding_window: int
-    head_dim: int
-    max_position_embeddings: int
-    rms_norm_eps: float
     pad_token_id: int
     eos_token_id: int
     bos_token_id: int
-    image_token_id: int
-    attention_dropout: float
-    rope_theta: int
     query_pre_attn_scalar: float
     attention_bias: bool = True
+    rope_theta: Optional[int] = 10_000
     attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: Optional[float] = None
 
@@ -94,8 +84,6 @@ class Gemma2RMSNorm(nn.Module):
 
     Attributes:
         weight (nn.Parameter): Learnable gain parameter.
-        eps (float): Small value for numerical stability.
-
     Shape:
         - Input: `(*, hidden_size)`
         - Output: `(*, hidden_size)`
@@ -106,7 +94,6 @@ class Gemma2RMSNorm(nn.Module):
 
         Args:
             dim (int): Dimension of the input features.
-            eps (float): Small constant for numerical stability. Defaults to 1e-6.
         """
         super().__init__()
         self.eps = eps
@@ -228,7 +215,9 @@ class Gemma2RotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor  # For type checking during registration
 
-    def __init__(self, config: Gemma2Config, device: Optional[torch.device] = None) -> None:
+    def __init__(
+        self, config: Gemma2Config, device: Optional[torch.device] = None
+    ) -> None:
         """Initialize rotary embeddings.
 
         Args:
@@ -236,8 +225,6 @@ class Gemma2RotaryEmbedding(nn.Module):
             device (Optional[torch.device]): Device to place tensors on.
         """
         super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
         self.config = config
 
         rope_init_fn: Callable = self.compute_default_rope_parameters
@@ -250,7 +237,6 @@ class Gemma2RotaryEmbedding(nn.Module):
         self,
         config: Gemma2Config,
         device: Optional[torch.device] = None,
-        seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, float]:
         """Compute inverse frequencies for RoPE.
 
@@ -262,7 +248,7 @@ class Gemma2RotaryEmbedding(nn.Module):
         Returns:
             Tuple[torch.Tensor, float]: Inverse frequencies and attention scaling factor.
         """
-        base = config.rope_theta
+        base = config.rope_theta if config.rope_theta is not None else 10_000
         dim = (
             getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads
@@ -464,29 +450,35 @@ class Gemma2Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.attention_dropout: float = config.attention_dropout
         self.hidden_size: int = config.hidden_size
         self.num_attention_heads: int = config.num_attention_heads
-        self.head_dim: int = (
-            config.head_dim or config.hidden_size // config.num_attention_heads
-        )
+        self.head_dim: int = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads: int = config.num_key_value_heads
-        self.num_key_value_groups: int = self.num_attention_heads // self.num_key_value_heads
+        self.num_key_value_groups: int = (
+            self.num_attention_heads // self.num_key_value_heads
+        )
         self.scaling: float = config.query_pre_attn_scalar**-0.5
-        self.attention_dropout_layer = nn.Dropout(config.attention_dropout)
 
         # Gemma 2 uses bias=True by default for projections, unlike Llama
         self.q_proj = nn.Linear(
-            self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
+            self.num_attention_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
         )
         self.attn_logit_softcapping: Optional[float] = config.attn_logit_softcapping
 
@@ -539,9 +531,6 @@ class Gemma2Attention(nn.Module):
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
         ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
 
         # Compute attention output
         attn_output = torch.matmul(attn_weights, value_states)
@@ -624,8 +613,8 @@ class Gemma2Attention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
-    
-    
+
+
 class Gemma2DecoderLayer(nn.Module):
     """Single transformer decoder layer with attention and feed-forward.
 
@@ -675,16 +664,10 @@ class Gemma2DecoderLayer(nn.Module):
         self.mlp = Gemma2MLP(config)
 
         # Pre-normalization layers
-        self.input_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = Gemma2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = Gemma2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = Gemma2RMSNorm(config.hidden_size)
+        self.post_attention_layernorm = Gemma2RMSNorm(config.hidden_size)
+        self.pre_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size)
+        self.post_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size)
 
     def forward(
         self,
@@ -741,8 +724,8 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states = residual + mlp_output
 
         return hidden_states
-    
-    
+
+
 class Gemma2Model(nn.Module):
     """Complete Gemma2 language model.
 
@@ -768,17 +751,22 @@ class Gemma2Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        
+
         # Layer definitions
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Gemma2DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=self.padding_idx
         )
-        self.norm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            [
+                Gemma2DecoderLayer(config, layer_idx=i)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = Gemma2RMSNorm(config.hidden_size)
         self.rotary_emb = Gemma2RotaryEmbedding(config)
-        
-        
-    def forward(self,
+
+    def forward(
+        self,
         input_ids: torch.LongTensor,
         inputs_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -797,8 +785,10 @@ class Gemma2Model(nn.Module):
             torch.Tensor: Output logits of shape (batch, seq_len, vocab_size).
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
+
         # Embedding lookup
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -806,12 +796,16 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         # Rotary embedding
-        positional_embedding = self.rotary_emb(hidden_states, cache_position=cache_position)
+        positional_embedding = self.rotary_emb(
+            hidden_states, cache_position=cache_position
+        )
 
         # normalized
         # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
         # See https://github.com/huggingface/transformers/pull/29402
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states = hidden_states * normalizer
 
         # Decoder layers
@@ -828,8 +822,8 @@ class Gemma2Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
-    
-    
+
+
 class Gemma2ForCausalLM(nn.Module):
     """Gemma2 model with language modeling head for causal language modeling.
 
@@ -856,12 +850,13 @@ class Gemma2ForCausalLM(nn.Module):
     def tie_weights(self) -> None:
         """Tie the weights of the language modeling head to the token embeddings."""
         self.lm_head.weight = self.model.embed_tokens.weight
-        
-    def forward(self,
-                attention_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
-                inputs_embeds: Optional[torch.Tensor] = None,
-                past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+
+    def forward(
+        self,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass through the Gemma2 model and language modeling head.
 
@@ -880,15 +875,15 @@ class Gemma2ForCausalLM(nn.Module):
             past_key_values=past_key_values,
             cache_position=position_ids,  # Use position_ids as cache_position for RoPE
         )
-        
+
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()  # Ensure logits are in float32 for numerical stability
-        
+
         # Final Logit Soft-Capping
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.config.final_logit_softcapping
-        
+
         return {"logits": logits}
