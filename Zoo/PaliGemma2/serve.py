@@ -5,8 +5,22 @@ import torch
 import gradio as gr
 from PIL import Image
 from transformers import AutoTokenizer
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, login
 from safetensors.torch import load_file
+from dotenv import load_dotenv
+
+
+# Load environment variables from .env file
+load_dotenv()
+HuggingFaceHubToken = os.getenv("HUGGING_FACE_HUB_TOKEN")
+
+if not HuggingFaceHubToken:
+    print("Error: Hugging Face Hub token not found in environment variables.")
+    print("Please set HUGGING_FACE_HUB_TOKEN in your .env file.")
+    sys.exit(1)
+
+login(token=HuggingFaceHubToken)
+os.environ["HF_TOKEN"] = HuggingFaceHubToken
 
 # Add Zoo to path to allow imports from your structure
 sys.path.append(os.path.join(os.path.dirname(__file__), "Zoo", "PaliGemma2"))
@@ -20,7 +34,7 @@ from utils.KVCache import KVCache
 # Replace this with the Hugging Face Repo ID that matches your architecture.
 # Since this architecture mixes Gemma2 and SigLip, ensure the weights match.
 # If this is a custom model you trained, put your repo ID here.
-HF_MODEL_ID = "google/paligemma-3b-pt-224" # Placeholder: Adjust if using specific Gemma2 weights
+HF_MODEL_ID = "google/paligemma2-3b-pt-224" # Placeholder: Adjust if using specific Gemma2 weights
 LOCAL_SAVE_DIR = "./saved_model"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
@@ -90,6 +104,8 @@ def download_and_load_weights(model, hf_id, local_dir):
     Saves the aligned weights locally.
     """
     weights_path = os.path.join(local_dir, "paligemma2_custom.pth")
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 
     if os.path.exists(weights_path):
         print(f"Loading weights from local cache: {weights_path}")
@@ -97,7 +113,7 @@ def download_and_load_weights(model, hf_id, local_dir):
     else:
         print(f"Downloading weights from Hugging Face: {hf_id}...")
         try:
-            model_path = snapshot_download(repo_id=hf_id, allow_patterns=["*.safetensors", "*.bin"])
+            model_path = snapshot_download(repo_id=hf_id, allow_patterns=["*.safetensors", "model.safetensors.index.json"])
             
             # Load safetensors preferably
             safetensors_file = os.path.join(model_path, "model.safetensors")
@@ -132,7 +148,8 @@ def download_and_load_weights(model, hf_id, local_dir):
             
         except Exception as e:
             print(f"Error downloading/processing weights: {e}")
-            print("Initializing with random weights for demonstration purposes.")
+            print("Go & Edit TOken Permission to allow read access to the model repository under Repositories permissions, and ensure the HF_MODEL_ID is correct.")
+            exit(1) # Exit since weights are essential for meaningful inference
             return model
 
     # Load into model
@@ -228,7 +245,11 @@ def main():
     model = PaliGemma2ForConditionalGeneration(config)
     
     # 3. Load Weights (Download -> Save -> Load)
-    model = download_and_load_weights(model, HF_MODEL_ID, LOCAL_SAVE_DIR)
+    try:
+        model = download_and_load_weights(model, HF_MODEL_ID, LOCAL_SAVE_DIR)
+    except Exception as e:
+        print(f"Error loading weights: {e}")
+        print("Make Sure you acknowledge Paligemma2's license and have the correct HF_MODEL_ID set")
     
     model.to(DEVICE).to(DTYPE)
     model.eval()
