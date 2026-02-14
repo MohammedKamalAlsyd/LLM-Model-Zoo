@@ -1,12 +1,12 @@
 import os
+from pathlib import Path
 import sys
 import json
 import torch
 import gradio as gr
 from PIL import Image
-from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download, login
-from safetensors.torch import load_file
+from utils.LoadModel import load_hf_model
 from dotenv import load_dotenv
 
 
@@ -98,68 +98,29 @@ def load_config():
     
     return config
 
-def download_and_load_weights(model, hf_id, local_dir):
+def download_and_load_weights(hf_id: str, local_dir: str, device: str = DEVICE):
+    """Ensure weights are available locally (via snapshot_download) and load them
+    using `load_hf_model` from `utils.LoadModel`.
+
+    Returns a ready-to-use model (moved to `device`) and tokenizer.
     """
-    Downloads weights from HF, loads them, and maps keys to your custom architecture.
-    Saves the aligned weights locally.
-    """
-    weights_path = os.path.join(local_dir, "paligemma2_custom.pth")
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
+    # If local_dir already contains a config.json, assume it's a local model folder
+    local_path = Path(local_dir)
+    config_file = local_path / "config.json"
 
-    if os.path.exists(weights_path):
-        print(f"Loading weights from local cache: {weights_path}")
-        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
-    else:
-        print(f"Downloading weights from Hugging Face: {hf_id}...")
+    if not config_file.exists():
+        print(f"Downloading model snapshot from Hugging Face: {hf_id} -> {local_dir}...")
         try:
-            model_path = snapshot_download(repo_id=hf_id, allow_patterns=["*.safetensors", "model.safetensors.index.json"])
-            
-            # Load safetensors preferably
-            safetensors_file = os.path.join(model_path, "model.safetensors")
-            if os.path.exists(safetensors_file):
-                state_dict = load_file(safetensors_file)
-            else:
-                bin_file = os.path.join(model_path, "pytorch_model.bin")
-                state_dict = torch.load(bin_file, map_location="cpu")
-            
-            print("Weights downloaded. Remapping keys if necessary...")
-            
-            # --- Key Mapping Logic ---
-            # Your model uses: language_model, vision_tower, multi_modal_projector
-            # Official HF weights might differ slightly.
-            # This is a heuristic mapping.
-            new_state_dict = {}
-            for key, value in state_dict.items():
-                new_key = key
-                # Remap common mismatches here if your architecture differs from official keys
-                # Example: "text_model" -> "language_model"
-                if key.startswith("text_model."):
-                    new_key = key.replace("text_model.", "language_model.")
-                
-                new_state_dict[new_key] = value
-
-            state_dict = new_state_dict
-
-            # Ensure directory exists
-            os.makedirs(local_dir, exist_ok=True)
-            print(f"Saving processed weights to {weights_path}...")
-            torch.save(state_dict, weights_path)
-            
+            snapshot_download(repo_id=hf_id, local_dir=local_dir, allow_patterns=["*.safetensors", "config.json", "pytorch_model.bin", "*.bin", "*.json"])  # downloads into local_dir
         except Exception as e:
-            print(f"Error downloading/processing weights: {e}")
-            print("Go & Edit TOken Permission to allow read access to the model repository under Repositories permissions, and ensure the HF_MODEL_ID is correct.")
-            exit(1) # Exit since weights are essential for meaningful inference
-            return model
+            print(f"Error downloading model snapshot: {e}")
+            raise
 
-    # Load into model
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"Warning: Missing keys: {len(missing)}")
-    if unexpected:
-        print(f"Warning: Unexpected keys: {len(unexpected)}")
-        
-    return model
+    # Use the loader utility to create model and tokenizer
+    model, tokenizer = load_hf_model(local_dir, device=device)
+    return model, tokenizer
 
 # --- Inference Logic ---
 
@@ -240,32 +201,23 @@ def main():
     # 1. Load Configuration
     config = load_config()
     
-    # 2. Initialize Model
-    print("Building Model Architecture...")
-    model = PaliGemma2ForConditionalGeneration(config)
-    
-    # 3. Load Weights (Download -> Save -> Load)
+    # 2. Download and load model + tokenizer
+    print("Downloading and loading model (weights + config)...")
     try:
-        model = download_and_load_weights(model, HF_MODEL_ID, LOCAL_SAVE_DIR)
+        model, returned_tokenizer = download_and_load_weights(HF_MODEL_ID, LOCAL_SAVE_DIR, device=DEVICE)
     except Exception as e:
         print(f"Error loading weights: {e}")
-        print("Make Sure you acknowledge Paligemma2's license and have the correct HF_MODEL_ID set")
-    
+        print("Make sure you have access to the HF model and the HF_MODEL_ID is correct.")
+        raise
+
     model.to(DEVICE).to(DTYPE)
     model.eval()
-    
-    # 4. Initialize Processor
-    # Using standard Gemma tokenizer as base
-    print("Loading Tokenizer...")
-    try:
-        base_tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b")
-    except:
-        print("Fallback to generic gemma tokenizer")
-        base_tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b")
-        
+
+    # 3. Initialize Processor using tokenizer returned from the model loader
+    print("Initializing processor with tokenizer from model...")
     processor = PaliGemma2Processor(
-        tokenizer=base_tokenizer,
-        image_tokens=config.vision_config.patch_size, # From config (usually 256)
+        tokenizer=returned_tokenizer,
+        image_tokens=config.vision_config.patch_size,
         image_size=config.vision_config.image_size
     )
     
