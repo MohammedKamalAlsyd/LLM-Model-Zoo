@@ -6,61 +6,120 @@ from typing import Tuple, Union
 from pathlib import Path
 import logging
 import torch
+import gc
 
-def load_hf_model(model_path: Union[str, Path], device: str = "cpu") -> Tuple[PaliGemma2ForConditionalGeneration, AutoTokenizer]:
-    """Load a HuggingFace-style model directory saved with safetensors.
 
-    Args:
-        model_path: Path to the model directory containing `config.json` and one
-            or more `*.safetensors` files.
-        device: Torch device string to move the model to (default: "cpu").
+def load_hf_model(
+    model_path: Union[str, Path],
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[PaliGemma2ForConditionalGeneration, AutoTokenizer]:
+    """Load a HuggingFace-style model directory efficiently.
 
-    Returns:
-        A tuple of (model, tokenizer).
+    Loads weights incrementally to avoid RAM spikes.
     """
     logger = logging.getLogger(__name__)
-
     model_path = Path(model_path)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
-    if tokenizer.padding_side != "right":
-        logger.warning("Loaded tokenizer.padding_side=%s (expected 'right')", tokenizer.padding_side)
-
-    # Collect safetensors files
-    safetensors_files = list(model_path.glob("*.safetensors"))
-    if not safetensors_files:
-        logger.warning("No .safetensors files found in %s", model_path)
-
-    # Load tensors from safetensors into a dict
-    tensors = {}
-    for safetensors_file in safetensors_files:
-        with safe_open(str(safetensors_file), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                tensors[key] = f.get_tensor(key)
-
-    # Load configuration
+    # 1. Load Config
     config_file = model_path / "config.json"
     if not config_file.exists():
         raise FileNotFoundError(f"config.json not found in {model_path}")
+
     with config_file.open("r", encoding="utf-8") as f:
         model_config = json.load(f)
     config = PaliGemma2Config(model_config)
 
-    # Instantiate model and move to device
-    model = PaliGemma2ForConditionalGeneration(config).to(device)
+    # 2. Initialize Model (Empty)
+    print(f"Initializing model structure on {device}...")
+    with torch.device("cuda" if device == "cuda" else "cpu"):
+        model = PaliGemma2ForConditionalGeneration(config)
 
-    # Move loaded tensors to the target device and load state dict
-    if tensors:
-        state_dict = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in tensors.items()}
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        logger.info("Skipping state_dict load: no tensors available for %s", model_path)
+    # Force garbage collection to clear any initialization debris
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    # Tie weights if model supports it
+    # 3. Load Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+
+    # 4. Stream Weights from Safetensors
+    safetensors_files = list(model_path.glob("*.safetensors"))
+    print(f"Found weight files: {[f.name for f in safetensors_files]}")
+
+    if not safetensors_files:
+        raise FileNotFoundError(f"No .safetensors found in {model_path}")
+
+    print("Streaming weights directly to GPU...")
+
+    # Get the state dict keys of the model to verify mapping
+    model_state_dict = model.state_dict()
+
+    for sf in safetensors_files:
+        print(f"Processing {sf.name}...")
+        with safe_open(str(sf), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key in model_state_dict:
+                    # 1. Load tensor to CPU (small chunk)
+                    tensor = f.get_tensor(key)
+
+                    # 2. Move to GPU and cast to dtype immediately
+                    tensor = tensor.to(device=device, dtype=dtype)
+
+                    # 3. Update the model parameter in-place
+                    # We have to navigate the module tree to set the data
+                    _set_tensor_in_model(model, key, tensor)
+
+                    # 4. Delete temp reference
+                    del tensor
+                else:
+                    pass
+                    # logger.warning(f"Key {key} from file not found in model definition.")
+
+        # Cleanup after every file
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Tie weights manually if needed
     try:
         model.tie_weights()
     except Exception:
-        logger.debug("Model has no tie_weights() or it failed; continuing.")
+        pass
 
     return model, tokenizer
+
+
+def _set_tensor_in_model(model: torch.nn.Module, key: str, tensor: torch.Tensor):
+    """Helper to set a parameter tensor deep inside the model hierarchy."""
+    try:
+        # Split key "model.layers.0.weight" -> parent "model.layers.0", child "weight"
+        if "." in key:
+            module_name, param_name = key.rsplit(".", 1)
+            # Retrieve the submodule (e.g., model.layers.0)
+            submodule = model.get_submodule(module_name)
+        else:
+            submodule = model
+            param_name = key
+
+        # Get the current parameter
+        current_param = getattr(submodule, param_name)
+
+        if current_param.shape != tensor.shape:
+            # Handle squeeze/unsqueeze differences if necessary (common in some checkpoints)
+            if current_param.numel() == tensor.numel():
+                tensor = tensor.view(current_param.shape)
+            else:
+                print(
+                    f"Shape mismatch for {key}: Model {current_param.shape} vs Loaded {tensor.shape}"
+                )
+                return
+
+        # Assign the data directly to the existing parameter on GPU
+        # We use .data to overwrite the tensor content without tracking gradients
+        with torch.no_grad():
+            current_param.data = tensor
+
+    except AttributeError:
+        print(f"Could not set parameter {key}")
+    except Exception as e:
+        print(f"Error setting {key}: {e}")

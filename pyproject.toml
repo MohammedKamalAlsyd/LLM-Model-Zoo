@@ -12,8 +12,5 @@ dependencies = [
     "numpy>=2.4.2",
     "pillow>=12.1.1",
     "safetensors>=0.7.0",
-    "torch>=2.10.0",
-    "torchaudio>=2.10.0",
-    "torchvision>=0.25.0",
     "transformers>=5.1.0",
 ]
