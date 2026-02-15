@@ -47,7 +47,7 @@ class PaliGemma2Processor(nn.Module):
         tokenizer,
         image_tokens: int,
         image_size: int,
-        rescale_factor: float = 0.5,
+        rescale_factor: float = (1.0 / 255.0),
     ) -> None:
         """Initialize the PaliGemma2Processor.
 
@@ -130,7 +130,7 @@ class PaliGemma2Processor(nn.Module):
         )
 
         # Convert PIL image to numpy array (H, W, C) with values in [0, 1]
-        image_array = torch.tensor(image, dtype=torch.float32) / 255.0
+        image_array = torch.tensor(image, dtype=torch.bfloat16) / 255.0
 
         # Rescale pixel values
         image_array = image_array * self.rescale_factor
@@ -139,8 +139,8 @@ class PaliGemma2Processor(nn.Module):
         image_array = image_array.permute(2, 0, 1)
 
         # Normalize using ImageNet statistics
-        mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.float32).view(3, 1, 1)
-        std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.float32).view(3, 1, 1)
+        mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.bfloat16).view(3, 1, 1)
+        std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.bfloat16).view(3, 1, 1)
         image_tensor = (image_array - mean) / std
 
         return image_tensor

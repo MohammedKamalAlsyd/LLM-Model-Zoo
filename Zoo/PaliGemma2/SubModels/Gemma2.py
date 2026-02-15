@@ -24,6 +24,7 @@ Classes:
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
+from utils.KVCache import KVCache
 
 import torch
 from torch import nn
@@ -261,7 +262,7 @@ class Gemma2RotaryEmbedding(nn.Module):
             base
             ** (
                 torch.arange(0, dim, 2, dtype=torch.int64).to(
-                    device=device, dtype=torch.float32
+                    device=device, dtype=torch.bfloat16
                 )
                 / dim
             )
@@ -529,7 +530,7 @@ class Gemma2Attention(nn.Module):
 
         # Softmax in float32 for numerical stability
         attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
+            attn_weights, dim=-1, dtype=torch.bfloat16
         ).to(query_states.dtype)
 
         # Compute attention output
@@ -543,8 +544,7 @@ class Gemma2Attention(nn.Module):
         hidden_states: torch.Tensor,
         positional_embedding: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply grouped query attention.
 
@@ -596,7 +596,10 @@ class Gemma2Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos}
 
         if past_key_value is not None:
-            cache_kwargs = {**cache_kwargs, "cache_position": cache_position}
+            # past_key_value is your KVCache object
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx
+            )
 
         scaling = self.scaling if self.scaling is not None else self.hidden_size**-0.5
         attn_output, attn_weights = self.attention_forward(
@@ -878,7 +881,6 @@ class Gemma2ForCausalLM(nn.Module):
 
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
-        logits = logits.float()  # Ensure logits are in float32 for numerical stability
 
         # Final Logit Soft-Capping
         if self.config.final_logit_softcapping is not None:
