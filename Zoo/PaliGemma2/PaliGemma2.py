@@ -1,244 +1,151 @@
-"""
-PaliGemma2 Multimodal Configuration
-
-Composes:
-- Gemma2 (text model)
-- SigLip (vision model)
-
-This file wires together the submodule configs using the
-values provided in the reference JSON.
-"""
-
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Any
-from torch import nn
 import torch
+from torch import nn
+from typing import Optional, Tuple, List
+from dataclasses import dataclass, field
 
-# Import sub-configs directly from your structure
+# Sub-models
 from SubModels.Gemma2 import Gemma2Config, Gemma2ForCausalLM
 from SubModels.SigLip import SigLipVisionConfig, SigLipVisionModel
 from SubModels.PaliGemmaProjector import PaliGemmaMultiModalProjector
 from utils.KVCache import KVCache
 
-
+@dataclass
 class PaliGemma2Config:
     """
-    Top-level configuration for the PaliGemma2 multimodal model.
-
-    Combines:
-        - Gemma2 text configuration
-        - SigLip vision configuration
-        - Cross-modal projection settings
+    Hardcoded configuration for 'google/paligemma2-3b-pt-224'.
+    Removes the need for external config.json files.
     """
-
-    # -------- Sub-model configs --------
-    text_config: Gemma2Config
-    vision_config: SigLipVisionConfig
-
-    # -------- Multimodal --------
+    # Multimodal settings
     model_type: str = "paligemma"
     image_token_index: int = 257152
-    projection_dim: int = 2304
     torch_dtype: str = "bfloat16"
+    
+    # Vision (SigLip-So400m)
+    vision_config: SigLipVisionConfig = field(default_factory=lambda: SigLipVisionConfig(
+        hidden_size=1152,
+        intermediate_size=4304,
+        num_attention_heads=16,
+        num_hidden_layers=27,
+        patch_size=14,
+        projection_dim=2304, # Output of Vision -> Input to Projector
+        image_size=224,
+        num_channels=3
+    ))
 
-    def __init__(self, main_config: dict[str, Any]) -> None:
-        """
-        Initialize sub-configs using values from the provided JSON
-        if they were not explicitly passed.
-        """
-
-        self.config = main_config  # Store the main config for reference
-
-        # Access the needed values from the main config
-        self.bos_token_id = main_config.get("bos_token_id", 2)
-        self.eos_token_id = main_config.get("eos_token_id", 1)
-        self.pad_token_id = main_config.get("pad_token_id", 0)
-
-        # Sub-model configs
-        text_config_dict = main_config.get("text_config", {})
-        vision_config_dict = main_config.get("vision_config", {})
-
-        # Ensure text_config_dict is a dictionary before unpacking
-        keys_to_keep = Gemma2Config.__dataclass_fields__.keys()
-        filtered_dict = {k: v for k, v in text_config_dict.items() if k in keys_to_keep}
-        filtered_dict["pad_token_id"] = self.pad_token_id
-        filtered_dict["eos_token_id"] = self.eos_token_id
-        filtered_dict["bos_token_id"] = self.bos_token_id
-        self.text_config = Gemma2Config(**filtered_dict)
-
-        # Ensure vision_config_dict is a dictionary before unpacking
-        keys_to_keep = SigLipVisionConfig.__dataclass_fields__.keys()
-        filtered_dict = {
-            k: v for k, v in vision_config_dict.items() if k in keys_to_keep
-        }
-        self.vision_config = SigLipVisionConfig(**filtered_dict)
-
+    # Text (Gemma2-2B)
+    text_config: Gemma2Config = field(default_factory=lambda: Gemma2Config(
+        vocab_size=257216, # Includes 1024 loc + 128 seg tokens
+        hidden_size=2304,
+        intermediate_size=9216,
+        num_attention_heads=8,
+        num_key_value_heads=4, # GQA
+        num_hidden_layers=26,
+        sliding_window=4096,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        query_pre_attn_scalar=2304**-0.5,
+        attn_logit_softcapping=50.0,
+        final_logit_softcapping=30.0,
+        rope_theta=10000
+    ))
+    
+    # Projection
+    projection_dim: int = 2304 # Must match text_config.hidden_size
 
 class PaliGemma2ForConditionalGeneration(nn.Module):
-    """
-    PaliGemma2 multimodal model for conditional generation.
-
-    Combines:
-        - Gemma2 text model
-        - SigLip vision model
-        - Cross-modal projection layers
-    """
-
     def __init__(self, config: PaliGemma2Config):
-        """
-        Initialize the PaliGemma2 model with the given configuration.
-
-        Args:
-            config (PaliGemma2Config): Model configuration.
-        """
         super().__init__()
-        self.config = config  # Store config for use in forward pass
-
-        # Initialize sub-models
-        self.language_model = Gemma2ForCausalLM(config.text_config)
-        self.vision_tower = SigLipVisionModel(config.vision_config)
+        self.config = config or PaliGemma2Config()
+        
+        # 1. Vision Encoder (SigLip)
+        self.vision_tower = SigLipVisionModel(self.config.vision_config)
+        
+        # 2. Projector (Linear: Vision Dim -> Text Dim)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(
-            hidden_size=config.projection_dim,
-            vision_projection_dim=config.vision_config.projection_dim,
+            hidden_size=self.config.projection_dim,
+            vision_projection_dim=self.config.vision_config.hidden_size 
         )
+        
+        # 3. Text Decoder (Gemma2)
+        self.language_model = Gemma2ForCausalLM(self.config.text_config)
 
     def tie_weights(self):
-        return self.language_model.tie_weights()
+        self.language_model.tie_weights()
 
-    def _merge_input_ids_with_image_features(
+    def _merge_inputs(
         self,
-        image_features: torch.Tensor,  # (B, N_img, H)
-        inputs_embeds: torch.Tensor,  # (B, T, H)
-        input_ids: torch.Tensor,  # (B, T)
-        attention_mask: torch.Tensor,  # (B, T)
-        kv_cache: Optional[KVCache] = None,  # kept generic on purpose
+        input_ids: torch.LongTensor,      # (B, T)
+        inputs_embeds: torch.Tensor,      # (B, T, D_text)
+        image_features: torch.Tensor,     # (B, N_patches, D_text)
+        attention_mask: torch.Tensor,     # (B, T)
+        kv_cache: Optional[KVCache]       # Cache object
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Replace image token embeddings with projected vision features
-        and build causal attention mask + position ids.
+        Merges text embeddings with projected image features.
+        B: Batch, T: Seq Len, D: Hidden Dim
         """
-
-        batch_size, seq_len, hidden_size = inputs_embeds.shape
+        B, T, D = inputs_embeds.shape
         device = inputs_embeds.device
-        dtype = inputs_embeds.dtype
 
-        # --------------------------------------------------
-        # Scale image features (Gemma-style)
-        # --------------------------------------------------
-        image_features = image_features / (hidden_size**0.5)
+        # Scale image features (Gemma2 requirement)
+        image_features = image_features / (D ** 0.5)
 
-        # Final embedding buffer
-        final_embeddings = torch.zeros(
-            batch_size, seq_len, hidden_size, device=device, dtype=dtype
-        )
+        # 1. Embeddings merging
+        # Create a mask where (1) is text, (0) is image placeholder or padding
+        # mask shape: (B, T, 1)
+        special_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+        
+        # Scatter image features into the sequence where special_mask is True
+        inputs_embeds = inputs_embeds.masked_scatter(special_mask, image_features.view(-1, D))
 
-        # Token masks
-        text_mask = (input_ids != self.config.image_token_index) & (
-            input_ids != self.pad_token_id
-        )
-        image_mask = input_ids == self.config.image_token_index
-        pad_mask = input_ids == self.pad_token_id
-
-        # Expand masks to embedding dim
-        text_mask = torch.tensor(text_mask, device=device).unsqueeze(-1)
-        image_mask = torch.tensor(image_mask, device=device).unsqueeze(-1)
-        pad_mask = torch.tensor(pad_mask, device=device).unsqueeze(-1)
-
-        # Insert text embeddings
-        final_embeddings = torch.where(text_mask, inputs_embeds, final_embeddings)
-
-        # Insert image embeddings (sequence-aligned scatter)
-        final_embeddings = final_embeddings.masked_scatter(
-            image_mask.expand_as(final_embeddings),
-            image_features.reshape(-1),
-        )
-
-        # Zero out padding
-        final_embeddings = torch.where(
-            pad_mask, torch.zeros_like(final_embeddings), final_embeddings
-        )
-
-        # --------------------------------------------------
-        # Build causal attention mask
-        # --------------------------------------------------
-        q_len = seq_len
-
+        # 2. Causal Mask Construction
+        # Prefill: (B, 1, T, T), Decode: (B, 1, 1, T_total)
         if kv_cache is None:
-            # Prefill phase (no cache)
-            causal_mask = torch.zeros(
-                batch_size, q_len, q_len, device=device, dtype=dtype
-            )
+            # Full causal mask for prefill
+            causal_mask = torch.zeros(B, 1, T, T, device=device, dtype=inputs_embeds.dtype)
         else:
-            # Decode phase (single token query)
-            assert q_len == 1
-            kv_len = kv_cache.num_items() + 1
-            causal_mask = torch.zeros(batch_size, 1, kv_len, device=device, dtype=dtype)
-
-        # Add head dimension: (B, 1, Q, K)
-        causal_mask = causal_mask.unsqueeze(1)
-
-        # --------------------------------------------------
-        # Position IDs (Gemma2 expects these)
-        # --------------------------------------------------
-        if kv_cache is not None:
-            # Last token position only
+            # Single token decoding
+            cache_len = kv_cache.num_items()
+            causal_mask = torch.zeros(B, 1, 1, cache_len + 1, device=device, dtype=inputs_embeds.dtype)
+            
+        # 3. Position IDs
+        # Calculate positions based on attention mask (ignoring padding)
+        if kv_cache is None:
+            position_ids = attention_mask.cumsum(-1).masked_fill(attention_mask == 0, 1)
+        else:
             position_ids = attention_mask.cumsum(-1)[:, -1:]
-        else:
-            # Full prefill positions
-            position_ids = attention_mask.cumsum(-1)
-            position_ids = position_ids.masked_fill(attention_mask == 0, 1)
 
-        return final_embeddings, causal_mask, position_ids
+        return inputs_embeds, causal_mask, position_ids
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        pixel_values: torch.FloatTensor,
+        input_ids: torch.LongTensor,          # (B, T)
+        pixel_values: torch.FloatTensor,      # (B, 3, H_img, W_img)
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
-    ) -> dict:
-        """
-        Forward pass for multimodal conditional generation.
-        """
-
+    ):
+        # Default mask
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+            attention_mask = torch.ones_like(input_ids)
 
-        # This implementation assumes NO padding (same as PaliGemma-1)
-        assert torch.all(attention_mask == 1), "Padding is not supported"
+        # 1. Text Embeddings
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids) # (B, T, D)
 
-        # --------------------------------------------------
-        # Text embeddings
-        # --------------------------------------------------
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        # 2. Vision Embeddings
+        # Extract features -> Project to text space
+        vis_out = self.vision_tower(pixel_values.to(inputs_embeds.dtype)) # (B, N, D_vis)
+        image_features = self.multi_modal_projector(vis_out)              # (B, N, D)
 
-        # --------------------------------------------------
-        # Vision tower
-        # --------------------------------------------------
-        vision_outputs = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
-        image_features = self.multi_modal_projector(vision_outputs)
-
-        # --------------------------------------------------
-        # Merge modalities
-        # --------------------------------------------------
-        inputs_embeds, attention_mask, position_ids = (
-            self._merge_input_ids_with_image_features(
-                image_features=image_features,
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                kv_cache=kv_cache,
-            )
+        # 3. Merge Modalities
+        final_embeds, causal_mask, pos_ids = self._merge_inputs(
+            input_ids, inputs_embeds, image_features, attention_mask, kv_cache
         )
 
-        # --------------------------------------------------
-        # Language model forward
-        # --------------------------------------------------
-        outputs = self.language_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=kv_cache,
+        # 4. Language Model Forward
+        return self.language_model(
+            inputs_embeds=final_embeds,
+            attention_mask=causal_mask,
+            position_ids=pos_ids,
+            past_key_values=kv_cache
         )
-
-        return outputs
