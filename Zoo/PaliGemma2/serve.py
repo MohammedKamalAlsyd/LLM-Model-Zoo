@@ -35,7 +35,7 @@ from utils.KVCache import KVCache
 # Since this architecture mixes Gemma2 and SigLip, ensure the weights match.
 # If this is a custom model you trained, put your repo ID here.
 HF_MODEL_ID = "google/paligemma2-3b-pt-224"  # Placeholder: Adjust if using specific Gemma2 weights
-LOCAL_SAVE_DIR = "./saved_model"
+LOCAL_SAVE_DIR = "./saved_model/Paligemma2"  # Local directory to save the model snapshot
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = (
     torch.bfloat16
@@ -45,7 +45,7 @@ DTYPE = (
 
 
 def load_config():
-    config_path = os.path.join("Zoo", "PaliGemma2", "config.json")
+    config_path = os.path.join(LOCAL_SAVE_DIR, "config.json")
     with open(config_path, "r") as f:
         config_dict = json.load(f)
 
