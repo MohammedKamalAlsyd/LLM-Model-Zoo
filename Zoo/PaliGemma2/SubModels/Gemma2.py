@@ -571,7 +571,6 @@ class Gemma2Attention(nn.Module):
             Tuple[torch.Tensor, Optional[torch.Tensor]]: Attention output and weights.
         """
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.hidden_size)
 
         # Project to Q, K, V and reshape for multi-head attention
         query_states = (
@@ -590,13 +589,11 @@ class Gemma2Attention(nn.Module):
             .transpose(1, 2)
         )
 
-        cache_kwargs = {}
         if positional_embedding is not None:
             cos, sin = positional_embedding
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, unsqueeze_dim=2
             )
-            cache_kwargs = {"sin": sin, "cos": cos}
 
         if past_key_value is not None:
             # past_key_value is your KVCache object
