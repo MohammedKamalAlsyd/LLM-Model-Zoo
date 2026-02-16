@@ -58,7 +58,6 @@ class Gemma2Config:
         query_pre_attn_scalar (float): Scaling factor for queries.
         attention_bias (bool): Whether to use bias in attention projections.
         attn_logit_softcapping (Optional[float]): Softcap for attention logits.
-        final_logit_softcapping (Optional[float]): Softcap for final logits.
     """
 
     vocab_size: int
@@ -75,7 +74,6 @@ class Gemma2Config:
     attention_bias: bool = False
     rope_theta: Optional[int] = 10_000
     attn_logit_softcapping: Optional[float] = None
-    final_logit_softcapping: Optional[float] = None
     head_dim: int = 256
 
 
@@ -881,10 +879,5 @@ class Gemma2ForCausalLM(nn.Module):
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
 
-        # Final Logit Soft-Capping
-        if self.config.final_logit_softcapping is not None:
-            logits = logits / self.config.final_logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.config.final_logit_softcapping
 
         return {"logits": logits}

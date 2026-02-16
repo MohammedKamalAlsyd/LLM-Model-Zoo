@@ -121,27 +121,39 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,          # (B, T)
-        pixel_values: torch.FloatTensor,      # (B, 3, H_img, W_img)
+        input_ids: torch.LongTensor,
+        kv_cache: KVCache,
+        pixel_values: Optional[torch.FloatTensor] = None, # Make optional
         attention_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
     ):
         # Default mask
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
         # 1. Text Embeddings
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids) # (B, T, D)
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # 2. Vision Embeddings
-        # Extract features -> Project to text space
-        vis_out = self.vision_tower(pixel_values.to(inputs_embeds.dtype)) # (B, N, D_vis)
-        image_features = self.multi_modal_projector(vis_out)              # (B, N, D)
+        # 2. Vision Embeddings (ONLY if pixel_values are provided)
+        if pixel_values is not None:
+            # Extract features -> Project to text space
+            vis_out = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
+            image_features = self.multi_modal_projector(vis_out)
 
-        # 3. Merge Modalities
-        final_embeds, causal_mask, pos_ids = self._merge_inputs(
-            input_ids, inputs_embeds, image_features, attention_mask, kv_cache
-        )
+            # 3. Merge Modalities
+            final_embeds, causal_mask, pos_ids = self._merge_inputs(
+                input_ids, inputs_embeds, image_features, attention_mask, kv_cache
+            )
+        else:
+            # This is a decoding step. Image features are already in the KV cache.
+            # We only need to prepare inputs for the language model.
+            final_embeds = inputs_embeds
+            
+            # Reconstruct causal mask and position_ids for the single new token
+            B, T = input_ids.shape
+            cache_len = kv_cache.num_items()
+            causal_mask = torch.zeros(B, 1, T, cache_len + T, device=final_embeds.device, dtype=final_embeds.dtype)
+            pos_ids = attention_mask.cumsum(-1)[:, -T:]
+
 
         # 4. Language Model Forward
         return self.language_model(
