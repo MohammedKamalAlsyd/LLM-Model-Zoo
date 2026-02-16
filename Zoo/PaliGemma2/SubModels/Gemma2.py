@@ -562,7 +562,6 @@ class Gemma2Attention(nn.Module):
             positional_embedding (Optional[Tuple]): (cos, sin) rotary embeddings.
             attention_mask (Optional[torch.Tensor]): Attention mask.
             past_key_value (Optional[Tuple]): Cached key-value for incremental decoding.
-            cache_position (Optional[torch.LongTensor]): Positions in cache.
 
         Returns:
             Tuple[torch.Tensor, Optional[torch.Tensor]]: Attention output and weights.
@@ -712,7 +711,6 @@ class Gemma2DecoderLayer(nn.Module):
             positional_embedding=positional_embedding,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
-            cache_position=cache_position,
         )
         # Post-norm applies to the output of the attention mechanism, not the residual stream
         attn_output = self.post_attention_layernorm(attn_output)
@@ -800,7 +798,7 @@ class Gemma2Model(nn.Module):
 
         # Rotary embedding
         positional_embedding = self.rotary_emb(
-            hidden_states, cache_position=cache_position
+            hidden_states, position_ids = cache_position if cache_position is not None else torch.arange(hidden_states.shape[1], device=hidden_states.device)[None, :]
         )
 
         # normalized

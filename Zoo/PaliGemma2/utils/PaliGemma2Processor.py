@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Union
 import torch
 from PIL import Image
 from torch import nn
+import numpy as np
 
 __all__ = ["PaliGemma2Processor"]
 
@@ -73,7 +74,7 @@ class PaliGemma2Processor(nn.Module):
         self.tokenizer = tokenizer
 
         # Add image token as special token
-        tokens_to_add = {"img_token": [self.IMAGE_TOKEN]}
+        tokens_to_add = {'additional_special_tokens': [self.IMAGE_TOKEN]}
         tokenizer.add_special_tokens(tokens_to_add)
 
         # Add location tokens for bounding box coordinates (object detection)
@@ -120,30 +121,32 @@ class PaliGemma2Processor(nn.Module):
         if not isinstance(image, Image.Image):
             raise TypeError(f"Expected PIL Image, got {type(image)}")
 
-        # Ensure image is RGB
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+            # Ensure RGB
+            if image.mode != "RGB":
+                image = image.convert("RGB")
 
-        # Resize to target dimensions (square image)
-        image = image.resize(
-            (self.image_size, self.image_size), Image.Resampling.LANCZOS
-        )
+            # Resize
+            image = image.resize(
+                (self.image_size, self.image_size), Image.Resampling.LANCZOS
+            )
 
-        # Convert PIL image to numpy array (H, W, C) with values in [0, 1]
-        image_array = torch.tensor(image, dtype=torch.bfloat16) / 255.0
+            # ←←← THIS WAS THE BUG
+            # Convert PIL → numpy (H, W, C) uint8 → torch (H, W, C) → scale to [0, 1]
+            image_array = (
+                torch.from_numpy(np.array(image))
+                .to(dtype=torch.bfloat16)
+                * self.rescale_factor          # 1/255 → [0, 1]
+            )
 
-        # Rescale pixel values
-        image_array = image_array * self.rescale_factor
+            # (H, W, C) → (C, H, W)
+            image_array = image_array.permute(2, 0, 1)
 
-        # Rearrange to (C, H, W) format
-        image_array = image_array.permute(2, 0, 1)
+            # ImageNet-style normalization to [-1, 1]
+            mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.bfloat16).view(3, 1, 1)
+            std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.bfloat16).view(3, 1, 1)
+            image_tensor = (image_array - mean) / std
 
-        # Normalize using ImageNet statistics
-        mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.bfloat16).view(3, 1, 1)
-        std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.bfloat16).view(3, 1, 1)
-        image_tensor = (image_array - mean) / std
-
-        return image_tensor
+            return image_tensor
 
     def __call__(
         self,

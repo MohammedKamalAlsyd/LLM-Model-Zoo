@@ -41,7 +41,7 @@ def load_weights_into_model(model, directory, device):
     state_dict_keys = set(model.state_dict().keys())
     
     for file in files:
-        with safe_open(file, framework="pt", device="cuda") as f:
+        with safe_open(file, framework="pt", device=DEVICE) as f:
             for key in f.keys():
                 if key in state_dict_keys:
                     # Load -> Move to GPU -> Cast -> Assign
