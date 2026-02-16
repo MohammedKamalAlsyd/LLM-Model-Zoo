@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 # Environment Setup
 load_dotenv()
+# Ensure we can find the Zoo folder
 sys.path.append(os.path.join(os.path.dirname(__file__), "Zoo", "PaliGemma2"))
 
 # Import Model
@@ -23,6 +24,7 @@ from transformers import AutoTokenizer
 HF_REPO = "google/paligemma2-3b-pt-224"
 LOCAL_DIR = "./saved_model/Paligemma2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Use bfloat16 if supported (Amperere+ GPUs), otherwise float32
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
 # Authentication
@@ -30,73 +32,105 @@ if token := os.getenv("HUGGING_FACE_HUB_TOKEN"):
     login(token=token)
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-# --- Lightweight Loader ---
-
-def load_weights_into_model(model, directory, device):
-    """Streams .safetensors directly into the model object."""
-    files = list(Path(directory).glob("*.safetensors"))
-    if not files: raise FileNotFoundError(f"No safetensors found in {directory}")
+# --- 1. CRITICAL CONFIG PATCH ---
+# We monkey-patch the config here to ensure head_dim is 256. 
+# This prevents the "2048 vs 2304" mismatch error even if you haven't edited PaliGemma2.py yet.
+def get_fixed_config():
+    config = PaliGemma2Config()
     
-    print(f"Loading {len(files)} weight files...")
-    state_dict_keys = set(model.state_dict().keys())
-    
-    for file in files:
-        with safe_open(file, framework="pt", device=DEVICE) as f:
-            for key in f.keys():
-                if key in state_dict_keys:
-                    # Load -> Move to GPU -> Cast -> Assign
-                    tensor = f.get_tensor(key).to(device=device, dtype=DTYPE)
-                    _set_nested_param(model, key, tensor)
-                    del tensor
-        gc.collect()
-        torch.cuda.empty_cache()
-
-def _set_nested_param(model, key, tensor):
-    """Helper to traverse model.layers.0.weight and assign data."""
-    try:
-        module_name, param_name = key.rsplit(".", 1) if "." in key else ("", key)
-        submodule = model.get_submodule(module_name) if module_name else model
-        param = getattr(submodule, param_name)
+    # Force head_dim to 256 (matches standard Gemma 2 2B weights)
+    # 8 heads * 256 dim = 2048 projection size
+    if not hasattr(config.text_config, 'head_dim'):
+        setattr(config.text_config, 'head_dim', 256)
+    else:
+        config.text_config.head_dim = 256
         
-        # Handle shape mismatches (e.g. squeezed tensors)
-        if param.shape != tensor.shape and param.numel() == tensor.numel():
-            tensor = tensor.view(param.shape)
-            
-        with torch.no_grad():
-            param.data = tensor
-    except Exception as e:
-        print(f"Warning: Failed to load {key}: {e}")
+    return config
+
+# --- 2. Loader Logic (Using load_state_dict) ---
+
+def load_weights_standard(model, directory):
+    """
+    Loads .safetensors using standard load_state_dict(strict=False).
+    This is safer and reports missing keys accurately.
+    """
+    files = list(Path(directory).glob("*.safetensors"))
+    if not files: 
+        raise FileNotFoundError(f"No safetensors found in {directory}")
+    
+    print(f"Aggregating weights from {len(files)} files...")
+    full_state_dict = {}
+    
+    # 1. Load all tensors into CPU memory
+    for file in files:
+        with safe_open(file, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                full_state_dict[key] = f.get_tensor(key)
+
+    print("Loading state dict into model...")
+    
+    # 2. Load into model
+    # strict=False allows for buffer mismatches (like rotary inv_freq) usually harmless
+    missing_keys, unexpected_keys = model.load_state_dict(full_state_dict, strict=False)
+    
+    # 3. Report Health
+    # Filter out "inv_freq" which are Rotary Embedding buffers often recalculated on fly
+    significant_missing = [k for k in missing_keys if "inv_freq" not in k]
+    
+    if significant_missing:
+        print(f"\n⚠️ WARNING: {len(significant_missing)} keys were missing!")
+        print(f"First 5 missing: {significant_missing[:5]}")
+    else:
+        print("\n✅ All model weights loaded successfully.")
+
+    if unexpected_keys:
+        print(f"ℹ️ Note: {len(unexpected_keys)} unexpected keys in file (usually fine).")
+
+    # Cleanup memory
+    del full_state_dict
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def get_model_and_processor():
     """Setup logic."""
-    print(f"Downloading {HF_REPO} to {LOCAL_DIR}...")
-    snapshot_download(repo_id=HF_REPO, local_dir=LOCAL_DIR, 
-                      allow_patterns=["*.safetensors", "tokenizer.json", "special_tokens_map.json"])
+    if not os.path.exists(LOCAL_DIR):
+        print(f"Downloading {HF_REPO} to {LOCAL_DIR}...")
+        snapshot_download(repo_id=HF_REPO, local_dir=LOCAL_DIR, 
+                          allow_patterns=["*.safetensors", "tokenizer.json", "special_tokens_map.json"])
 
-    # 1. Init Model (Architecture defined in code, not JSON)
+    # 1. Init Model with FIXED config
     print("Initializing Model Architecture...")
-    config = PaliGemma2Config() 
-    model = PaliGemma2ForConditionalGeneration(config).to(DEVICE).to(DTYPE)
+    config = get_fixed_config() 
     
-    # 2. Load Weights
-    load_weights_into_model(model, LOCAL_DIR, DEVICE)
+    # Initialize on Meta device to save RAM before loading weights, if possible, 
+    # but for simplicity/safety we init on CPU then move.
+    model = PaliGemma2ForConditionalGeneration(config)
+    
+    # 2. Load Weights using the new function
+    load_weights_standard(model, LOCAL_DIR)
+    
+    # 3. Move to Device and Cast
+    model.to(DTYPE).to(DEVICE)
     model.eval()
     
-    # 3. Init Processor
+    # 4. Init Processor
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_DIR, padding_side="right")
-    processor = PaliGemma2Processor(tokenizer, 
-                                    image_tokens=config.vision_config.patch_size, # Actually num_patches (256) implicitly handled
-                                    image_size=config.vision_config.image_size) # 224
     
-    # Fix: PaliGemma uses 256 tokens for 224px image (14x14 patch) -> (224/14)^2 = 256
-    processor.image_tokens = (config.vision_config.image_size // config.vision_config.patch_size) ** 2
+    # Calculate image tokens: (224 / 14)^2 = 256
+    num_image_tokens = (config.vision_config.image_size // config.vision_config.patch_size) ** 2
+    
+    processor = PaliGemma2Processor(
+        tokenizer, 
+        image_tokens=num_image_tokens,
+        image_size=config.vision_config.image_size
+    )
     
     return model, processor
 
-# --- Inference ---
+# --- 3. Corrected Inference Loop ---
 
 @torch.no_grad()
-def generate(model, processor, image, prompt, max_tokens=100, temp=0.7):
+def generate(model, processor, image, prompt, max_tokens=100, temp=0.7, top_p=0.9):
     # 1. Preprocess
     inputs = processor(text=prompt, image=image, return_tensors="pt")
     input_ids = inputs["input_ids"].to(DEVICE)
@@ -104,63 +138,107 @@ def generate(model, processor, image, prompt, max_tokens=100, temp=0.7):
     attention_mask = inputs["attention_mask"].to(DEVICE)
     
     kv_cache = KVCache()
-    generated = []
-    curr_input = input_ids
+    generated_ids = []
+    
+    # Initial forward pass inputs
+    curr_input_ids = input_ids
+    curr_pixel_values = pixel_values
+    
+    print("Starting generation...")
 
-    # 2. Loop
-    for _ in range(max_tokens):
+    # 2. Generation Loop
+    for step in range(max_tokens):
+        # Forward pass
+        # Note: model.forward handles the merging of embeddings internally
+        # Logic: If kv_cache is empty, it processes the full prompt.
+        # If kv_cache has items, it processes only the last token (curr_input_ids).
+        
         outputs = model(
-            input_ids=curr_input,
-            pixel_values=pixel_values, # Needed every step for merging logic, but computed once
+            input_ids=curr_input_ids,
+            pixel_values=curr_pixel_values, 
             attention_mask=attention_mask,
             kv_cache=kv_cache
         )
         
-        # Greedy / Sampling
-        next_logits = outputs["logits"][:, -1, :] # (B, Vocab)
-        if temp > 0:
-            probs = torch.softmax(next_logits / temp, dim=-1)
-            next_token = torch.multinomial(probs, 1)
-        else:
-            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+        next_token_logits = outputs["logits"][:, -1, :] # (B, Vocab)
 
-        if next_token.item() == model.config.text_config.eos_token_id:
+        # Sampling logic
+        if temp > 0:
+            # Apply Temperature
+            next_token_logits = next_token_logits / temp
+            probs = torch.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        else:
+            # Greedy
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+        token_id = next_token.item()
+        
+        # Stop condition
+        if token_id == model.config.text_config.eos_token_id:
             break
             
-        generated.append(next_token.item())
-        curr_input = next_token
+        generated_ids.append(token_id)
         
-        # Update mask: append 1 for the new token
-        attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=DEVICE)], dim=1)
+        # Prepare for next step
+        curr_input_ids = next_token # (1, 1)
+        
+        # Extend attention mask
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, 1), device=DEVICE, dtype=attention_mask.dtype)], 
+            dim=1
+        )
+        
+        # IMPORTANT: Pixel values are only needed for the PREFILL step (when cache is empty).
+        # In subsequent steps, we pass None or dummy because the vision embeddings 
+        # are already merged into the KV Cache of the first layer.
+        # However, keeping it doesn't hurt if the model handle it, but for efficiency/correctness:
+        # The prompt processing step embedded the image. The decoding steps just need text.
+        
+    decoded_text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return decoded_text
 
-    return processor.tokenizer.decode(generated, skip_special_tokens=True)
-
-# --- UI ---
+# --- 4. UI ---
 
 def main():
+    # Load model once on startup
     model, processor = get_model_and_processor()
     
     def run_inference(image, text, max_new, temp):
-        if not image: return "Upload an image."
-        text = text or "describe this image"
+        if image is None: 
+            return "Please upload an image."
+        if not text: 
+            text = "describe this image"
+            
         try:
-            return generate(model, processor, image, text, int(max_new), float(temp))
+            result = generate(model, processor, image, text, int(max_new), float(temp))
+            return result
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return f"Error: {e}"
 
     with gr.Blocks(title="PaliGemma2 Zoo") as app:
         gr.Markdown(f"### PaliGemma2 (3B) on {DEVICE.upper()}")
+        gr.Markdown("Custom Implementation with `load_state_dict`")
+        
         with gr.Row():
-            img = gr.Image(type="pil", label="Image")
             with gr.Column():
-                prompt = gr.Textbox(label="Prompt", value="describe this image")
-                tokens = gr.Slider(10, 500, 100, label="Max Tokens")
-                temp = gr.Slider(0.0, 1.5, 0.7, label="Temperature")
+                img = gr.Image(type="pil", label="Input Image")
+                prompt = gr.Textbox(label="Prompt", value="caption en", placeholder="e.g. 'caption en' or 'detect cat'")
+                
+                with gr.Accordion("Advanced Settings", open=False):
+                    tokens = gr.Slider(10, 500, 100, step=10, label="Max New Tokens")
+                    temp = gr.Slider(0.0, 1.5, 0.0, step=0.1, label="Temperature (0.0 = Greedy)")
+                
                 btn = gr.Button("Generate", variant="primary")
-                out = gr.Textbox(label="Output")
+                
+            with gr.Column():
+                out = gr.Textbox(label="Output", lines=5)
         
         btn.click(run_inference, [img, prompt, tokens, temp], out)
 
+    print(f"Launching on http://0.0.0.0:7860")
     app.launch(server_name="0.0.0.0", share=False)
 
 if __name__ == "__main__":

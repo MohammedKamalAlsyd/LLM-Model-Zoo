@@ -264,7 +264,7 @@ class SigLipEncoderLayer(nn.Module):
     def __init__(self, config: SigLipVisionConfig) -> None:
         super().__init__()
         self.config = config
-        self.attention = SigLipAttention(config)
+        self.self_attn = SigLipAttention(config)
         self.mlp = SigLipMLP(config)
         self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -272,7 +272,7 @@ class SigLipEncoderLayer(nn.Module):
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Compute encoder layer forward pass with pre-normalization."""
         # Self-attention block with residual connection
-        attn_output, _ = self.attention(self.layer_norm1(hidden_state))
+        attn_output, _ = self.self_attn(self.layer_norm1(hidden_state))
         hidden_state = hidden_state + attn_output
 
         # MLP block with residual connection

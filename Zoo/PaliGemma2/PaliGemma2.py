@@ -47,7 +47,8 @@ class PaliGemma2Config:
         query_pre_attn_scalar=2304**-0.5,
         attn_logit_softcapping=50.0,
         final_logit_softcapping=30.0,
-        rope_theta=10000
+        rope_theta=10000,
+        head_dim=256
     ))
     
     # Projection

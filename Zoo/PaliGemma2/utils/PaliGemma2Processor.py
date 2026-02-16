@@ -118,35 +118,38 @@ class PaliGemma2Processor(nn.Module):
         Raises:
             TypeError: If image is not a PIL Image instance.
         """
+        
+        # 1. Check type (Keep this block)
         if not isinstance(image, Image.Image):
             raise TypeError(f"Expected PIL Image, got {type(image)}")
 
-            # Ensure RGB
-            if image.mode != "RGB":
-                image = image.convert("RGB")
+        # 2. UNINDENT THE REST OF THE CODE BELOW
+        
+        # Ensure RGB
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
-            # Resize
-            image = image.resize(
-                (self.image_size, self.image_size), Image.Resampling.LANCZOS
-            )
+        # Resize
+        image = image.resize(
+            (self.image_size, self.image_size), Image.Resampling.LANCZOS
+        )
 
-            # ←←← THIS WAS THE BUG
-            # Convert PIL → numpy (H, W, C) uint8 → torch (H, W, C) → scale to [0, 1]
-            image_array = (
-                torch.from_numpy(np.array(image))
-                .to(dtype=torch.bfloat16)
-                * self.rescale_factor          # 1/255 → [0, 1]
-            )
+        # Convert PIL → numpy (H, W, C) uint8 → torch (H, W, C) → scale to [0, 1]
+        image_array = (
+            torch.from_numpy(np.array(image))
+            .to(dtype=torch.bfloat16)
+            * self.rescale_factor          # 1/255 → [0, 1]
+        )
 
-            # (H, W, C) → (C, H, W)
-            image_array = image_array.permute(2, 0, 1)
+        # (H, W, C) → (C, H, W)
+        image_array = image_array.permute(2, 0, 1)
 
-            # ImageNet-style normalization to [-1, 1]
-            mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.bfloat16).view(3, 1, 1)
-            std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.bfloat16).view(3, 1, 1)
-            image_tensor = (image_array - mean) / std
+        # ImageNet-style normalization to [-1, 1]
+        mean = torch.tensor(IMAGENET_STANDARD_MEAN, dtype=torch.bfloat16).view(3, 1, 1)
+        std = torch.tensor(IMAGENET_STANDARD_STD, dtype=torch.bfloat16).view(3, 1, 1)
+        image_tensor = (image_array - mean) / std
 
-            return image_tensor
+        return image_tensor
 
     def __call__(
         self,

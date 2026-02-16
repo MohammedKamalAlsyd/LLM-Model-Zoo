@@ -72,10 +72,11 @@ class Gemma2Config:
     eos_token_id: int
     bos_token_id: int
     query_pre_attn_scalar: float
-    attention_bias: bool = True
+    attention_bias: bool = False
     rope_theta: Optional[int] = 10_000
     attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: Optional[float] = None
+    head_dim: int = 256
 
 
 class Gemma2RMSNorm(nn.Module):
@@ -453,7 +454,7 @@ class Gemma2Attention(nn.Module):
 
         self.hidden_size: int = config.hidden_size
         self.num_attention_heads: int = config.num_attention_heads
-        self.head_dim: int = config.hidden_size // config.num_attention_heads
+        self.head_dim: int = config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
         self.num_key_value_heads: int = config.num_key_value_heads
         self.num_key_value_groups: int = (
             self.num_attention_heads // self.num_key_value_heads
