@@ -452,7 +452,11 @@ class Gemma2Attention(nn.Module):
 
         self.hidden_size: int = config.hidden_size
         self.num_attention_heads: int = config.num_attention_heads
-        self.head_dim: int = config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+        self.head_dim: int = (
+            config.head_dim
+            if hasattr(config, "head_dim")
+            else config.hidden_size // config.num_attention_heads
+        )
         self.num_key_value_heads: int = config.num_key_value_heads
         self.num_key_value_groups: int = (
             self.num_attention_heads // self.num_key_value_heads
@@ -521,7 +525,8 @@ class Gemma2Attention(nn.Module):
         # Apply soft capping if specified
         if softcapping is not None:
             attn_weights = attn_weights / softcapping
-            attn_weights = torch.tanh(attn_weights) * softcapping
+            attn_weights = torch.tanh(attn_weights)
+            attn_weights *= softcapping
 
         # Apply attention mask (causal mask, sliding window, padding)
         if attention_mask is not None:
@@ -797,7 +802,14 @@ class Gemma2Model(nn.Module):
 
         # Rotary embedding
         positional_embedding = self.rotary_emb(
-            hidden_states, position_ids = cache_position if cache_position is not None else torch.arange(hidden_states.shape[1], device=hidden_states.device)[None, :]
+            hidden_states,
+            position_ids=(
+                cache_position
+                if cache_position is not None
+                else torch.arange(hidden_states.shape[1], device=hidden_states.device)[
+                    None, :
+                ]
+            ),
         )
 
         # normalized
@@ -878,6 +890,5 @@ class Gemma2ForCausalLM(nn.Module):
 
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
-
 
         return {"logits": logits}
