@@ -6,8 +6,8 @@ from dataclasses import dataclass
 @dataclass
 class Llama4TextConfig:
     vocab_size: int = 202048
-    hidden_size: int = 5120 # 5120 for 40 heads, 128 head dim
-    intermediate_size: int = 8192 
+    hidden_size: int = 5120  # 5120 for 40 heads, 128 head dim
+    intermediate_size: int = 8192
     intermediate_size_mlp: int = 16384
     num_hidden_layers: int = 48
     num_attention_heads: int = 40
@@ -28,7 +28,6 @@ class Llama4TextConfig:
     attn_temperature_tuning: float = 4
     floor_scale: int = 8192
     attn_scale: float = 0.1
-
 
 
 class Llama4TextExperts(nn.Module):
@@ -99,7 +98,8 @@ class Llama4TextExperts(nn.Module):
         """
 
         # combined: (token_count, num_experts_local, 2*expert_hidden_dim)
-        combined = torch.einsum('td,ehd->teh', inputs, self.expert_combined_proj)
+        hidden_states = inputs.reshape(self.num_experts, -1, self.hidden_dim)
+        combined = torch.bmm(hidden_states, self.expert_combined_proj)
 
         # Split into gate logits and up features
         gate_logits, up_features = combined.split(self.expert_hidden_dim, dim=-1)
@@ -113,7 +113,9 @@ class Llama4TextExperts(nn.Module):
         # Project back to hidden dimension using per-expert down projections
         # expert_down_proj: (num_experts_local, expert_hidden_dim, hidden_dim)
         # out_per_expert: (token_count, num_experts_local, hidden_dim)
-        out_per_expert = torch.einsum('tef,efd->ted', up_activated, self.expert_down_proj)
+        out_per_expert = torch.einsum(
+            "tef,efd->ted", up_activated, self.expert_down_proj
+        )
 
         # Weight by gate scalars and sum experts: -> (token_count, hidden_dim)
         weighted = out_per_expert * gate_scalar
@@ -122,16 +124,21 @@ class Llama4TextExperts(nn.Module):
         return aggregated
 
 
-
 class Llama4TextMLP(nn.Module):
     def __init__(self, config: Llama4TextConfig):
         super().__init__()
         self.config = config
 
         # Descriptive weights names to ease mapping from external checkpoints
-        self.gating_weights = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.input_expansion_weights = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.output_projection_weights = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gating_weights = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.input_expansion_weights = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.output_projection_weights = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
         self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states):
@@ -163,7 +170,9 @@ class Llama4TextMoe(nn.Module):
         self.expert_container = Llama4TextExperts(config)
 
         # Routing projection (maps token -> expert logits)
-        self.routing_weights = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+        self.routing_weights = nn.Linear(
+            config.hidden_size, config.num_local_experts, bias=False
+        )
 
         # A shared feed-forward used as a baseline/residual
         self.shared_feedforward = Llama4TextMLP(config)
@@ -178,23 +187,32 @@ class Llama4TextMoe(nn.Module):
         num_experts_local = self.num_experts
 
         # Expand tokens across experts: (token_count, num_experts_local, hidden_dim)
-        expanded_tokens = hidden_states.unsqueeze(1).expand(token_count, num_experts_local, hidden_dim)
+        expanded_tokens = hidden_states.unsqueeze(1).expand(
+            token_count, num_experts_local, hidden_dim
+        )
 
         # Weight tokens per-expert
         weights = router_weights.unsqueeze(-1)  # (token_count, num_experts_local, 1)
-        routed = expanded_tokens * weights  # (token_count, num_experts_local, hidden_dim)
+        routed = (
+            expanded_tokens * weights
+        )  # (token_count, num_experts_local, hidden_dim)
 
         # Rearrange to run per-expert processing in batch: (num_experts_local, token_count, hidden_dim) -> (num_experts_local*token_count, hidden_dim)
-        routed = routed.permute(1, 0, 2).contiguous().view(num_experts_local * token_count, hidden_dim)
+        routed = (
+            routed.permute(1, 0, 2)
+            .contiguous()
+            .view(num_experts_local * token_count, hidden_dim)
+        )
 
         # Run experts using the expert container
-        expert_out_flat = self.expert_container(routed)  # (num_experts_local*token_count, hidden_dim)
+        expert_out_flat = self.expert_container(
+            routed
+        )  # (num_experts_local*token_count, hidden_dim)
 
         # Reshape back to (num_experts_local, token_count, hidden_dim) and sum across experts -> (token_count, hidden_dim)
         expert_out = expert_out_flat.view(num_experts_local, token_count, hidden_dim)
         final_output = expert_out.sum(dim=0)
         return final_output
-
 
     def sparse_routing(self, router_weights, router_top_indices, hidden_states):
         """
@@ -202,13 +220,13 @@ class Llama4TextMoe(nn.Module):
         router_top_indices: (T, top_k)
         hidden_states:      (T, D)
         """
-        
+
         final_output = torch.zeros_like(hidden_states)
 
         # For each expert, gather the tokens assigned to it and run the per-expert
         # processing only on those tokens (sparse execution).
         for expert_id in range(self.num_experts):
-            mask = (router_top_indices == expert_id)
+            mask = router_top_indices == expert_id
             if not mask.any():
                 continue
 
@@ -226,30 +244,45 @@ class Llama4TextMoe(nn.Module):
             # per-expert forward here.
 
             # Compute combined projection for this expert only
-            combined = torch.einsum('nd,hd->nh', expert_input, self.expert_container.expert_combined_proj[expert_id])
-            gate_logits, up_features = combined.split(self.expert_container.expert_hidden_dim, dim=-1)
+            combined = torch.einsum(
+                "nd,ho->no",
+                expert_input,
+                self.expert_container.expert_combined_proj[expert_id],
+            )
+            gate_logits, up_features = combined.split(
+                self.expert_container.expert_hidden_dim, dim=-1
+            )
             gate_scalar = torch.sigmoid(gate_logits.mean(dim=-1, keepdim=True))
             up_activated = self.expert_container.activation_fn(up_features)
-            expert_out = torch.einsum('nf,fd->nd', up_activated, self.expert_container.expert_down_proj[expert_id])
+            expert_out = torch.einsum(
+                "nf,fd->nd",
+                up_activated,
+                self.expert_container.expert_down_proj[expert_id],
+            )
 
             weights = router_weights[token_indices, k_indices].unsqueeze(-1)
             final_output[token_indices] += expert_out * weights * gate_scalar
 
         return final_output
 
-
     def forward(self, hidden_states, mode="dense"):
         batch_size, seq_length, hidden_dim = hidden_states.shape
 
         # Flatten tokens
         token_count = batch_size * seq_length
-        hidden_states = hidden_states.view(token_count, self.hidden_dim)  # (token_count, hidden_dim)
+        hidden_states = hidden_states.view(
+            token_count, self.hidden_dim
+        )  # (token_count, hidden_dim)
 
         # Router logits
-        router_logits = self.routing_weights(hidden_states)  # (token_count, num_experts)
+        router_logits = self.routing_weights(
+            hidden_states
+        )  # (token_count, num_experts)
 
         # Top-k selection
-        router_top_value, router_top_indices = torch.topk(router_logits, self.top_k, dim=1)  # (token_count, top_k)
+        router_top_value, router_top_indices = torch.topk(
+            router_logits, self.top_k, dim=1
+        )  # (token_count, top_k)
 
         if mode == "dense":
             # Dense uses full routing weights
@@ -259,7 +292,9 @@ class Llama4TextMoe(nn.Module):
         elif mode == "sparse":
             # Sparse uses only top-k weights
             router_weights = torch.sigmoid(router_top_value)  # (token_count, top_k)
-            routed_out = self.sparse_routing(router_weights, router_top_indices, hidden_states)
+            routed_out = self.sparse_routing(
+                router_weights, router_top_indices, hidden_states
+            )
         else:
             raise ValueError("mode must be 'dense' or 'sparse'")
 
@@ -268,3 +303,19 @@ class Llama4TextMoe(nn.Module):
         final = shared_out + routed_out
 
         return final.view(batch_size, seq_length, hidden_dim)
+
+
+if __name__ == "__main__":
+    config = Llama4TextConfig()
+    moe_layer = Llama4TextMoe(config)
+
+    batch_size = 2
+    seq_length = 4
+    hidden_dim = config.hidden_size
+
+    dummy_input = torch.randn(batch_size, seq_length, hidden_dim)
+    # output_dense = moe_layer(dummy_input, mode="dense")
+    output_sparse = moe_layer(dummy_input, mode="sparse")
+
+    # print("Dense MoE output shape:", output_dense.shape)
+    print("Sparse MoE output shape:", output_sparse.shape)
