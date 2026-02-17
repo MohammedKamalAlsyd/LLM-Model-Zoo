@@ -1,0 +1,40 @@
+graph TD
+    subgraph Inputs
+        I["Input Image<br/>(Pixel Values)"]
+        T["Input Text<br/>(Token IDs)"]
+    end
+
+    subgraph Vision_Pipeline ["Vision Pipeline"]
+        P_Emb["Patch Embedding<br/>(Unfold + Linear)"]
+        V_Enc["Vision Encoder Stack<br/>(Transformer Layers)"]
+        V_Adapt["Vision Adapter<br/>(Pixel Shuffle + MLP)"]
+        
+        I --> P_Emb --> V_Enc --> V_Adapt
+    end
+
+    subgraph Text_Preparation ["Text Preparation"]
+        T_Emb["Text Embeddings"]
+        M_Proj["Multi-Modal Projector<br/>(Linear Layer)"]
+        
+        T --> T_Emb
+        V_Adapt --> M_Proj
+    end
+
+    subgraph Merge_Logic ["Merge Logic"]
+        Merge["masked_scatter_<br/>(Injects Vision Features into<br/>Text Stream at Placeholder Indices)"]
+    end
+
+    subgraph Language_Model ["Llama 4 Decoder"]
+        L4_Layers["Stack of Llama 4<br/>Decoder Layers"]
+        LM_Head["LM Head<br/>(Linear)"]
+        Output["Logits / Next Token"]
+    end
+
+    T_Emb --> Merge
+    M_Proj --> Merge
+    Merge --> L4_Layers
+    L4_Layers --> LM_Head --> Output
+
+    style Merge fill:#f9f,stroke:#333,stroke-width:2px
+    style Vision_Pipeline fill:#e1f5fe,stroke:#0277bd
+    style Language_Model fill:#fff3e0,stroke:#ef6c00
