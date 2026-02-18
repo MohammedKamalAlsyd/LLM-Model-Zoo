@@ -380,7 +380,7 @@ class PixtralAttentionLayer(nn.Module):
         attention_mask: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool | None = None,
-    ) -> tuple[torch.FloatTensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): Input to the layer of shape `(batch, seq_len, embed_dim)`.
