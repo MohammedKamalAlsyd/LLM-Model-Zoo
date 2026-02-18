@@ -12,9 +12,11 @@ from typing import Optional
 # Configuration
 # ============================================================================
 
+
 @dataclass
 class PixtralConfig:
     """Configuration class for Pixtral model architecture."""
+
     head_dim: int = 64
     num_heads: int = 16
     attention_dropout: float = 0.0
@@ -31,10 +33,11 @@ class PixtralConfig:
 # Helper Methods
 # --------
 
+
 def rotate_half(hidden_state: torch.Tensor) -> torch.Tensor:
     """
     Rotate half the hidden dimensions of the input.
-    
+
     Used in RoPE to apply rotation: (x1, x2) -> (-x2, x1)
     """
     x1 = hidden_state[..., : hidden_state.shape[-1] // 2]
@@ -43,8 +46,11 @@ def rotate_half(hidden_state: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, 
-    sin: torch.Tensor, unsqueeze_dim: int = 1
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
 ) -> tuple:
     """
     Apply rotary position embeddings to query and key tensors.
@@ -66,6 +72,7 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
 
 def position_ids_in_meshgrid(patch_embeds_list, max_width):
     """
@@ -90,24 +97,25 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
 # Rotary Position Embeddings (RoPE) - 2D Grid-based
 # ============================================================================
 
+
 class PixtraRotaryEmbedding(nn.Module):
     """
     2D Rotary Position Embedding for image tokens.
-    
+
     Key difference from standard RoPE: Each pixel position gets its own frequency
     based on its 2D location (height, width) in the image grid.
-    
+
     Outputs tensor of shape (batch, height * width, dim) with position embeddings
     where each token gets a positional embedding based on its grid position.
     """
-    
+
     inv_freq: torch.Tensor  # Type hint for `register_buffer`
 
     def __init__(self, config: PixtralConfig) -> None:
         super().__init__()
         self.config = config
         self.rope_base = config.rope_theta
-        
+
         # Compute and register inverse frequencies
         inv_freq = self.compute_default_rope_parameters()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -120,10 +128,10 @@ class PixtraRotaryEmbedding(nn.Module):
     def compute_default_rope_parameters(self) -> torch.Tensor:
         """
         Compute inverse frequencies for 2D grid-based RoPE.
-        
+
         Unlike standard RoPE which uses sequence position, this creates a 2D grid
         where each (height, width) position gets separate frequency components.
-        
+
         Returns:
             Tensor of shape (patches_total, dim) with inverse frequencies
         """
@@ -139,7 +147,7 @@ class PixtraRotaryEmbedding(nn.Module):
 
         # Compute base frequencies
         freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        
+
         # Create separate frequency maps for height and width
         freqs_h = torch.outer(h, freqs[::2]).float()  # shape: (patches, dim/4)
         freqs_w = torch.outer(w, freqs[1::2]).float()  # shape: (patches, dim/4)
@@ -151,7 +159,9 @@ class PixtraRotaryEmbedding(nn.Module):
                 freqs_w[None, :, :].repeat(max_patches_per_side, 1, 1),  # (H, W, dim/4)
             ],
             dim=-1,  # (H, W, dim/2)
-        ).reshape(-1, dim // 2)  # (H*W, dim/2)
+        ).reshape(
+            -1, dim // 2
+        )  # (H*W, dim/2)
 
         # Duplicate to match full dimension
         inv_freq = torch.cat((inv_freq, inv_freq), dim=-1)  # (H*W, dim)
@@ -164,11 +174,11 @@ class PixtraRotaryEmbedding(nn.Module):
     def forward(self, hidden_state: torch.Tensor, position_ids: torch.Tensor) -> tuple:
         """
         Compute cos and sin components of rotary embeddings.
-        
+
         Args:
             hidden_state: Hidden states for dtype conversion
             position_ids: Position indices to look up in inverse frequencies
-            
+
         Returns:
             Tuple of (cos, sin) embeddings
         """
@@ -179,15 +189,15 @@ class PixtraRotaryEmbedding(nn.Module):
         return cos.to(dtype=hidden_state.dtype), sin.to(dtype=hidden_state.dtype)
 
 
-
 # ============================================================================
 # Feed-Forward Network (MLP)
 # ============================================================================
 
+
 class PixtralMLP(nn.Module):
     """
     Feed-forward network with Gated Linear Units (GLU) architecture.
-    
+
     Structure: (gate_proj * up_proj) -> activation -> down_proj
     This design allows better expressiveness compared to standard dense layers.
     """
@@ -196,22 +206,22 @@ class PixtralMLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        
+
         # Projection layers (no bias)
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        
+
         # Activation function
         self.act_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the MLP.
-        
+
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
-            
+
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
@@ -226,10 +236,11 @@ class PixtralMLP(nn.Module):
 # Layer Normalization (RMS Norm)
 # ============================================================================
 
+
 class PixtralRMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization.
-    
+
     More computationally efficient than standard LayerNorm while providing
     similar stabilization benefits during training.
     """
@@ -242,20 +253,20 @@ class PixtralRMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Apply RMS normalization to input.
-        
+
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
-            
+
         Returns:
             Normalized tensor with same shape
         """
         # Store original dtype and convert to float32 for stability
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        
+
         # Compute variance along last dimension
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        
+
         # Normalize and scale back to original dtype
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
@@ -265,10 +276,11 @@ class PixtralRMSNorm(nn.Module):
 # Layer Normalization (RMS Norm)
 # ============================================================================
 
+
 class PixtralAttention(nn.Module):
     """
     Multi-head attention mechanism for Pixtral model.
-    
+
     Key features:
     - Supports both self-attention and cross-attention
     - Uses 2D RoPE for positional embeddings
@@ -280,25 +292,34 @@ class PixtralAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        
+
         # Ensure hidden size is divisible by number of heads
-        assert self.hidden_size % self.num_attention_heads == 0, "Hidden size must be divisible by number of heads"
-        
+        assert (
+            self.hidden_size % self.num_attention_heads == 0
+        ), "Hidden size must be divisible by number of heads"
+
         # Projection layers for query, key, value (no bias)
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        
+
         # Output projection layer (no bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        
+
         # Dropout for attention probabilities
         self.attn_dropout = nn.Dropout(config.attention_dropout)
 
-    def attention_forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, scaling: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+    def attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        scaling: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute attention output given query, key, value tensors.
-        
+
         Args:
             query: Query tensor of shape (batch, heads, seq_len_q, head_dim)
             key: Key tensor of shape (batch, heads, seq_len_kv, head_dim)
@@ -310,22 +331,27 @@ class PixtralAttention(nn.Module):
         """
         # Compute scaled dot product attention scores
         attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scaling
-        
+
         # Apply attention mask if provided
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
-        
+
         # Compute attention probabilities
-        attn_weights  = torch.softmax(attn_scores, dim=-1)
-        attn_weights  = self.attn_dropout(attn_weights )
-        
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
         # Compute attention output
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output, attn_weights 
-    
+        return attn_output, attn_weights
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None, output_attentions: bool | None = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool | None = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute multi-head attention output.
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
@@ -336,25 +362,43 @@ class PixtralAttention(nn.Module):
             Tuple of (attention_output, attention_weights)
         """
         batch_size, patches, _ = hidden_states.size()
-        
+
         # Project hidden states to query, key, value
-        query = self.q_proj(hidden_states).view(batch_size, patches, self.num_attention_heads, self.head_dim).transpose(1, 2)  # (batch, heads, seq_len, head_dim)
-        key   = self.k_proj(hidden_states).view(batch_size, patches, self.num_attention_heads, self.head_dim).transpose(1, 2)  # (batch, heads, seq_len, head_dim)
-        value = self.v_proj(hidden_states).view(batch_size, patches, self.num_attention_heads, self.head_dim).transpose(1, 2)  # (batch, heads, seq_len, head_dim)
-        
+        query = (
+            self.q_proj(hidden_states)
+            .view(batch_size, patches, self.num_attention_heads, self.head_dim)
+            .transpose(1, 2)
+        )  # (batch, heads, seq_len, head_dim)
+        key = (
+            self.k_proj(hidden_states)
+            .view(batch_size, patches, self.num_attention_heads, self.head_dim)
+            .transpose(1, 2)
+        )  # (batch, heads, seq_len, head_dim)
+        value = (
+            self.v_proj(hidden_states)
+            .view(batch_size, patches, self.num_attention_heads, self.head_dim)
+            .transpose(1, 2)
+        )  # (batch, heads, seq_len, head_dim)
+
         # Apply RoPE if position embeddings are provided
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        
+
         # Compute attention output
-        scaling_factor = 1.0 / (self.head_dim ** 0.5)
-        attn_output, attn_weights = self.attention_forward(query, key, value, attention_mask=attention_mask, scaling=scaling_factor)
-        
+        scaling_factor = 1.0 / (self.head_dim**0.5)
+        attn_output, attn_weights = self.attention_forward(
+            query, key, value, attention_mask=attention_mask, scaling=scaling_factor
+        )
+
         # Project back to hidden size
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, patches, self.hidden_size)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, patches, self.hidden_size)
+        )
         attn_output = self.o_proj(attn_output)
-        
+
         return attn_output, attn_weights if output_attentions else None
 
 
@@ -365,15 +409,14 @@ class PixtralAttentionLayer(nn.Module):
     """
     Single layer of attention followed by feed-forward network with residual connections.
     """
- 
+
     def __init__(self, config: PixtralConfig):
         super().__init__()
         self.attention_norm = PixtralRMSNorm(config.hidden_size)
         self.ffn_norm = PixtralRMSNorm(config.hidden_size)
         self.feed_forward = PixtralMLP(config)
         self.attention = PixtralAttention(config)
-        
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -407,6 +450,80 @@ class PixtralAttentionLayer(nn.Module):
 
         if output_attentions:
             outputs += (attn_weights,)
-        
+
         return outputs
 
+
+# ============================================================================
+# Transformer consisting of multiple attention layers
+# ============================================================================
+class PixtralTransformer(nn.Module):
+    """
+    Stack of attention layers for the Pixtral model.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.layers = torch.nn.ModuleList()
+        for _ in range(config.num_hidden_layers):
+            self.layers.append(PixtralAttentionLayer(config))
+
+    def forward(
+        self,
+        input_embeds,
+        attention_mask,
+        position_embeddings,
+        output_attentions,
+        output_hidden_states,
+        return_dict=False,
+    ):
+        """
+        Args:
+            input_embeds: Input tensor of shape (batch, seq_len, hidden_size)
+            attention_mask: Attention mask tensor (broadcastable to (batch, heads, seq_len, seq_len))
+            position_embeddings: Tuple of (cos, sin) tensors for RoPE
+            output_attentions: Whether to return attention weights
+            output_hidden_states: Whether to return hidden states from all layers
+            return_dict: Whether to return a dictionary of outputs or a tuple
+        """
+        hidden_states = input_embeds
+        all_attentions = (
+            []
+        )  # intialize it to avoid type error when output_attentions is False
+        encoder_states = (
+            []
+        )  # intialize it to avoid type error when output_hidden_states is False
+
+        for layer in self.layers:
+            if output_hidden_states:
+                encoder_states = encoder_states + [hidden_states]
+
+            layer_outputs = layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                output_attentions=output_attentions,
+            )
+
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_attentions = all_attentions + [layer_outputs[1]]
+
+        if output_hidden_states:
+            encoder_states = encoder_states + [hidden_states]
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [hidden_states, encoder_states, all_attentions]
+                if v is not None
+            )
+
+        outputs = {
+            "last_hidden_state": hidden_states,
+            "hidden_states": tuple(encoder_states) if output_hidden_states else None,
+            "attentions": tuple(all_attentions) if output_attentions else None,
+        }
+
+        return outputs
