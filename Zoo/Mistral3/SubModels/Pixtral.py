@@ -356,4 +356,57 @@ class PixtralAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         
         return attn_output, attn_weights if output_attentions else None
+
+
+# ============================================================================
+# Attention Layer with Residual Connection
+# ============================================================================
+class PixtralAttentionLayer(nn.Module):
+    """
+    Single layer of attention followed by feed-forward network with residual connections.
+    """
  
+    def __init__(self, config: PixtralConfig):
+        super().__init__()
+        self.attention_norm = PixtralRMSNorm(config.hidden_size)
+        self.ffn_norm = PixtralRMSNorm(config.hidden_size)
+        self.feed_forward = PixtralMLP(config)
+        self.attention = PixtralAttention(config)
+        
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        output_attentions: bool | None = None,
+    ) -> tuple[torch.FloatTensor]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): Input to the layer of shape `(batch, seq_len, embed_dim)`.
+            attention_mask (`torch.FloatTensor`): Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
+            output_attentions (`bool`, *optional*, defaults to `False`): Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned tensors for more detail.
+        """
+        residual = hidden_states
+
+        hidden_states = self.attention_norm(hidden_states)
+        hidden_states, attn_weights = self.attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            output_attentions=output_attentions,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.ffn_norm(hidden_states)
+        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+        
+        return outputs
+
