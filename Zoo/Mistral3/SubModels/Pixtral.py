@@ -290,10 +290,12 @@ class PixtralRMSNorm(nn.Module):
         """
         # Store original dtype and convert to float32 for stability
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = hidden_states.to(dtype=torch.float32)
 
         # Compute variance along last dimension
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        variance = hidden_states.pow(2).mean(
+            -1, keepdim=True
+        )  # shape: (batch, seq_len, 1)
 
         # Normalize and scale back to original dtype
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
@@ -615,17 +617,19 @@ class PixtralVisionModel(nn.Module):
         patch_embeds = torch.cat(
             [p.flatten(1).T for p in patch_embeds_list], dim=0
         ).unsqueeze(0)
-        patch_embeds = self.ln_pre(patch_embeds)
+        patch_embeds = self.ln_pre(
+            patch_embeds
+        )  # Shape: (1, total_patches (Sum of images patches), hidden_size)
 
         # positional embeddings
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.config.image_size // self.config.patch_size,
-        )
+        )  # Shape: (total_patches,)
 
         position_embeddings = self.patch_positional_embedding(
             patch_embeds, position_ids
-        )
+        )  # Tuple of (cos, sin) tensors for RoPE, each of shape (total_patches, hidden_size)
 
         attention_mask = generate_block_attention_mask(
             [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
@@ -638,4 +642,4 @@ class PixtralVisionModel(nn.Module):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             return_dict=True,
-        )
+        )  # Note Rope Added in each Transformer Layer not single time here
