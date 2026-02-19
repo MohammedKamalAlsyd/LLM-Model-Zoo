@@ -20,7 +20,7 @@ from typing import Iterable
 
 import torch
 from torch import nn
-from Mistral3 import Mistral3RMSNorm, Mistral3Config
+from Zoo.Mistral3.SubModels.Ministral3 import Mistral3RMSNorm, Mistral3Config
 
 
 class Mistral3PatchMerger(nn.Module):

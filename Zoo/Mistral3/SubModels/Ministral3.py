@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from Pixtral import PixtralConfig
 
 @dataclass
-class Mistral3TextConfig:
+class Ministral3Config:
     attention_dropout: float = 0.0
     head_dim: int = 128
     hidden_size: int = 4096
@@ -20,7 +20,7 @@ class Mistral3TextConfig:
 class Mistral3Config:
     spatial_merge_size: int = 2
     vocab_size: int = 131072
-    text_config: Mistral3TextConfig = Mistral3TextConfig()
+    text_config: Ministral3Config = Ministral3Config()
     vision_config: PixtralConfig = PixtralConfig()
 
 
