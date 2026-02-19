@@ -27,6 +27,7 @@ class PixtralConfig:
     num_hidden_layers: int = 24
     patch_size: int = 14
     rope_theta: float = 100000.0
+    num_channels: int = 3
 
 
 # --------
@@ -93,12 +94,39 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     return torch.cat(positions)
 
 
+def generate_block_attention_mask(patch_embeds_list, tensor):
+    """
+    Generate a block-diagonal attention mask for a sequence of patch embeddings.
+    This mask allows full attention within each image's patches but prevents attention across different images in the batch.
+    Args:
+        patch_embeds_list: List of patch embedding tensors, each of shape (batch, channels, height, width)
+        tensor: The input tensor for which the attention mask is being generated (used to determine dtype and device)
+    Returns:
+        A block-diagonal attention mask tensor of shape (batch, 1, seq_len, seq_len) where seq_len is the total number of patches across all images in the batch. The mask has 0s for positions within the same image and -inf for positions across different images, allowing attention only within each image's patches.
+    """
+    dtype = tensor.dtype
+    device = tensor.device
+    seq_len = tensor.shape[1]
+    d_min = torch.finfo(dtype).min
+    causal_mask = torch.full(
+        (seq_len, seq_len), fill_value=d_min, dtype=dtype, device=device
+    )
+
+    block_end_idx = torch.tensor(patch_embeds_list).cumsum(-1)
+    block_start_idx = torch.tensor([0] + patch_embeds_list[:-1]).cumsum(-1)
+    for start, end in zip(block_start_idx, block_end_idx):
+        causal_mask[start:end, start:end] = 0
+
+    causal_mask = causal_mask[None, None, :, :].expand(tensor.shape[0], 1, -1, -1)
+    return causal_mask
+
+
 # ============================================================================
 # Rotary Position Embeddings (RoPE) - 2D Grid-based
 # ============================================================================
 
 
-class PixtraRotaryEmbedding(nn.Module):
+class PixtralRotaryEmbedding(nn.Module):
     """
     2D Rotary Position Embedding for image tokens.
 
@@ -527,3 +555,87 @@ class PixtralTransformer(nn.Module):
         }
 
         return outputs
+
+
+# ============================================================================
+# Vision Model for Pixtral
+# ============================================================================
+
+
+class PixtralVisionModel(nn.Module):
+    """
+    Vision model for Pixtral architecture.
+
+    This model processes image inputs and produces hidden states that can be
+    fed into a language model for vision-language tasks.
+    """
+
+    def __init__(self, config: PixtralConfig):
+        super().__init__()
+        self.config = config
+        self.patch_conv = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=config.hidden_size,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
+            bias=False,
+        )
+        self.patch_size = config.patch_size
+        self.ln_pre = PixtralRMSNorm(config.hidden_size, eps=1e-5)
+        self.transformer = PixtralTransformer(config)
+        self.patch_positional_embedding = PixtralRotaryEmbedding(config)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_sizes: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+    ):
+        """
+        Args:
+            pixel_values: Tensor of shape (batch, channels, height, width) containing the input images.
+            image_sizes: Optional tensor of shape (batch, 2) containing the original height and width of each image in the batch. If None, it is assumed all images have the same size as the input tensor.
+            output_hidden_states: Whether to return hidden states from all layers of the transformer.
+            output_attentions: Whether to return attention weights from all layers of the transformer.
+        """
+        if image_sizes is None:
+            batch_size, _, height, width = pixel_values.shape
+            image_sizes = torch.tensor([(height, width)] * batch_size)
+
+        # pass images through initial convolution independently
+        target_dtype = self.patch_conv.weight.dtype
+        patch_embeds = self.patch_conv(pixel_values.to(dtype=target_dtype))
+        patch_embeds_list = [
+            embed[..., : (size[0] // self.patch_size), : (size[1] // self.patch_size)]
+            for embed, size in zip(patch_embeds, image_sizes)
+        ]
+
+        # flatten to a single sequence
+        patch_embeds = torch.cat(
+            [p.flatten(1).T for p in patch_embeds_list], dim=0
+        ).unsqueeze(0)
+        patch_embeds = self.ln_pre(patch_embeds)
+
+        # positional embeddings
+        position_ids = position_ids_in_meshgrid(
+            patch_embeds_list,
+            max_width=self.config.image_size // self.config.patch_size,
+        )
+
+        position_embeddings = self.patch_positional_embedding(
+            patch_embeds, position_ids
+        )
+
+        attention_mask = generate_block_attention_mask(
+            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
+        )
+
+        return self.transformer(
+            patch_embeds,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
