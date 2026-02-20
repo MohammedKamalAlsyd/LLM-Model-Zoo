@@ -9,7 +9,7 @@ preserving public attribute names so checkpoints (Hugging Face weights)
 can be loaded without name changes.
 """
 
-from typing import Optional
+from typing import Optional,Dict, Any
 
 import torch
 import torch.nn as nn
@@ -45,12 +45,15 @@ class Ministral3Config:
     num_key_value_heads: int = 8  # For GQA
     rms_norm_eps: float = 1e-5
     rope_parameters: dict = RopeParameters().__dict__
+    vocab_size: int = 131072
+    pad_token_id: int | None = 11
+    bos_token_id: int | None = 1
+    eos_token_id: int | None = 2
 
 
 @dataclass
 class Mistral3Config:
     spatial_merge_size: int = 2
-    vocab_size: int = 131072
     text_config: Ministral3Config = Ministral3Config()
     vision_config: PixtralConfig = PixtralConfig()
 
@@ -90,6 +93,88 @@ def _get_llama_4_attn_scale(
         1 + torch.floor(positions_ids / max_position_embeddings)
     )
     return scaling.unsqueeze(-1)
+
+
+def create_causal_mask(
+    config,
+    inputs_embeds: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_values: Optional[KVCache] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Build an additive causal attention mask.
+
+    Returns:
+        Tensor of shape (batch, 1, query_length, key_value_length)
+        containing:
+            0        → allowed attention
+            -inf     → masked attention
+
+    Compatible with:
+        attn_weights = attn_weights + attention_mask
+    """
+
+    if inputs_embeds is None:
+        return None
+    
+    batch_size, query_length, _ = inputs_embeds.shape
+    device = inputs_embeds.device
+    dtype = inputs_embeds.dtype
+
+    # -----------------------------------------------------
+    # Determine total KV length (past + current)
+    # -----------------------------------------------------
+    past_length = 0
+    if past_key_values is not None:
+        past_length = past_key_values.num_items()
+
+    kv_length = past_length + query_length
+
+    # -----------------------------------------------------
+    # Base causal mask
+    # -----------------------------------------------------
+    # Build (query_length, kv_length) matrix
+    mask = torch.full(
+        (query_length, kv_length),
+        fill_value=torch.finfo(dtype).min,
+        device=device,
+    )
+
+    # Allow attention to previous + current tokens
+    mask = torch.triu(mask, diagonal=1 + past_length)
+
+    # -----------------------------------------------------
+    # Optional sliding window support
+    # -----------------------------------------------------
+    sliding_window = getattr(config.text_config, "sliding_window", None)
+
+    if sliding_window is not None:
+        # Create window constraint
+        q_ids = torch.arange(query_length, device=device) + past_length
+        kv_ids = torch.arange(kv_length, device=device)
+
+        distance = q_ids[:, None] - kv_ids[None, :]
+        window_mask = distance <= sliding_window
+
+        # Combine with causal mask
+        mask = torch.where(window_mask, mask, torch.finfo(dtype).min)
+
+    # -----------------------------------------------------
+    # Expand to 4D (batch, 1, q_len, kv_len)
+    # -----------------------------------------------------
+    mask = mask.unsqueeze(0).unsqueeze(1)
+    mask = mask.expand(batch_size, 1, query_length, kv_length)
+
+    # -----------------------------------------------------
+    # Apply padding mask if provided
+    # -----------------------------------------------------
+    if attention_mask is not None:
+        # Expected shape: (batch, kv_length)
+        padding_mask = attention_mask[:, None, None, :]
+        padding_mask = (1.0 - padding_mask) * torch.finfo(dtype).min
+        mask = mask + padding_mask
+
+    return mask
 
 
 class Ministral3Attention(nn.Module):
@@ -270,7 +355,6 @@ class Ministral3DecoderLayer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: KVCache | None = None,
-        use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -284,7 +368,6 @@ class Ministral3DecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
@@ -370,3 +453,149 @@ class Ministral3RotaryEmbedding(nn.Module):
         sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class Ministral3Model(nn.Module):
+    def __init__(self, config: Ministral3Config):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
+        self.layers = nn.ModuleList(
+            [
+                Ministral3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = Ministral3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Ministral3RotaryEmbedding(config=config)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: KVCache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, KVCache]:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        past_key_values = KVCache()
+
+        if cache_position is None and inputs_embeds is not None:
+            past_seen_tokens = (
+                past_key_values.num_items() if past_key_values is not None else 0
+            )
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+                dtype=torch.long,
+            )
+
+        if position_ids is None and cache_position is not None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, past_key_values
+
+
+
+class Ministral3ForCausalLM(nn.Module):
+    """
+    Minimal causal language modeling head on top of Ministral3Model.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = config
+        self.model = Ministral3Model(config)
+        self.vocab_size = config.vocab_size
+
+        # Output projection
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+        )
+
+        # Tie weights (if desired)
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[KVCache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Returns:
+            {
+                "loss": optional,
+                "logits": Tensor,
+                "past_key_values": optional
+            }
+        """
+
+        # -----------------------------------------------------
+        # 1. Run base transformer
+        # -----------------------------------------------------
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs["last_hidden_state"]
+
+        # -----------------------------------------------------
+        # 2. Optionally slice logits (generation optimization)
+        # -----------------------------------------------------
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+
+        logits = self.lm_head(hidden_states)
+
+        return {
+            "logits": logits,
+            "past_key_values": outputs.get("past_key_values", None),
+        }
