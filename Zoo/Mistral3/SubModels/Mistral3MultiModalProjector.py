@@ -20,7 +20,45 @@ from typing import Iterable
 
 import torch
 from torch import nn
-from Zoo.Mistral3.SubModels.Ministral3 import Mistral3RMSNorm, Mistral3Config
+from Zoo.Mistral3.SubModels.Ministral3 import Mistral3Config
+
+class Mistral3RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (RMSNorm) for vision features.
+
+    This module applies a rescaling-only normalization that scales the input 
+    by the inverse square root of the mean of the squared hidden states. 
+    It is used here to stabilize vision features before they are processed 
+    by the patch merger and projection layers.
+
+    The implementation forces calculations to `float32` for numerical stability 
+    before casting back to the original input precision.
+
+    Notes for users copying weights from Hugging Face:
+    - Keep the attribute name `weight` as-is.
+    - Ensure `eps` matches the `rms_norm_eps` defined in the text config.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply RMSNorm to the input features.
+
+        Args:
+            hidden_states: Input tensor of vision features 
+                (shape: [total_patches, embed_dim]).
+
+        Returns:
+            torch.Tensor: Normalized and rescaled features with the same 
+                shape as the input.
+        """
+        org_input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states.to(org_input_dtype)
 
 
 class Mistral3PatchMerger(nn.Module):
