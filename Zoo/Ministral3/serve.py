@@ -2,9 +2,8 @@ import os
 import sys
 import torch
 import gradio as gr
-from PIL import Image
 from pathlib import Path
-from huggingface_hub import snapshot_download, login
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 import gc
 from dotenv import load_dotenv
@@ -38,10 +37,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Mistral-3 is optimized for bfloat16
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
-# Authentication
-if token := os.getenv("HUGGING_FACE_HUB_TOKEN"):
-    login(token=token)
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+# No Need For Authentication
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # --- Lightweight Loader ---
 
