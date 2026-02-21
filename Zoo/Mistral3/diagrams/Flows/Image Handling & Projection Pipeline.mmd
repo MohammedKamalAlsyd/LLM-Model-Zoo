@@ -1,0 +1,67 @@
+flowchart TD
+    %% Input
+    pixel_values([pixel_values <br> Shape: Batch, Channels, H, W])
+    image_sizes([image_sizes])
+
+    %% Pixtral Vision Model
+    subgraph PixtralVisionModel["1. Pixtral Vision Model (Zoo/Mistral3/SubModels/Pixtral.py)"]
+        conv[Conv2d Patch Extraction<br>stride & kernel = patch_size]
+        flatten[Flatten & Concat per image]
+        ln_pre[PixtralRMSNorm]
+        
+        subgraph RoPE["2D Grid RoPE"]
+            pos_grid[Generate 2D Meshgrid Position IDs]
+            rope_emb[PixtralRotaryEmbedding<br>Compute Cos & Sin freqs]
+        end
+        
+        attn_mask[Generate Block-Diagonal<br>Attention Mask]
+        pix_transformer[PixtralTransformer<br>N layers of Self-Attention + MLP]
+    end
+
+    %% Mistral3 MultiModal Projector
+    subgraph MultiModalProjector["2. Mistral3 MultiModal Projector (Zoo/Mistral3/SubModels/Mistral3MultiModalProjector.py)"]
+        proj_norm[Mistral3RMSNorm]
+        
+        subgraph PatchMerger["Mistral3PatchMerger"]
+            unfold[Unfold spatial_merge_size blocks<br>e.g., 2x2 patches]
+            merge_linear[merging_layer Linear<br>Reduce dimension]
+        end
+        
+        subgraph MLP["MLP Projector"]
+            lin1[linear_1: Vision Hidden -> Text Hidden]
+            gelu[GELU Activation]
+            lin2[linear_2: Text Hidden -> Text Hidden]
+        end
+    end
+
+    %% Token Integration
+    subgraph TokenIntegration["3. Embedding Integration (Mistral3Model)"]
+        replacement_logic[Replace <image> tokens in text inputs_embeds<br>with the output projected patches]
+    end
+
+    %% Flow mappings
+    pixel_values --> conv
+    conv --> flatten
+    image_sizes --> flatten
+    flatten --> ln_pre
+    
+    ln_pre --> pos_grid
+    pos_grid --> rope_emb
+    
+    ln_pre --> pix_transformer
+    rope_emb --> pix_transformer
+    flatten --> attn_mask
+    attn_mask --> pix_transformer
+    
+    pix_transformer --> |"image_hidden_states<br>(total_patches, vision_hidden_size)"| proj_norm
+    proj_norm --> unfold
+    image_sizes --> unfold
+    unfold --> merge_linear
+    merge_linear --> lin1
+    lin1 --> gelu
+    gelu --> lin2
+    
+    lin2 --> |"Projected Features<br>(total_merged_patches, text_hidden_size)"| replacement_logic
+
+    classDef component fill:#fff3e0,stroke:#e65100,stroke-width:1px;
+    class pix_transformer,PatchMerger,MLP component;

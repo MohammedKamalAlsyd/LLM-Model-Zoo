@@ -1,0 +1,65 @@
+flowchart TD
+    %% Inputs
+    in_text([Text: input_ids])
+    in_img([Images: pixel_values])
+    in_size([image_sizes])
+
+    %% Main Wrapper
+    subgraph Mistral3ForConditionalGeneration["Mistral3ForConditionalGeneration"]
+        
+        subgraph Mistral3Model["Mistral3Model (Multimodal Fusion)"]
+            
+            %% Text Branch
+            subgraph TextEmbed["Text Embedding"]
+                embed[nn.Embedding]
+            end
+
+            %% Vision Branch
+            subgraph VisionTower["PixtralVisionModel"]
+                v_encoder[Pixtral Transformer]
+            end
+
+            %% Projection
+            subgraph Projector["Mistral3MultiModalProjector"]
+                v_proj[Patch Merger & MLP]
+            end
+
+            %% Fusion
+            subgraph TokenReplacement["Token Replacement"]
+                mask_scatter[Find 'image_token_index' placeholders<br/>Insert Image Features via masked_scatter]
+            end
+
+            %% Language Model
+            subgraph LLM["Ministral3ForCausalLM"]
+                decoder[Ministral3 Decoder Layers]
+                kv_cache[(KV Cache)]
+            end
+        end
+
+        lm_head[LM Head / Linear Projection]
+        loss[CrossEntropyLoss]
+    end
+
+    %% Flow
+    in_text --> embed
+    embed --> |inputs_embeds| mask_scatter
+
+    in_img --> v_encoder
+    in_size --> v_encoder
+    v_encoder --> |Vision Hidden States| v_proj
+    in_size --> v_proj
+    v_proj --> |Projected Image Features| mask_scatter
+
+    mask_scatter --> |Fused Embeddings| decoder
+    decoder <--> kv_cache
+    decoder --> |last_hidden_state| lm_head
+    lm_head --> out_logits([Logits])
+    
+    out_logits -.-> |If labels provided| loss
+    out_loss([Loss])
+    loss -.-> out_loss
+
+    classDef input fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef output fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    class in_text,in_img,in_size input;
+    class out_logits,out_loss output;
