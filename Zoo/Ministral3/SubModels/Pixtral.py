@@ -6,7 +6,7 @@ from torch import nn
 import torch
 from dataclasses import dataclass
 from typing import Optional
-from Zoo.Mistral3.utils.rotate_functions import apply_rotary_pos_emb
+from Zoo.Ministral3.utils.rotate_functions import apply_rotary_pos_emb
 
 
 # ============================================================================

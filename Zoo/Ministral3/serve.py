@@ -19,8 +19,8 @@ from Ministral3_Multimodal import (
     Ministral3MultimodalConfig,
     Ministral3ForConditionalGeneration
 )
-from SubModels.Ministral3 import Ministral3Config, RopeParameters
-from SubModels.Pixtral import PixtralConfig
+from Zoo.Ministral3.SubModels.Ministral3 import Ministral3Config, RopeParameters
+from Zoo.Ministral3.SubModels.Pixtral import PixtralConfig
 
 from transformers import AutoProcessor
 

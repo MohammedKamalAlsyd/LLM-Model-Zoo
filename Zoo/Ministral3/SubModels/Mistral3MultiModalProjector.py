@@ -20,7 +20,7 @@ from typing import Iterable
 
 import torch
 from torch import nn
-from Zoo.Mistral3.SubModels.Ministral3 import Mistral3Config
+from Zoo.Ministral3.Ministral3_Multimodal import Ministral3MultimodalConfig
 
 class Mistral3RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (RMSNorm) for vision features.
@@ -73,7 +73,7 @@ class Mistral3PatchMerger(nn.Module):
     - Do not change `spatial_merge_size` or `patch_size` semantics here.
     """
 
-    def __init__(self, config: Mistral3Config) -> None:
+    def __init__(self, config: Ministral3MultimodalConfig) -> None:
         super().__init__()
 
         hidden_size = config.vision_config.hidden_size
@@ -169,7 +169,7 @@ class Mistral3MultiModalProjector(nn.Module):
     from checkpoints.
     """
 
-    def __init__(self, config: Mistral3Config) -> None:
+    def __init__(self, config: Ministral3MultimodalConfig) -> None:
         super().__init__()
 
         # Normalize vision features before merging/projection

@@ -30,9 +30,8 @@ import torch
 import torch.nn as nn
 
 # Local utilities expected to exist in the repo
-from Pixtral import PixtralConfig
-from Zoo.Mistral3.utils.KVCache import KVCache
-from Zoo.Mistral3.utils.rotate_functions import apply_rotary_pos_emb
+from Zoo.Ministral3.utils.KVCache import KVCache
+from Zoo.Ministral3.utils.rotate_functions import apply_rotary_pos_emb
 
 
 # -----------------------

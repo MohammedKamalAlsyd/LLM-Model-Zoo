@@ -16,7 +16,7 @@ from torch import nn
 from SubModels.Ministral3 import Ministral3Config, Ministral3Model, RopeParameters
 from SubModels.Pixtral import PixtralConfig, PixtralVisionModel, position_ids_in_meshgrid, generate_block_attention_mask
 from SubModels.Mistral3MultiModalProjector import Mistral3MultiModalProjector
-from Zoo.Mistral3.utils.KVCache import KVCache
+from Zoo.Ministral3.utils.KVCache import KVCache
 
 
 # ============================================================================
