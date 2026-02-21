@@ -77,17 +77,6 @@ class Ministral3Config:
     eos_token_id: Optional[int] = 2
 
 
-@dataclass
-class Mistral3Config:
-    """
-    Higher-level multimodal configuration that composes text + vision configs.
-    This file primarily uses the text_config (Ministral3Config).
-    """
-    spatial_merge_size: int = 2
-    text_config: Ministral3Config = Ministral3Config()
-    vision_config: PixtralConfig = PixtralConfig()
-
-
 # -----------------------
 # Small utility functions
 # -----------------------
@@ -701,3 +690,9 @@ class Ministral3ForCausalLM(nn.Module):
             "logits": logits,
             "past_key_values": outputs.get("past_key_values", None),
         }
+    
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
