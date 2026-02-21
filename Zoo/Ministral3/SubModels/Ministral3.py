@@ -23,16 +23,15 @@ Notes:
    loading that relies on module attribute names will continue to work.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
 
 # Local utilities expected to exist in the repo
-from Zoo.Ministral3.utils.KVCache import KVCache
-from Zoo.Ministral3.utils.rotate_functions import apply_rotary_pos_emb
-
+from utils.KVCache import KVCache
+from utils.rotate_functions import apply_rotary_pos_emb
 
 # -----------------------
 # Configuration dataclasses
@@ -69,7 +68,7 @@ class Ministral3Config:
     num_hidden_layers: int = 34
     num_key_value_heads: int = 8  # For GQA-style grouped KV heads
     rms_norm_eps: float = 1e-5
-    rope_parameters: dict = RopeParameters().__dict__
+    rope_parameters: dict = field(default_factory=lambda: RopeParameters().__dict__)
     vocab_size: int = 131072
     pad_token_id: Optional[int] = 11
     bos_token_id: Optional[int] = 1

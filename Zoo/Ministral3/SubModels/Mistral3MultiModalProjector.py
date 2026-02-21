@@ -20,7 +20,7 @@ from typing import Iterable
 
 import torch
 from torch import nn
-from Zoo.Ministral3.Ministral3_Multimodal import Ministral3MultimodalConfig
+from Zoo.Ministral3.config import Ministral3MultimodalConfig
 
 class Mistral3RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (RMSNorm) for vision features.

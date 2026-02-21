@@ -13,24 +13,11 @@ import torch
 from torch import nn
 
 # Import your untouched submodels
-from SubModels.Ministral3 import Ministral3Config, Ministral3Model, RopeParameters
-from SubModels.Pixtral import PixtralConfig, PixtralVisionModel, position_ids_in_meshgrid, generate_block_attention_mask
+from SubModels.Ministral3 import Ministral3Model
+from SubModels.Pixtral import PixtralVisionModel, position_ids_in_meshgrid, generate_block_attention_mask
 from SubModels.Mistral3MultiModalProjector import Mistral3MultiModalProjector
-from Zoo.Ministral3.utils.KVCache import KVCache
-
-
-# ============================================================================
-# Configurations (Mapping directly to the provided JSON)
-# ============================================================================
-
-@dataclass
-class Ministral3MultimodalConfig:
-    spatial_merge_size: int = 2
-    image_token_index: int = 10
-    vision_feature_layer: int = -1
-    tie_word_embeddings: bool = False
-    text_config: Ministral3Config = field(default_factory=Ministral3Config)
-    vision_config: PixtralConfig = field(default_factory=PixtralConfig)
+from utils.KVCache import KVCache
+from config import Ministral3MultimodalConfig
 
 
 # ============================================================================

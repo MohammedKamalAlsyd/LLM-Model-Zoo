@@ -9,6 +9,13 @@ from safetensors import safe_open
 import gc
 from dotenv import load_dotenv
 
+# Navigates up until it finds the directory containing 'Zoo'
+current_path = Path(__file__).resolve()
+root_node = next(p for p in current_path.parents if (p / "Zoo").exists())
+
+if str(root_node) not in sys.path:
+    sys.path.insert(0, str(root_node))
+
 # Environment Setup
 load_dotenv()
 # Ensure we can import from the current directory (Zoo/Mistral3)
