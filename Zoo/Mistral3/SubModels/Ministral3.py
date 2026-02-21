@@ -691,8 +691,8 @@ class Ministral3ForCausalLM(nn.Module):
             "past_key_values": outputs.get("past_key_values", None),
         }
     
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value) -> None:
         self.model.embed_tokens = value
