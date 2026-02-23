@@ -34,7 +34,7 @@ from Zoo.Ministral3.SubModels.Pixtral import PixtralConfig
 from transformers import AutoProcessor
 
 # --- Constants ---
-HF_REPO = "mistralai/Ministral-3-8B-Instruct-2512"
+HF_REPO = "mistralai/Ministral-3-3B-Instruct-2512"
 LOCAL_DIR = "./saved_model/Ministral3"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Mistral-3 is optimized for bfloat16
@@ -238,7 +238,7 @@ def generate(model, processor, image, prompt, max_tokens=100, temp=0.7):
 # --- UI ---
 
 def main():
-    print("Starting Ministral-3 8B Multimodal Server...")
+    print("Starting Ministral-3 3b Multimodal Server...")
     model, processor = get_model_and_processor()
     
     def run_inference(image, text, max_new, temp):
@@ -250,7 +250,7 @@ def main():
             return f"Error: {str(e)}"
 
     with gr.Blocks(title="Ministral-3 Zoo") as app:
-        gr.Markdown(f"### Ministral-3 (8B) Multimodal on {DEVICE.upper()}")
+        gr.Markdown(f"### Ministral-3 (3b) Multimodal on {DEVICE.upper()}")
         with gr.Row():
             img = gr.Image(type="pil", label="Image")
             with gr.Column():
