@@ -7,9 +7,12 @@ from SubModels.Pixtral import PixtralConfig
 
 @dataclass
 class Ministral3MultimodalConfig:
+    # Top-level multimodal parameters
     spatial_merge_size: int = 2
     image_token_index: int = 10
     vision_feature_layer: int = -1
-    tie_word_embeddings: bool = False
+    tie_word_embeddings: bool = True 
+
+    # Nested configurations
     text_config: Ministral3Config = field(default_factory=Ministral3Config)
     vision_config: PixtralConfig = field(default_factory=PixtralConfig)

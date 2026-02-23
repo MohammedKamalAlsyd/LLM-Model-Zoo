@@ -3,7 +3,7 @@ import sys
 import torch
 import gradio as gr
 from pathlib import Path
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, login
 from safetensors import safe_open
 import gc
 from dotenv import load_dotenv
@@ -19,6 +19,9 @@ if str(root_node) not in sys.path:
 load_dotenv()
 # Ensure we can import from the current directory (Zoo/Mistral3)
 sys.path.append(os.path.dirname(__file__))
+HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN")
+if HF_TOKEN:
+    login(HF_TOKEN)
 
 # Import the specific configurations and the wrapper from your new file
 from Ministral3_Multimodal import (
@@ -53,11 +56,14 @@ def load_weights_into_model(model, directory, device):
     for file in files:
         with safe_open(file, framework="pt", device=DEVICE) as f:
             for key in f.keys():
-                if key in state_dict_keys:
-                    # Load -> Move to GPU -> Cast -> Assign
-                    tensor = f.get_tensor(key).to(device=device, dtype=DTYPE)
-                    _set_nested_param(model, key, tensor)
-                    del tensor
+                if key not in state_dict_keys:
+                    print(f"Skipping {key}, not found in custom model.")
+                    continue
+                
+                # Load -> Move to GPU -> Cast -> Assign
+                tensor = f.get_tensor(key).to(device=device, dtype=DTYPE)
+                _set_nested_param(model, key, tensor)
+                del tensor
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -83,12 +89,12 @@ def get_model_and_processor():
     snapshot_download(
         repo_id=HF_REPO, 
         local_dir=LOCAL_DIR, 
-        allow_patterns=["*.safetensors", "preprocessor_config.json", "tokenizer*", "chat_template.json"]
+        allow_patterns=["consolidated.safetensors", "preprocessor_config.json", "tokenizer*", "chat_template.json"]
     )
 
     print("Initializing Model Architecture...")
     
-    # 1. Map Text Config exactly to the JSON provided
+    # 1. Map Text Config for the 3B model
     rope_params = RopeParameters(
         beta_fast=32.0,
         beta_slow=1.0,
@@ -105,18 +111,19 @@ def get_model_and_processor():
     text_config = Ministral3Config(
         attention_dropout=0.0,
         head_dim=128,
-        hidden_size=4096,
-        intermediate_size=14336,
+        hidden_size=3072,           # Updated from 4096
+        intermediate_size=9216,     # Updated from 14336
         max_position_embeddings=262144,
         num_attention_heads=32,
-        num_hidden_layers=34,
+        num_hidden_layers=26,       # Updated from 34
         num_key_value_heads=8,
         rms_norm_eps=1e-05,
         vocab_size=131072,
+        tie_word_embeddings=True,   # Updated from False
         rope_parameters=rope_params.__dict__
     )
 
-    # 2. Map Vision Config exactly to the JSON provided
+    # 2. Map Vision Config (Dimensions remain similar, but added rope_params block)
     vision_config = PixtralConfig(
         attention_dropout=0.0,
         head_dim=64,
@@ -127,15 +134,18 @@ def get_model_and_processor():
         num_channels=3,
         num_hidden_layers=24,
         patch_size=14,
-        rope_theta=10000.0
+        rope_parameters={
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+        }
     )
 
-    # 3. Combine into the Multimodal wrapper matching the JSON
+    # 3. Combine into the Multimodal wrapper
     multimodal_config = Ministral3MultimodalConfig(
         spatial_merge_size=2,
         image_token_index=10,
         vision_feature_layer=-1,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,   # Updated to match text_config
         text_config=text_config,
         vision_config=vision_config
     )

@@ -39,7 +39,7 @@ from utils.rotate_functions import apply_rotary_pos_emb
 
 @dataclass
 class RopeParameters:
-    """Container for RoPE-related hyperparameters (kept simple here)."""
+    """Container for RoPE-related hyperparameters (YaRN scaling)."""
     beta_fast: float = 32.0
     beta_slow: float = 1.0
     factor: float = 16.0
@@ -51,28 +51,33 @@ class RopeParameters:
     rope_type: str = "yarn"
     type: str = "yarn"
 
-
 @dataclass
 class Ministral3Config:
     """
-    Minimal text-only model configuration used by the blocks in this file.
-    Keep attribute names and shapes aligned with the original implementation
-    for checkpoint compatibility.
+    Updated for Ministral-3B configuration.
     """
     attention_dropout: float = 0.0
     head_dim: int = 128
-    hidden_size: int = 4096
-    intermediate_size: int = 14336
+    hidden_act: str = "silu"
+    hidden_size: int = 3072           # Updated: 4096 -> 3072
+    intermediate_size: int = 9216     # Updated: 14336 -> 9216
     max_position_embeddings: int = 262144
     num_attention_heads: int = 32
-    num_hidden_layers: int = 34
-    num_key_value_heads: int = 8  # For GQA-style grouped KV heads
-    rms_norm_eps: float = 1e-5
-    rope_parameters: dict = field(default_factory=lambda: RopeParameters().__dict__)
+    num_hidden_layers: int = 26       # Updated: 34 -> 26
+    num_key_value_heads: int = 8 
+    rms_norm_eps: float = 1e-05
     vocab_size: int = 131072
+    tie_word_embeddings: bool = True  # Updated: 8B was False, 3B is True
+    rope_parameters: dict = field(default_factory=lambda: RopeParameters().__dict__)
+    
+    # Standard token IDs
     pad_token_id: Optional[int] = 11
     bos_token_id: Optional[int] = 1
     eos_token_id: Optional[int] = 2
+    
+    # Additional metadata from JSON
+    sliding_window: Optional[int] = None
+    use_cache: bool = True
 
 
 # -----------------------
@@ -694,3 +699,6 @@ class Ministral3ForCausalLM(nn.Module):
 
     def set_input_embeddings(self, value) -> None:
         self.model.embed_tokens = value
+
+    def tie_weights(self) -> None:
+        self.lm_head.weight = self.model.embed_tokens.weight

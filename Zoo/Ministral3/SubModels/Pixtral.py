@@ -14,13 +14,12 @@ from utils.rotate_functions import apply_rotary_pos_emb
 # ============================================================================
 
 
-@dataclass
 class PixtralConfig:
-    """Configuration class for Pixtral model architecture."""
+    """Configuration class for Pixtral model architecture (Vision Tower)."""
 
     head_dim: int = 64
-    num_heads: int = 16
     attention_dropout: float = 0.0
+    head_dim: int = 64
     hidden_size: int = 1024
     image_size: int = 1540
     intermediate_size: int = 4096
