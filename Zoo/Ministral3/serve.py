@@ -24,7 +24,7 @@ if HF_TOKEN:
     login(HF_TOKEN)
 
 # Import the specific configurations and the wrapper from your new file
-from Ministral3_Multimodal import (
+from Ministral3Multimodal import (
     Ministral3MultimodalConfig,
     Ministral3ForConditionalGeneration
 )
@@ -134,10 +134,6 @@ def get_model_and_processor():
         num_channels=3,
         num_hidden_layers=24,
         patch_size=14,
-        rope_parameters={
-            "rope_theta": 10000.0,
-            "rope_type": "default"
-        }
     )
 
     # 3. Combine into the Multimodal wrapper

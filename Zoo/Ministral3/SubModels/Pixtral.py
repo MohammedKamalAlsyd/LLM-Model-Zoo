@@ -13,7 +13,7 @@ from utils.rotate_functions import apply_rotary_pos_emb
 # Configuration
 # ============================================================================
 
-
+@dataclass
 class PixtralConfig:
     """Configuration class for Pixtral model architecture (Vision Tower)."""
 
