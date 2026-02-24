@@ -13,20 +13,20 @@ from utils.rotate_functions import apply_rotary_pos_emb
 # Configuration
 # ============================================================================
 
+
 @dataclass
 class PixtralConfig:
     """Configuration class for Pixtral model architecture (Vision Tower)."""
 
     head_dim: int = 64
     attention_dropout: float = 0.0
-    head_dim: int = 64
     hidden_size: int = 1024
     image_size: int = 1540
     intermediate_size: int = 4096
     num_attention_heads: int = 16
     num_hidden_layers: int = 24
     patch_size: int = 14
-    rope_theta: float = 100000.0
+    rope_theta: float = 10000.0
     num_channels: int = 3
 
 
@@ -215,7 +215,7 @@ class PixtralMLP(nn.Module):
         """
         # Gate mechanism: (gate * up) -> activation -> down
         down_proj = self.down_proj(
-            self.act_fn(self.up_proj(hidden_states) * self.gate_proj(hidden_states))
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         )
         return down_proj
 
@@ -550,7 +550,7 @@ class PixtralVisionModel(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor | None = None,
+        image_sizes: list[tuple[int, int]] | None = None,
         output_hidden_states: bool | None = None,
         output_attentions: bool | None = None,
     ):
@@ -563,7 +563,7 @@ class PixtralVisionModel(nn.Module):
         """
         if image_sizes is None:
             batch_size, _, height, width = pixel_values.shape
-            image_sizes = torch.tensor([(height, width)] * batch_size)
+            image_sizes = [(height, width)] * batch_size
 
         # pass images through initial convolution independently
         target_dtype = self.patch_conv.weight.dtype
@@ -582,10 +582,14 @@ class PixtralVisionModel(nn.Module):
         )  # Shape: (1, total_patches (Sum of images patches), hidden_size)
 
         # positional embeddings
-        position_ids = position_ids_in_meshgrid(
-            patch_embeds_list,
-            max_width=self.config.image_size // self.config.patch_size,
-        ).unsqueeze(0).to(patch_embeds.device)  # Shape: (1, total_patches)
+        position_ids = (
+            position_ids_in_meshgrid(
+                patch_embeds_list,
+                max_width=self.config.image_size // self.config.patch_size,
+            )
+            .unsqueeze(0)
+            .to(patch_embeds.device)
+        )  # Shape: (1, total_patches)
 
         position_embeddings = self.patch_positional_embedding(
             patch_embeds, position_ids

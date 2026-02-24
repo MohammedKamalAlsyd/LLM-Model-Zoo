@@ -28,6 +28,7 @@ from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
+import math
 
 # Local utilities expected to exist in the repo
 from utils.KVCache import KVCache
@@ -452,48 +453,125 @@ class Ministral3DecoderLayer(nn.Module):
 
 class Ministral3RotaryEmbedding(nn.Module):
     """
-    Rotary positional embedding helper.
+    Rotary positional embedding helper with YaRN (Yet another RoPE extension) support.
 
-    Produces (cos, sin) tensors which are applied to query/key tensors using
-    `apply_rotary_pos_emb`. The implementation follows the canonical RoPE
-    formulation, and returns cos/sin in the same dtype as the input tensors.
+    This implementation handles:
+    1. Standard RoPE (default).
+    2. YaRN RoPE (if rope_type="yarn" in config), which mixes interpolation and 
+       extrapolation using a linear ramp to support context extension.
     """
 
-    inv_freq: torch.Tensor  # type annotation for register_buffer linting
-
-    def compute_default_rope_parameters(self, config: Ministral3Config) -> Tuple[torch.Tensor, float]:
-        """
-        Compute the inverse frequency vector used to produce rotary angles.
-
-        Returns:
-            inv_freq: Tensor of shape (head_dim / 2,)
-            attention_scaling: float multiplier applied to cos/sin (unused except kept for API consistency)
-        """
-        base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
-
-        # Classic RoPE inverse frequency formula:
-        # inv_freq[i] = 1 / (base ** (i / dim))
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / float(dim))
-        )
-
-        attention_scaling = 1.0  # kept for API consistency
-        return inv_freq, attention_scaling
+    inv_freq: torch.Tensor
 
     def __init__(self, config: Ministral3Config):
         super().__init__()
         self.config = config
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
+        
+        # Calculate inverse frequencies and attention scaling factor
+        inv_freq, self.attention_scaling = self._compute_rope_parameters(config)
 
-        self.rope_type = self.config.rope_parameters.get("rope_type", "yarn")
-        inv_freq, self.attention_scaling = self.compute_default_rope_parameters(self.config)
-
-        # Register as non-persistent buffers so they won't be part of state_dict if not desired,
-        # but will be present on the right device when moved.
+        # Register as non-persistent buffers.
+        # They won't be saved in state_dict (weights), but move to device with the model.
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    def _compute_rope_parameters(self, config: Ministral3Config) -> Tuple[torch.Tensor, float]:
+        """
+        Computes the inverse frequencies and attention scaling factor based on config.
+        Supports 'default' and 'yarn' strategies.
+        """
+        # 1. Extract basic parameters
+        rope_params = config.rope_parameters
+        rope_type = rope_params.get("rope_type", "default")
+        base = rope_params.get("rope_theta", 1000000.0)
+        
+        # head_dim is usually hidden_size // num_heads
+        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+        dim = head_dim 
+
+        # 2. Basic RoPE generation (High precision for calculation)
+        # inv_freq = 1.0 / (base ** (arange / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+        # If not YaRN, return standard RoPE
+        if rope_type != "yarn":
+            return inv_freq, 1.0
+
+        # -----------------------------------------------------------------------
+        # YaRN Implementation
+        # -----------------------------------------------------------------------
+        
+        # Extract YaRN specific parameters
+        factor = rope_params.get("factor")
+        original_max_pos = rope_params.get("original_max_position_embeddings")
+        max_pos = config.max_position_embeddings
+
+        # If factor is missing, infer it from the expansion ratio
+        if factor is None and original_max_pos is not None:
+            factor = max_pos / original_max_pos
+        if factor is None or factor <= 1.0:
+            # Fallback to standard if no expansion is happening
+            return inv_freq, 1.0
+
+        beta_fast = rope_params.get("beta_fast", 32.0)
+        beta_slow = rope_params.get("beta_slow", 1.0)
+        mscale = rope_params.get("mscale", 1.0)
+        mscale_all_dim = rope_params.get("mscale_all_dim", 1.0)
+
+        # Helper: Calculate attention scaling (temperature scaling for softmax)
+        # This mitigates entropy issues in long contexts.
+        def get_mscale_factor(scale, mscale_val=1.0):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale_val * math.log(scale) + 1.0
+
+        attention_factor = 1.0
+        if mscale is not None and mscale_all_dim is not None:
+             attention_factor = get_mscale_factor(factor, mscale) / get_mscale_factor(factor, mscale_all_dim)
+        
+        # Helper: Find the dimension index corresponding to a specific frequency/rotation
+        def find_correction_dim(num_rotations, dim, base, max_position):
+            return (dim * math.log(max_position / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+        # Helper: Create a 0-to-1 linear ramp between low and high bounds
+        def linear_ramp_factor(min_val, max_val, dim_tensor):
+            if min_val == max_val:
+                max_val += 0.001 # Avoid div by zero
+            return torch.clamp((dim_tensor - min_val) / (max_val - min_val), 0, 1)
+
+        # 3. Compute YaRN Mixed Frequencies
+        
+        # A) Standard frequencies (extrapolation)
+        # pos_freqs = base ** (i / dim)
+        pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        
+        # B) Interpolated frequencies (divide freq by factor => stretch wavelength)
+        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+        # C) Determine mixing ramp
+        # We need to find which dimensions in the embedding vector are "fast" (high freq) vs "slow" (low freq).
+        # - High freq (lower indices) gets Extrapolation (standard RoPE).
+        # - Low freq (higher indices) gets Interpolation (stretched RoPE).
+        low_bound = find_correction_dim(beta_fast, dim, base, original_max_pos)
+        high_bound = find_correction_dim(beta_slow, dim, base, original_max_pos)
+
+        # Invert logic: low_bound in rotations maps to high index in vector, so we sort range carefully
+        # We clamp strictly to valid indices [0, dim/2]
+        low = max(math.floor(low_bound), 0)
+        high = min(math.ceil(high_bound), dim // 2 - 1)
+
+        # Create the ramp mask
+        # ramp is 0 where we want strict interpolation, 1 where we want strict extrapolation
+        ramp = linear_ramp_factor(low, high, torch.arange(dim // 2, dtype=torch.float32))
+
+        # D) Combine: (Interpolation * (1-ramp)) + (Extrapolation * ramp)
+        inv_freq_yarn = (
+            inv_freq_interpolation * (1 - ramp) 
+            + inv_freq_extrapolation * ramp
+        )
+
+        return inv_freq_yarn, attention_factor
 
     def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -501,32 +579,39 @@ class Ministral3RotaryEmbedding(nn.Module):
 
         Args:
             x: tensor used to determine dtype/device (batch, seq_len, hidden_size)
-            position_ids: (batch, seq_len) absolute position ids for tokens
+            position_ids: (batch, seq_len) absolute position ids
 
         Returns:
-            cos: (batch, seq_len, head_dim) cosine terms
-            sin: (batch, seq_len, head_dim) sine terms
+            cos: (batch, seq_len, head_dim)
+            sin: (batch, seq_len, head_dim)
         """
-        # inv_freq: (dim/2,)
-        batch = position_ids.shape[0]
+        # inv_freq shape: (dim/2,)
+        batch_size = position_ids.shape[0]
+        
+        # Ensure inv_freq is on the correct device and float32 before math
+        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
+        
+        # Expand for broadcasting: (batch, dim/2, 1)
+        inv_freq_expanded = inv_freq[None, :, None].expand(batch_size, -1, 1)
 
-        # Expand inv_freq to (batch, dim/2, 1)
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(batch, -1, 1).to(x.device)
-
-        # position_ids: (batch, seq_len) -> (batch, 1, seq_len) for matmul
+        # Expand position_ids: (batch, 1, seq_len)
         position_ids_expanded = position_ids[:, None, :].float()
 
-        # (batch, dim/2, 1) @ (batch, 1, seq_len) -> (batch, dim/2, seq_len)
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)  # -> (batch, seq_len, dim/2)
+        # Matmul: (batch, dim/2, 1) @ (batch, 1, seq_len) -> (batch, dim/2, seq_len)
+        # This computes theta_i * position for every dim i and position
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
 
-        # Duplicate to interleave for cos/sin pairs -> (batch, seq_len, dim)
+        # Combine to full dimension: (batch, seq_len, dim)
+        # We concatenate freqs with itself to match the "rotate_half" convention
         emb = torch.cat((freqs, freqs), dim=-1)
 
+        # Compute cos/sin and apply the YaRN attention scaling factor
         cos = emb.cos() * self.attention_scaling
         sin = emb.sin() * self.attention_scaling
 
+        # Cast back to input dtype (e.g., bfloat16)
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
+    
 
 class Ministral3Model(nn.Module):
     """
