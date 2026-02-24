@@ -585,7 +585,7 @@ class PixtralVisionModel(nn.Module):
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.config.image_size // self.config.patch_size,
-        )  # Shape: (total_patches,)
+        ).unsqueeze(0).to(patch_embeds.device)  # Shape: (1, total_patches)
 
         position_embeddings = self.patch_positional_embedding(
             patch_embeds, position_ids

@@ -43,29 +43,85 @@ DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_suppo
 # No Need For Authentication
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-# --- Lightweight Loader ---
+# --- Robust Loader with Remapping ---
+
+def remap_key(key):
+    """
+    Maps Hugging Face checkpoint keys to our Custom Model keys.
+    
+    HF Checkpoint Structure:
+      - vision_tower.*
+      - multi_modal_projector.*
+      - language_model.model.*  (Backbone)
+      - language_model.lm_head.* (Head)
+    
+    Custom Model Structure:
+      - model.vision_tower.*
+      - model.multi_modal_projector.*
+      - model.language_model.*  (Backbone)
+      - lm_head.*
+    """
+    # 1. Map Text Backbone: language_model.model -> model.language_model
+    if key.startswith("language_model.model."):
+        return key.replace("language_model.model.", "model.language_model.")
+    
+    # 2. Map Vision Tower: vision_tower -> model.vision_tower
+    if key.startswith("vision_tower."):
+        return f"model.{key}"
+
+    # 3. Map Projector: multi_modal_projector -> model.multi_modal_projector
+    if key.startswith("multi_modal_projector."):
+        return f"model.{key}"
+
+    # 4. Map LM Head (if present inside language_model)
+    if key.startswith("language_model.lm_head."):
+        return key.replace("language_model.lm_head.", "lm_head.")
+    
+    # 5. Fallback for unexpected keys, try prepending model.
+    if not key.startswith("model.") and not key.startswith("lm_head."):
+         return f"model.{key}"
+
+    return key
+
 
 def load_weights_into_model(model, directory, device):
-    """Streams .safetensors directly into the model object."""
+    """Streams .safetensors directly into the model object with remapping."""
     files = list(Path(directory).glob("*.safetensors"))
     if not files: raise FileNotFoundError(f"No safetensors found in {directory}")
     
     print(f"Loading {len(files)} weight files...")
-    state_dict_keys = set(model.state_dict().keys())
+    
+    # Get all valid keys from our model to check against
+    model_keys = set(model.state_dict().keys())
+    loaded_keys = set()
     
     for file in files:
         with safe_open(file, framework="pt", device=DEVICE) as f:
-            for key in f.keys():
-                if key not in state_dict_keys:
-                    print(f"Skipping {key}, not found in custom model.")
+            for file_key in f.keys():
+                # Apply remapping
+                custom_key = remap_key(file_key)
+                
+                if custom_key not in model_keys:
+                    # Optional: Print only if it's NOT just a mismatch we caused
+                    print(f"Skipping {file_key} -> {custom_key} (not in model)")
                     continue
                 
-                # Load -> Move to GPU -> Cast -> Assign
-                tensor = f.get_tensor(key).to(device=device, dtype=DTYPE)
-                _set_nested_param(model, key, tensor)
+                # Load -> Cast -> Assign
+                tensor = f.get_tensor(file_key).to(device=device, dtype=DTYPE)
+                _set_nested_param(model, custom_key, tensor)
+                loaded_keys.add(custom_key)
                 del tensor
         gc.collect()
         torch.cuda.empty_cache()
+
+    # Verify loading
+    missing_keys = model_keys - loaded_keys
+    if missing_keys:
+        print(f"Warning: {len(missing_keys)} keys were not loaded!")
+        # Optional: inspect specific missing keys
+        # print(missing_keys)
+    else:
+        print("All model weights loaded successfully.")
 
 def _set_nested_param(model, key, tensor):
     """Helper to traverse nested submodules and assign data."""
@@ -89,7 +145,7 @@ def get_model_and_processor():
     snapshot_download(
         repo_id=HF_REPO, 
         local_dir=LOCAL_DIR, 
-        allow_patterns=["consolidated.safetensors", "preprocessor_config.json", "tokenizer*", "chat_template.json"]
+        allow_patterns=["model.safetensors"]
     )
 
     print("Initializing Model Architecture...")
@@ -153,7 +209,7 @@ def get_model_and_processor():
     model.eval()
     
     # Init Processor (Mistral processors handle image patching and text formatting)
-    processor = AutoProcessor.from_pretrained(LOCAL_DIR)
+    processor = AutoProcessor.from_pretrained(model) # Since Preprocessor not Found in the repo on hugging face, we rely on AutoProcessor to find the right one based on the model's config.
     
     return model, processor
 

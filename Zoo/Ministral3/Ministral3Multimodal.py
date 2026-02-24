@@ -14,70 +14,10 @@ from torch import nn
 
 # Import your untouched submodels
 from SubModels.Ministral3 import Ministral3Model
-from SubModels.Pixtral import PixtralVisionModel, position_ids_in_meshgrid, generate_block_attention_mask
+from SubModels.Pixtral import PixtralVisionModel
 from SubModels.Mistral3MultiModalProjector import Mistral3MultiModalProjector
 from utils.KVCache import KVCache
 from config import Ministral3MultimodalConfig
-
-
-# ============================================================================
-# Patched Vision Tower (Fixing RoPE Broadcasting without modifying Pixtral.py)
-# ============================================================================
-
-class PatchedPixtralVisionModel(PixtralVisionModel):
-    """
-    Subclasses the unmodified PixtralVisionModel to inject the batch dimension 
-    into position_ids, ensuring RoPE broadcasts correctly with attention queries.
-    """
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        image_sizes: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-    ):
-        if image_sizes is None:
-            batch_size, _, height, width = pixel_values.shape
-            image_sizes = torch.tensor([(height, width)] * batch_size)
-
-        # 1. Convolutions and Flattening (From original code)
-        target_dtype = self.patch_conv.weight.dtype
-        patch_embeds = self.patch_conv(pixel_values.to(dtype=target_dtype))
-        patch_embeds_list = [
-            embed[..., : (size[0] // self.patch_size), : (size[1] // self.patch_size)]
-            for embed, size in zip(patch_embeds, image_sizes)
-        ]
-
-        patch_embeds = torch.cat(
-            [p.flatten(1).T for p in patch_embeds_list], dim=0
-        ).unsqueeze(0)
-        patch_embeds = self.ln_pre(patch_embeds)
-
-        # 2. Positional Embeddings -> 🚨 FIX: Add batch dimension `.unsqueeze(0)`
-        position_ids = position_ids_in_meshgrid(
-            patch_embeds_list,
-            max_width=self.config.image_size // self.config.patch_size,
-        )
-        # Fix shape from (total_patches,) -> (1, total_patches) so it broadcasts
-        position_ids = position_ids.unsqueeze(0).to(patch_embeds.device)
-
-        position_embeddings = self.patch_positional_embedding(
-            patch_embeds, position_ids
-        )
-
-        # 3. Transformer
-        attention_mask = generate_block_attention_mask(
-            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
-        )
-
-        return self.transformer(
-            patch_embeds,
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
-            return_dict=True,
-        )
 
 
 # ============================================================================
@@ -90,7 +30,7 @@ class Ministral3MultimodalModel(nn.Module):
         self.config = config
 
         # 1. Vision Encoder (using our patched version)
-        self.vision_tower = PatchedPixtralVisionModel(config.vision_config)
+        self.vision_tower = PixtralVisionModel(config.vision_config)
 
         # 2. Projector
         self.multi_modal_projector = Mistral3MultiModalProjector(config)
