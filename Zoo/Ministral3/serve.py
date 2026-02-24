@@ -34,7 +34,7 @@ from Zoo.Ministral3.SubModels.Pixtral import PixtralConfig
 from transformers import AutoProcessor
 
 # --- Constants ---
-HF_REPO = "mistralai/Ministral-3-3B-Instruct-2512"
+HF_REPO = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
 LOCAL_DIR = "./saved_model/Ministral3"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Mistral-3 is optimized for bfloat16
@@ -190,6 +190,7 @@ def get_model_and_processor():
         num_channels=3,
         num_hidden_layers=24,
         patch_size=14,
+        rope_theta=10000.0
     )
 
     # 3. Combine into the Multimodal wrapper
