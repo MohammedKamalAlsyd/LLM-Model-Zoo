@@ -210,7 +210,7 @@ def get_model_and_processor():
     model.eval()
     
     # Init Processor (Mistral processors handle image patching and text formatting)
-    processor = AutoProcessor.from_pretrained(model) # Since Preprocessor not Found in the repo on hugging face, we rely on AutoProcessor to find the right one based on the model's config.
+    processor = AutoProcessor.from_pretrained(HF_REPO) # Since Preprocessor not Found in the repo on hugging face, we rely on AutoProcessor to find the right one based on the model's config.
     
     return model, processor
 
@@ -237,11 +237,15 @@ def generate(model, processor, image, prompt, max_tokens=100, temp=0.7):
     
     input_ids = inputs["input_ids"].to(DEVICE)
     pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
+    attention_mask = inputs.get("attention_mask", None)
     
     # Processor might output image sizes; if not, the model defaults appropriately
     image_sizes = inputs.get("image_sizes", None)
     if image_sizes is not None:
         image_sizes = image_sizes.to(DEVICE)
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(DEVICE)
 
     generated_ids = []
 
@@ -249,9 +253,11 @@ def generate(model, processor, image, prompt, max_tokens=100, temp=0.7):
     # Pass input_ids and pixel_values. The model automatically initializes KVCache if None.
     outputs = model(
         input_ids=input_ids,
+        attention_mask=attention_mask,
         pixel_values=pixel_values,
         image_sizes=image_sizes,
-        past_key_values=None 
+        past_key_values=None,
+        logits_to_keep=1 # Only compute logit for the very last token
     )
     
     # Get logits for the VERY LAST token of the prompt

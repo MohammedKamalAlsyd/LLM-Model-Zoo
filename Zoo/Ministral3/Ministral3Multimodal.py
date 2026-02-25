@@ -2,12 +2,10 @@
 Ministral-3 8B Multimodal Wrapper (mistralai/Ministral-3-8B-Instruct-2512)
 
 This wrapper connects the unmodified Pixtral vision tower, Mistral3 projector, 
-and Ministral3 language model. It dynamically applies structural fixes (like 
-RoPE broadcasting and mask robustness) without altering the sub-models.
+and Ministral3 language model.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any
 
 import torch
 from torch import nn
@@ -35,7 +33,7 @@ class Ministral3MultimodalModel(nn.Module):
         # 2. Projector
         self.multi_modal_projector = Mistral3MultiModalProjector(config)
 
-        # 3. Text Encoder -> 🚨 FIX: Using the base model (no LM head)
+        # 3. Text Encoder
         self.language_model = Ministral3Model(config.text_config)
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -77,7 +75,7 @@ class Ministral3MultimodalModel(nn.Module):
         inputs_embeds: torch.Tensor,
         image_features: torch.Tensor,
     ) -> torch.Tensor:
-        """🚨 FIX: Robust masking that works even if input_ids is None"""
+        """Robust masking that works even if input_ids is None"""
         
         if input_ids is None:
             # Fallback: find the image tokens by matching embedding weights
@@ -96,7 +94,7 @@ class Ministral3MultimodalModel(nn.Module):
             raise ValueError(f"Tokens mismatch! Found {num_placeholders} placeholders but {num_image_features} image features.")
 
         expanded_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        image_features = image_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        image_features = image_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype).contiguous()
 
         return inputs_embeds.masked_scatter(expanded_mask, image_features)
 
@@ -171,7 +169,7 @@ class Ministral3ForConditionalGeneration(nn.Module):
         vocab_size = config.text_config.vocab_size
         self.lm_head = nn.Linear(text_hidden, vocab_size, bias=False)
 
-        # 🚨 FIX: Tie embeddings based on the JSON config
+        # Tie embeddings based on the JSON config
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.get_input_embeddings().weight
 
