@@ -1,0 +1,3 @@
+# TODO: use F.scaled_dot_product_attention instead of dot product to leverage flash scaled_dot_product_attention
+# TODO: organize the files and remove duplication at the last
+# TODO: remove processing in the code and use AutoProcessor instead
