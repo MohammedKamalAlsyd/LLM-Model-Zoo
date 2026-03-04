@@ -1,0 +1,87 @@
+flowchart TD
+    %% Nodes and Styles
+    classDef file fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef process fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef data fill:#fff3e0,stroke:#ef6c00,stroke-width:2px;
+    classDef loop fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,stroke-dasharray: 5 5;
+
+    subgraph Inputs ["User Inputs"]
+        Prompt[("Text Prompt")]:::data
+        NegPrompt[("Uncond Prompt")]:::data
+        InputImg[("Input Image<br/>(Optional)")]:::data
+        Params[("Seed, Strength,<br/>Steps, CFG Scale")]:::data
+    end
+
+    subgraph Conditioning ["Text Conditioning (sd/clip.py)"]
+        Tokenizer["Tokenizer"]:::process
+        CLIP["CLIP Model<br/>(Transformer)"]:::file
+        Context[("Context Embeddings<br/>(Cond + Uncond)")]:::data
+    end
+
+    subgraph LatentInit ["Latent Initialization"]
+        Generator["Torch Generator<br/>(Seed)"]:::process
+        
+        direction TB
+        subgraph Img2Img ["If Input Image"]
+            Resize["Resize/Rescale"]:::process
+            Encoder["VAE Encoder<br/>(sd/encoder.py)"]:::file
+            AddNoise["DDPM Add Noise<br/>(sd/ddpm.py)"]:::file
+        end
+        
+        subgraph Txt2Img ["If No Image"]
+            RandNoise["Random Gaussian Noise"]:::process
+        end
+        
+        InitialLatents[("Initial Latents<br/>(4, H/8, W/8)")]:::data
+    end
+
+    subgraph DenoisingLoop ["Denoising Loop (sd/pipeline.py)"]
+        direction TB
+        LoopStart(("For t in Timesteps")):::loop
+        
+        TimeEmbed["Get Time Embedding<br/>(sd/diffusion.py)"]:::process
+        
+        subgraph ModelPred ["Noise Prediction"]
+            Expand["Duplicate Latents<br/>(for CFG Batching)"]:::process
+            UNET["UNet Diffusion Model<br/>(sd/diffusion.py)"]:::file
+            Chunk["Chunk Output<br/>(Cond / Uncond)"]:::process
+        end
+        
+        CFG["Apply CFG Math<br/>scale * (cond - uncond) + uncond"]:::process
+        SamplerStep["DDPM Sampler Step<br/>Remove Noise<br/>(sd/ddpm.py)"]:::file
+        UpdateLatents[("Updated Latents")]:::data
+        
+        LoopEnd(("Next t")):::loop
+    end
+
+    subgraph Decoding ["Image Decoding (sd/decoder.py)"]
+        Decoder["VAE Decoder"]:::file
+        RescaleOutput["Rescale & Permute<br/>Tensor to Numpy"]:::process
+    end
+
+    FinalOutput[("Final Image<br/>(512x512)")]:::data
+
+    %% Connections
+    Prompt & NegPrompt --> Tokenizer
+    Tokenizer --> CLIP --> Context
+    
+    Params --> Generator
+    InputImg --> Resize --> Encoder --> AddNoise
+    Generator --> AddNoise & RandNoise
+    RandNoise --> InitialLatents
+    AddNoise --> InitialLatents
+    
+    InitialLatents --> LoopStart
+    Context --> UNET
+    
+    LoopStart --> TimeEmbed
+    TimeEmbed --> UNET
+    LoopStart --> Expand
+    Expand --> UNET
+    UNET --> Chunk --> CFG
+    CFG --> SamplerStep
+    SamplerStep --> UpdateLatents
+    UpdateLatents --> LoopEnd
+    
+    LoopEnd -- "Loop Finished" --> Decoder
+    Decoder --> RescaleOutput --> FinalOutput

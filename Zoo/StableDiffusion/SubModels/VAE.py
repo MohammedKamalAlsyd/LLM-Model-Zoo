@@ -120,7 +120,7 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, add_upsample):
+    def __init__(self, in_channels, out_channels, add_upsample) -> None:
         super().__init__()
         self.block = nn.ModuleList(
             [
@@ -133,7 +133,7 @@ class UpBlock(nn.Module):
         )
         self.upsample = Upsample(out_channels) if add_upsample else None
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         for resnet in self.block:
             x = resnet(x)
         if self.upsample is not None:
@@ -142,13 +142,13 @@ class UpBlock(nn.Module):
 
 
 class MidBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels) -> None:
         super().__init__()
         self.block_1 = ResnetBlock(channels, channels)
         self.attn_1 = AttnBlock(channels)
         self.block_2 = ResnetBlock(channels, channels)
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         x = self.block_1(x)
         x = self.attn_1(x)
         x = self.block_2(x)
@@ -161,7 +161,7 @@ class MidBlock(nn.Module):
 
 
 class VAE_Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.conv_in = nn.Conv2d(3, 128, kernel_size=3, padding=1)
 
@@ -180,7 +180,7 @@ class VAE_Encoder(nn.Module):
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=512, eps=1e-6)
         self.conv_out = nn.Conv2d(512, 8, kernel_size=3, padding=1)
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         x = self.conv_in(x)
 
         for block in self.down:
@@ -196,7 +196,7 @@ class VAE_Encoder(nn.Module):
 
 
 class VAE_Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.conv_in = nn.Conv2d(4, 512, kernel_size=3, padding=1)
 
@@ -215,7 +215,7 @@ class VAE_Decoder(nn.Module):
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=128, eps=1e-6)
         self.conv_out = nn.Conv2d(128, 3, kernel_size=3, padding=1)
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         x = self.conv_in(x)
 
         x = self.mid(x)
@@ -245,14 +245,14 @@ class VAE(nn.Module):
     standard weights into this model without needing a conversion script.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.encoder = VAE_Encoder()
         self.decoder = VAE_Decoder()
         self.quant_conv = nn.Conv2d(8, 8, kernel_size=1, padding=0)
         self.post_quant_conv = nn.Conv2d(4, 4, kernel_size=1, padding=0)
 
-    def encode(self, x, noise):
+    def encode(self, x, noise) -> torch.Tensor:
         """
         Takes raw image tensors -> encodes to latents -> applies reparameterization
         Returns latents scaled to match SD pipeline requirements.
@@ -273,7 +273,7 @@ class VAE(nn.Module):
 
         return x
 
-    def decode(self, x):
+    def decode(self, x) -> torch.Tensor:
         """
         Takes scaled latents -> un-scales -> decodes back to images.
         """
