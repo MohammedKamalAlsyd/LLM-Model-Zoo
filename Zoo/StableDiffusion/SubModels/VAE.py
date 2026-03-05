@@ -239,10 +239,6 @@ class VAE_Decoder(nn.Module):
 class VAE(nn.Module):
     """
     Main VAE wrapper representing `first_stage_model` from the SD Checkpoints.
-
-    Because the internal attributes strictly follow the original CompVis naming convention
-    (`encoder`, `decoder`, `quant_conv`, `post_quant_conv`), you can directly load
-    standard weights into this model without needing a conversion script.
     """
 
     def __init__(self) -> None:
