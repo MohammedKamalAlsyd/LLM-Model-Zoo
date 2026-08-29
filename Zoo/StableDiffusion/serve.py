@@ -4,6 +4,7 @@ from tqdm import tqdm
 from PIL import Image
 from typing import Optional
 from transformers import PreTrainedTokenizerBase
+from Zoo.StableDiffusion.SubModels.DDPM import DDPMSampler
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,7 +137,14 @@ def generate(
         # ---------------------------------------------------------------------------
         # Step 2: Sampler Initialization
         # ---------------------------------------------------------------------------
-        sampler = DDPMSampler()
+        generator = torch.Generator(device=device)
+        if seed is not None:
+            generator.manual_seed(seed)
+        else:
+            generator.seed()
+            
+
+        sampler = DDPMSampler(generator=generator)
         sampler.set_inference_timesteps(n_inference_steps)
 
         # ---------------------------------------------------------------------------
@@ -144,8 +152,8 @@ def generate(
         # ---------------------------------------------------------------------------
         if input_image is not None:
             # --- IMAGE TO IMAGE ---
-            encoder = models["encoder"]
-            load_model(encoder)
+            vae = models["vae"]
+            load_model(vae)
 
             # Preprocess the PIL Image into a Tensor
             input_image_tensor = input_image.resize((WIDTH, HEIGHT))
@@ -164,14 +172,14 @@ def generate(
 
             # Generate initial noise and encode the image into latents
             encoder_noise = torch.randn(latents_shape, device=device)
-            latents = encoder(input_image_tensor, encoder_noise)
+            latents = vae.encode(input_image_tensor, encoder_noise)
 
             # Add noise to the latents based on the 'strength' parameter
             sampler.set_strength(strength=strength)
             latents = sampler.add_noise(latents, sampler.timesteps[0])
 
             # Encoding is done. Free up VRAM.
-            unload_model(encoder)
+            unload_model(vae)
 
         else:
             # --- TEXT TO IMAGE ---
@@ -188,6 +196,7 @@ def generate(
 
         for i, timestep in enumerate(timesteps):
             # Generate the time embedding for the current step -> (1, 320)
+            timestep = int(timestep.item())
             time_embedding = get_time_embedding(timestep).to(device)
 
             model_input = latents
@@ -220,15 +229,15 @@ def generate(
         # ---------------------------------------------------------------------------
         # Step 5: Decoding Latents to Image (VAE Decoder)
         # ---------------------------------------------------------------------------
-        decoder = models["decoder"]
-        load_model(decoder)
+        vae = models["vae"]
+        load_model(vae)
 
         # Decode Latents back into Image Space
         # (1, 4, 64, 64) -> (1, 3, 512, 512)
-        images = decoder(latents)
+        images = vae.decode(latents)
 
         # Decoding is done. Free up VRAM.
-        unload_model(decoder)
+        unload_model(vae)
 
         # ---------------------------------------------------------------------------
         # Step 6: Image Post-Processing

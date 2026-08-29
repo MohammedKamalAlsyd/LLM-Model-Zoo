@@ -2,6 +2,7 @@ import torch
 import numpy as np
 
 
+# See this First: https://www.youtube.com/watch?v=EhndHhIvWWw
 class DDPMSampler:
     """
     Denoising Diffusion Probabilistic Models (DDPM) Sampler.
