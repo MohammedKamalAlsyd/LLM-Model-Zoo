@@ -36,6 +36,7 @@ def load_models_from_standard_weights(ckpt_path: str, device: str = "cpu") -> di
         elif key.startswith("cond_stage_model.transformer.text_model."):
             clip_dict[key.replace("cond_stage_model.transformer.text_model.", "")] = value
 
+    clip_dict.pop("embeddings.position_ids", None)
     print("Loading weights into modules...")
     # strict=True ensures we didn't miss any keys and no layers are left randomly initialized
     unet.load_state_dict(unet_dict, strict=True)
