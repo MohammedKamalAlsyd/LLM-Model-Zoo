@@ -1,10 +1,22 @@
+import os
 import torch
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from typing import Optional
-from transformers import PreTrainedTokenizerBase
+from huggingface_hub import hf_hub_download, snapshot_download, login
+from dotenv import load_dotenv
+import gradio as gr
+
+from transformers import PreTrainedTokenizerBase, CLIPTokenizer
 from Zoo.StableDiffusion.SubModels.DDPM import DDPMSampler
+from Zoo.StableDiffusion.utils.model_loader import load_models_from_standard_weights
+
+# Environment Setup
+load_dotenv()
+if token := os.getenv("HUGGING_FACE_HUB_TOKEN"):
+    login(token=token)
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -252,3 +264,106 @@ def generate(
         image_array = images.to("cpu", torch.uint8).numpy()[0]
 
         return image_array
+
+# =================================================================================
+# Gradio Interface & Model Initialization
+# =================================================================================
+
+# Global state to keep models in memory across UI requests
+GLOBAL_MODELS = {}
+GLOBAL_TOKENIZER = None
+
+HF_REPO = "runwayml/stable-diffusion-v1-5"
+LOCAL_DIR = "./saved_model/StableDiffusion"
+
+def initialize_models():
+    """Downloads (if necessary) and loads the tokenizer and model weights."""
+    global GLOBAL_MODELS, GLOBAL_TOKENIZER
+    
+    print(f"Ensuring model weights exist in {LOCAL_DIR}...")
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    
+    # 1. Download/Verify the specific Checkpoint file
+    ckpt_path = hf_hub_download(
+        repo_id=HF_REPO,
+        filename="v1-5-pruned-emaonly.ckpt",
+        local_dir=LOCAL_DIR
+    )
+    
+    # 2. Download/Verify the tokenizer directory
+    snapshot_download(
+        repo_id=HF_REPO,
+        allow_patterns=["tokenizer/*"],
+        local_dir=LOCAL_DIR
+    )
+    tokenizer_path = os.path.join(LOCAL_DIR, "tokenizer")
+
+    # 3. Load into memory
+    print("Loading Tokenizer...")
+    GLOBAL_TOKENIZER = CLIPTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+    
+    print("Loading Checkpoint Weights... (This may take a minute)")
+    GLOBAL_MODELS = load_models_from_standard_weights(ckpt_path, device)
+    print("Initialization Complete! Launching UI...")
+
+def gradio_predict(prompt, uncond_prompt, input_image, strength, cfg_scale, steps, seed):
+    """Wrapper function to connect Gradio inputs to the generation pipeline."""
+    
+    # Satisfies strict type-checking for Pylance
+    if GLOBAL_TOKENIZER is None:
+        raise RuntimeError("Tokenizer was not initialized properly.")
+        
+    # Handle random seed logic
+    active_seed = None if seed == -1 else int(seed)
+    
+    image_array = generate(
+        prompt=prompt,
+        tokenizer=GLOBAL_TOKENIZER,
+        uncond_prompt=uncond_prompt,
+        input_image=input_image,
+        strength=strength,
+        do_cfg=True,
+        cfg_scale=cfg_scale,
+        n_inference_steps=int(steps),
+        models=GLOBAL_MODELS,
+        seed=active_seed
+    )
+    
+    # Convert output numpy array to PIL Image for Gradio
+    return Image.fromarray(image_array)
+
+def launch_app():
+    initialize_models()
+    
+    with gr.Blocks(title="PyTorch Stable Diffusion from Scratch") as demo:
+        gr.Markdown(f"# 🎨 Stable Diffusion v1.5 (From Scratch)\nRunning on **{device.upper()}**.")
+        gr.Markdown("A clean, native PyTorch implementation with automatic weight downloading to `./saved_model/StableDiffusion`.")
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                prompt = gr.Textbox(label="Prompt", placeholder="A highly detailed cinematic shot of a cybernetic cat...")
+                uncond_prompt = gr.Textbox(label="Negative Prompt", value="lowres, bad anatomy, bad quality, blurry, worst quality")
+                
+                input_image = gr.Image(label="Input Image (Optional for Img2Img)", type="pil")
+                
+                with gr.Accordion("Advanced Settings", open=False):
+                    strength = gr.Slider(0.01, 1.0, value=0.8, step=0.01, label="Denoising Strength (Img2Img Only)")
+                    cfg_scale = gr.Slider(1.0, 20.0, value=7.5, step=0.5, label="CFG Scale")
+                    steps = gr.Slider(10, 100, value=50, step=1, label="Inference Steps (DDPM)")
+                    seed = gr.Number(label="Seed (-1 for random)", value=-1, precision=0)
+                
+                generate_btn = gr.Button("Generate Image", variant="primary")
+                
+            with gr.Column(scale=1):
+                output_image = gr.Image(label="Generated Output")
+
+        generate_btn.click(
+            fn=gradio_predict,
+            inputs=[prompt, uncond_prompt, input_image, strength, cfg_scale, steps, seed],
+            outputs=[output_image]
+        )
+        
+    demo.launch(server_name="0.0.0.0", share=False)
+
+if __name__ == "__main__":
+    launch_app()
