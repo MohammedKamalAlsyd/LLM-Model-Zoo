@@ -1,3 +1,9 @@
 # TODO: use F.scaled_dot_product_attention instead of dot product to leverage flash scaled_dot_product_attention
 # TODO: organize the files and remove duplication at the last
 # TODO: remove processing in the code and use AutoProcessor instead
+
+
+Stable Diffusion 3 or FLUX.1 
+IDEFICS 2 or Qwen2-VL
+OpenAI CLIP openai/clip-vit-base-patch32
+Bark or VITS

@@ -1,0 +1,63 @@
+flowchart TD
+    %% Nodes and Styles
+    classDef file fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef process fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef data fill:#fff3e0,stroke:#ef6c00,stroke-width:2px;
+    classDef loop fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,stroke-dasharray: 5 5;
+
+    subgraph Input ["User Input"]
+        AudioIn[("Raw Audio Input<br/>(Mic or File)")]:::data
+    end
+
+    subgraph AudioProc ["Audio Processing (AudioProcessing.py)"]
+        Resample["Resample to 16kHz<br/>& Pad/Trim to 30s"]:::process
+        STFT["STFT<br/>(25ms window, 10ms step)"]:::process
+        MelFilter["Apply 128 Mel Filters<br/>(Human pitch scale)"]:::process
+        LogNorm["Log10 & Normalize<br/>(Dynamic Range Compression)"]:::process
+        Spectrogram[("Log-Mel Spectrogram<br/>(Batch, 128, 3000)")]:::data
+    end
+
+    subgraph Enc ["Audio Encoder (Encoder.py)"]
+        direction TB
+        Conv["Conv1D (stride=1) &<br/>Conv1D (stride=2)"]:::process
+        SineEmb["Add Fixed Sinusoidal<br/>Positional Embeddings"]:::process
+        EncBlocks["32x Encoder Layers<br/>(Self-Attention + MLP)"]:::file
+        EncOutput[("Encoder Hidden States<br/>(Batch, 1500, 1280)")]:::data
+    end
+
+    subgraph GenLoop ["Autoregressive Generation Loop (serve.py)"]
+        direction TB
+        InitPrompt[("Initial Prompt Tokens<br/><|start|><|en|><|transcribe|>")]:::data
+        LoopStart(("For t in 448 Max Tokens")):::loop
+        
+        subgraph Dec ["Text Decoder (Decoder.py)"]
+            TokEmb["Token Embeddings +<br/>Learned Pos Embeddings"]:::process
+            DecBlocks["4x Decoder Layers<br/>(Masked Self-Attn -><br/>Cross-Attn -> MLP)"]:::file
+        end
+        
+        LMHead["LM Head (Linear)<br/>Projects 1280 to 51,866 Vocab"]:::process
+        ArgMax["ArgMax<br/>(Greedy Decoding)"]:::process
+        NextToken[("Next Predicted Token")]:::data
+        
+        LoopEnd(("Next t<br/>(Break if EOS Token)")):::loop
+    end
+
+    subgraph Output ["Final Output"]
+        Tokenizer["Tokenizer Decode"]:::process
+        FinalText[("Transcription Text")]:::data
+    end
+
+    %% Connections
+    AudioIn --> Resample --> STFT --> MelFilter --> LogNorm --> Spectrogram
+    Spectrogram --> Conv --> SineEmb --> EncBlocks --> EncOutput
+    
+    %% The critical Cross-Attention connection
+    EncOutput -. "Cross-Attention<br/>(Audio is Keys & Values)" .-> DecBlocks
+    
+    InitPrompt --> LoopStart
+    LoopStart --> TokEmb --> DecBlocks
+    DecBlocks --> LMHead --> ArgMax --> NextToken
+    NextToken -- "Append Token to Sequence" --> LoopEnd
+    
+    LoopEnd -- "Loop Again" --> TokEmb
+    LoopEnd -- "EOS Reached" --> Tokenizer --> FinalText
