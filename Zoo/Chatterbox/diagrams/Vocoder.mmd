@@ -1,0 +1,66 @@
+flowchart TD
+    %% Styling
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef melBranch fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef sineBranch fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef fusion fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef output fill:#ffebee,stroke:#d32f2f,stroke-width:2px;
+
+    %% Inputs
+    MelIn["Mel-Spectrogram<br/>(B, 80, T)"]:::input
+
+    %% Parallel Branches
+    subgraph PitchAndSource ["Branch 1: Harmonic Source Generation"]
+        F0Net["ConvRNNF0Predictor<br/>(Pitch Estimator)"]:::sineBranch
+        F0Upsamp["Upsample F0<br/>(240x Scale)"]:::sineBranch
+        SineMod["SourceModuleHnNSF<br/>(SineGen + Harmonics)"]:::sineBranch
+        STFT["_stft()<br/>(Sine to Complex Spectrogram)"]:::sineBranch
+    end
+
+    subgraph MelUpsampling ["Branch 2: Acoustic Upsampling"]
+        ConvPre["ConvPre (1D Conv)<br/>(80 -> 512 Ch)"]:::melBranch
+    end
+
+    subgraph FusionLoop ["Multi-Stage Upsampling & MRF Fusion"]
+        direction TB
+        Up1["ConvTranspose1d (8x)<br/>(512 -> 256 Ch)"]:::fusion
+        SourceDown1["SourceDowns + ResBlock"]:::fusion
+        Add1(("x = x + si")):::fusion
+        MRF1["MRF ResBlocks<br/>(Kernels: 3, 7, 11)"]:::fusion
+        
+        Up2["ConvTranspose1d (5x)<br/>(256 -> 128 Ch)"]:::fusion
+        SourceDown2["SourceDowns + ResBlock"]:::fusion
+        Add2(("x = x + si")):::fusion
+        MRF2["MRF ResBlocks<br/>(Kernels: 3, 7, 11)"]:::fusion
+
+        Up3["ConvTranspose1d (3x)<br/>(128 -> 64 Ch)"]:::fusion
+        SourceDown3["SourceDowns + ResBlock"]:::fusion
+        Add3(("x = x + si")):::fusion
+        MRF3["MRF ResBlocks<br/>(Kernels: 3, 7, 11)"]:::fusion
+    end
+
+    subgraph WaveformSynthesis ["Branch 3: ISTFT Audio Reconstruction"]
+        ConvPost["ConvPost<br/>(Outputs Mag + Phase)"]:::output
+        ISTFT["_istft()<br/>(Inverse Fourier Transform)"]:::output
+        Clamp["Audio Clamp<br/>[-0.99, 0.99]"]:::output
+        AudioOut["Raw Waveform (.wav)<br/>(B, 1, T * 480)"]:::output
+    end
+
+    %% Connections
+    MelIn --> ConvPre
+    MelIn --> F0Net
+    F0Net --> F0Upsamp --> SineMod --> STFT
+
+    ConvPre --> Up1
+    STFT --> SourceDown1
+    Up1 & SourceDown1 --> Add1 --> MRF1
+
+    MRF1 --> Up2
+    STFT --> SourceDown2
+    Up2 & SourceDown2 --> Add2 --> MRF2
+
+    MRF2 --> Up3
+    STFT --> SourceDown3
+    Up3 & SourceDown3 --> Add3 --> MRF3
+
+    MRF3 --> ConvPost --> ISTFT --> Clamp --> AudioOut

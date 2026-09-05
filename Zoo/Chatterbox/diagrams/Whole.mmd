@@ -1,0 +1,90 @@
+flowchart TD
+    %% Node Styles
+    classDef input fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#000;
+    classDef process fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000;
+    classDef model fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000;
+    classDef tensor fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000;
+    classDef loop fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5,color:#000;
+
+    %% --------------------------------------------------------
+    %% Inputs
+    %% --------------------------------------------------------
+    subgraph Inputs ["User Inputs"]
+        Text[("Text Prompt\n'Hello World'")]:::input
+        RefAudio[("Reference Audio\n(Target Voice)")]:::input
+    end
+
+    %% --------------------------------------------------------
+    %% Phase 1 & 2: Tokenization & Conditioning
+    %% --------------------------------------------------------
+    subgraph Phase1_2 ["Phases 1 & 2: Tokenization & Conditioning"]
+        direction TB
+        TextTok["Text Tokenizer (BPE)"]:::process
+        TextTokens(["Text Tokens\n(1D Sequence)"]):::tensor
+        
+        VoiceEnc["Voice Encoder\n(LSTM/ResNet)"]:::model
+        SpkEmb(["spks: Speaker Embedding\n(80 Dims)"]):::tensor
+        
+        MelExt["Mel Extractor"]:::process
+        S3Tok["S3Tokenizer"]:::model
+        CondSpeech(["Cond Speech Tokens\n(Prefix Prompt)"]):::tensor
+    end
+
+    Text --> TextTok --> TextTokens
+    RefAudio --> VoiceEnc --> SpkEmb
+    RefAudio --> MelExt --> S3Tok --> CondSpeech
+
+    %% --------------------------------------------------------
+    %% Phase 3: The LLM Brain
+    %% --------------------------------------------------------
+    subgraph Phase3 ["Phase 3: T3 (Autoregressive LLM)"]
+        direction TB
+        CondEnc["T3CondEnc\n(Fuses Prompts)"]:::process
+        GPT2["GPT-2 / Llama Backbone\n(Predicts next token)"]:::model
+        PredTokens(["mu: Predicted Speech Tokens\n(The Sheet Music)"]):::tensor
+    end
+
+    TextTokens --> GPT2
+    SpkEmb --> CondEnc
+    CondSpeech --> CondEnc
+    CondEnc --> |"Context Window Prefix"| GPT2
+    GPT2 --> PredTokens
+
+    %% --------------------------------------------------------
+    %% Phase 4: Acoustic Generation (Flow Matching)
+    %% --------------------------------------------------------
+    subgraph Phase4 ["Phase 4: Flow Matching & S3Gen (Acoustic Stage)"]
+        direction TB
+        Noise(["x: Pure Gaussian Noise\n(80 Channels)"]):::tensor
+        
+        subgraph ODELoop ["Euler ODE Solver (2 Steps)"]
+            direction LR
+            Concat["Concat [x, mu, spks, cond]\ninto 320 Channels"]:::process
+            
+            S3Gen["S3Gen Estimator\n(1D Causal U-Net)"]:::model
+            
+            Velocity(["dxdt: Velocity Field\n(80 Channels)"]):::tensor
+            EulerUpdate["Update:\nx = x + dt * dxdt"]:::process
+            
+            Concat --> S3Gen --> Velocity --> EulerUpdate
+        end
+        CleanMel(["Clean Mel-Spectrogram\n(80 Channels)"]):::tensor
+    end
+
+    PredTokens --> Concat
+    SpkEmb --> Concat
+    Noise --> Concat
+    
+    EulerUpdate -. "Loop next t" .-> Concat
+    EulerUpdate ===> |"t = 1.0"| CleanMel
+
+    %% --------------------------------------------------------
+    %% Phase 5: Vocoder
+    %% --------------------------------------------------------
+    subgraph Phase5 ["Phase 5: Vocoder (Audio Rendering)"]
+        direction TB
+        HiFiGAN["HiFi-GAN + NSF\n(Upsamples time & injects Pitch)"]:::model
+        FinalAudio[("Final 24kHz\nAudio Waveform")]:::input
+    end
+
+    CleanMel --> HiFiGAN --> FinalAudio

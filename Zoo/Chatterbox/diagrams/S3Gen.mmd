@@ -1,0 +1,91 @@
+flowchart TD
+    %% Styling
+    classDef data fill:#fff3e0,stroke:#ef6c00,stroke-width:2px;
+    classDef process fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef fusion fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef attention fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef resnet fill:#ffebee,stroke:#c62828,stroke-width:2px;
+
+    %% --------------------------------------------------
+    %% 1. Time Embedding
+    %% --------------------------------------------------
+    subgraph TimeEmb ["1. Time & MeanFlow Embedding"]
+        direction TB
+        t[("Time (t)")]:::data
+        r[("Target Time (r)")]:::data
+        
+        SinEmb["SinusoidalPosEmb"]:::process
+        MLP["TimestepEmbedding<br/>(Linear -> SiLU -> Linear)"]:::process
+        Mixer["time_embed_mixer<br/>(Linear)"]:::process
+        
+        t & r --> SinEmb --> MLP
+        MLP --> Mixer
+        T_EMB[("t_emb<br/>(Batch, 1024)")]:::data
+        Mixer --> T_EMB
+    end
+
+    %% --------------------------------------------------
+    %% 2. Input Fusion (Early Fusion)
+    %% --------------------------------------------------
+    subgraph InputStage ["2. Early Input Fusion (No Cross-Attention!)"]
+        direction TB
+        Noise[("Noise 'x'<br/>(B, 80, T)")]:::data
+        Content[("Text Tokens 'mu'<br/>(B, 80, T)")]:::data
+        Prompt[("Audio Prompt 'cond'<br/>(B, 80, T)")]:::data
+        Voice[("Speaker Embed 'spks'<br/>(B, 80)")]:::data
+        
+        Expand["Expand Time Dim"]:::process
+        Voice --> Expand --> VoiceExt[("Expanded Voice<br/>(B, 80, T)")]:::data
+        
+        Concat["torch.cat(dim=1)"]:::fusion
+        Noise & Content & Prompt & VoiceExt --> Concat
+        
+        FusedInput[("Fused Input Tensor<br/>(B, 320, T)")]:::data
+        Concat --> FusedInput
+    end
+
+    %% --------------------------------------------------
+    %% 3. The 1D U-Net Backbone
+    %% --------------------------------------------------
+    subgraph UNet ["3. The Causal 1D U-Net Backbone"]
+        direction TB
+        
+        %% Down
+        DownRes["down_resnet<br/>(Injects t_emb)"]:::resnet
+        DownAttn["down_transformer<br/>(4x 1D Self-Attention)"]:::attention
+        DownConv["downsample<br/>(CausalConv1d)"]:::process
+        
+        %% Mid
+        MidRes["mid_resnet<br/>(Injects t_emb)"]:::resnet
+        MidAttn["mid_transformer<br/>(4x 1D Self-Attention)"]:::attention
+        
+        %% Up
+        ConcatSkip["Concat Skip Connection<br/>(dim=1)"]:::fusion
+        UpRes["up_resnet<br/>(Injects t_emb)"]:::resnet
+        UpAttn["up_transformer<br/>(4x 1D Self-Attention)"]:::attention
+        UpConv["upsample<br/>(CausalConv1d)"]:::process
+        
+        %% Routing
+        FusedInput --> DownRes --> DownAttn
+        DownAttn -- "Save Skip Connection" --> ConcatSkip
+        DownAttn --> DownConv --> MidRes --> MidAttn --> ConcatSkip
+        ConcatSkip --> UpRes --> UpAttn --> UpConv
+    end
+    
+    %% Inject Time into ResNets
+    T_EMB -.-> DownRes & MidRes & UpRes
+
+    %% --------------------------------------------------
+    %% 4. Output
+    %% --------------------------------------------------
+    subgraph OutputStage ["4. Velocity Projection"]
+        direction TB
+        FinalBlock["final_block<br/>(CausalBlock1D)"]:::process
+        FinalProj["final_proj<br/>(Conv1d to 80 channels)"]:::process
+        Mask["Multiply by Valid Audio Mask"]:::process
+        
+        UpConv --> FinalBlock --> FinalProj --> Mask
+    end
+
+    DXDT[("Velocity Field 'dxdt'<br/>(B, 80, T)")]:::data
+    Mask --> DXDT
