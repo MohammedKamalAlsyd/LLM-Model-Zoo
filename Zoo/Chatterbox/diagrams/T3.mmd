@@ -1,0 +1,112 @@
+flowchart TD
+    %% Styling Classes
+    classDef inputStyle fill:#2d3748,stroke:#cbd5e0,stroke-width:1px,color:#fff;
+    classDef encStyle fill:#2b6cb0,stroke:#bee3f8,stroke-width:1px,color:#fff;
+    classDef perceiverStyle fill:#744210,stroke:#fbd38d,stroke-width:1px,color:#fff;
+    classDef concatStyle fill:#234e52,stroke:#81e6d9,stroke-width:2px,color:#fff;
+    classDef tfmrStyle fill:#553c9a,stroke:#d6bcfa,stroke-width:2px,color:#fff;
+    classDef decodeStyle fill:#7b341e,stroke:#fecaca,stroke-width:1px,color:#fff;
+
+    %% -------------------------------------------------------------
+    %% 1. INPUTS & SPECIALIZED ENCODERS
+    %% -------------------------------------------------------------
+    subgraph INPUTS ["1. Inputs & Feature Extraction"]
+        RawWavPrompt["Ref Audio (Style/Prompt)"]:::inputStyle
+        RawWavSpkr["Ref Audio (Speaker)"]:::inputStyle
+        RawText["Text Input String"]:::inputStyle
+        EmoAdv["Emotion Scalar (0.0 - 1.0)"]:::inputStyle
+
+        S3Tok["S3Tokenizer (25Hz Discrete Codes)"]:::encStyle
+        VoiceEnc["VoiceEncoder (3-Layer LSTM)"]:::encStyle
+        MTLTok["MTLTokenizer (Multilingual BPE)"]:::encStyle
+
+        RawWavPrompt --> S3Tok
+        RawWavSpkr --> VoiceEnc
+        RawText --> MTLTok
+    end
+
+    %% -------------------------------------------------------------
+    %% 2. EMBEDDING & CONDITIONING PROJECTIONS
+    %% -------------------------------------------------------------
+    subgraph CONDITIONING ["2. Conditioning & Feature Compression"]
+        SpkrLinear["Linear Proj (256 -> 1024)"]:::encStyle
+        EmoLinear["Linear Proj (1 -> 1024)"]:::encStyle
+        TextEmb["Text Embedding + PosEmb (Reset to 0)"]:::encStyle
+        SpeechEmb["Speech Embedding (Vocab: 8194 -> 1024)"]:::encStyle
+
+        VoiceEnc -->|dim: 256| SpkrLinear
+        EmoAdv -->|dim: 1| EmoLinear
+        MTLTok -->|shape: B, L_text| TextEmb
+        S3Tok -->|shape: B, L_prompt| SpeechEmb
+
+        subgraph PERCEIVER ["Perceiver Resampler (Prompt Compression)"]
+            LearnQueries["32 Learned Latent Queries (1, 32, 1024)"]:::perceiverStyle
+            RelBias["Bucketed Log Relative Pos Bias"]:::perceiverStyle
+            CrossAttn["Cross-Attention (Queries x Prompt)"]:::perceiverStyle
+            SelfAttn["Self-Attention Block"]:::perceiverStyle
+
+            LearnQueries --> CrossAttn
+            SpeechEmb --> CrossAttn
+            RelBias -.->|Modifies Attention Scores| CrossAttn
+            CrossAttn --> SelfAttn
+        end
+    end
+
+    %% -------------------------------------------------------------
+    %% 3. UNIFIED PREFIX SEQUENCE
+    %% -------------------------------------------------------------
+    subgraph SEQUENCE_BUILDER ["3. Multimodal Sequence Construction"]
+        SpkrToken["Speaker Token (B, 1, 1024)"]:::concatStyle
+        PromptTokens["Prompt Tokens (B, 32, 1024)"]:::concatStyle
+        EmoToken["Emotion Token (B, 1, 1024)"]:::concatStyle
+        TextTokens["Text Tokens (B, L_text, 1024)"]:::concatStyle
+        SpeechPrefix["Speech Tokens BOS/Gen (B, L_speech, 1024)"]:::concatStyle
+
+        SpkrLinear --> SpkrToken
+        SelfAttn --> PromptTokens
+        EmoLinear --> EmoToken
+        TextEmb --> TextTokens
+
+        Concat["Concatenate Along Sequence Dimension<br/><b>Conditioning (34) + Text (N) + Speech (M)</b>"]:::concatStyle
+        SpkrToken --> Concat
+        PromptTokens --> Concat
+        EmoToken --> Concat
+        TextTokens --> Concat
+        SpeechPrefix --> Concat
+    end
+
+    %% -------------------------------------------------------------
+    %% 4. TRANSFORMER BACKBONE
+    %% -------------------------------------------------------------
+    subgraph BACKBONE ["4. Transformer Backbone (LLaMA-520M)"]
+        LlamaCore["<b>30 Layers, 16 Heads, Hidden: 1024</b><br/>• SDPA Attention with RoPE<br/>• SwiGLU Feed-Forward Networks<br/>• KV Cache Enabled"]:::tfmrStyle
+        Concat -->|Inputs Embeds: B, Total_Seq, 1024| LlamaCore
+    end
+
+    %% -------------------------------------------------------------
+    %% 5. LOGITS, CFG & AUTOREGRESSIVE LOOP
+    %% -------------------------------------------------------------
+    subgraph GENERATION ["5. Classifier-Free Guidance & Generation Loop"]
+        SpeechHead["Speech Logit Head (1024 -> 8194)"]:::encStyle
+        LlamaCore -->|Last Hidden State| SpeechHead
+
+        CFGSplit["CFG Logit Split: <br/>• Cond Logits (Batch 0)<br/>• Uncond Logits (Batch 1: Zeroed Text)"]:::decodeStyle
+        SpeechHead --> CFGSplit
+
+        CFGEq["<b>CFG Interpolation:</b><br/>Logits = Cond + cfg_weight * (Cond - Uncond)"]:::decodeStyle
+        CFGSplit --> CFGEq
+
+        Samplers["Logit Filters:<br/>1. Repetition Penalty<br/>2. Temperature Scaling<br/>3. Min-P & Top-P Warpers"]:::decodeStyle
+        CFGEq --> Samplers
+
+        SampleToken["Multinomial Sampling -> <b>Next Speech Token</b>"]:::decodeStyle
+        Samplers --> SampleToken
+
+        StopCheck{"Is Token == STOP_SPEECH?"}:::decodeStyle
+        SampleToken --> StopCheck
+
+        StopCheck -- No --> FeedBack["Next Speech Token Embed + SpeechPosEmb(t+1)"]:::decodeStyle
+        FeedBack -->|Feed with Past KV Cache| LlamaCore
+
+        StopCheck -- Yes --> FinalTokens["Final Sequence of Speech Tokens (to Vocoder)"]:::inputStyle
+    end

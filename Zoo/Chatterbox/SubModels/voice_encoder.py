@@ -36,8 +36,8 @@ class VoiceEncoder(nn.Module):
         self.similarity_bias = nn.Parameter(torch.tensor([-5.0]))
 
         # Native GPU Buffers replace the old @lru_cache and librosa logic!
-        self.register_buffer("_mel_filters", get_mel_basis(hp.num_mels, hp.fmin, hp.fmax))
-        self.register_buffer("window", torch.hann_window(N_FFT))
+        self.register_buffer("_mel_filters", get_mel_basis(hp.num_mels, hp.fmin, hp.fmax), persistent=False)
+        self.register_buffer("window", torch.hann_window(N_FFT), persistent=False)
 
     @property
     def device(self) -> torch.device:

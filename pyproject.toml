@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dicta-onnx>=1.0.9",
+    "diffusers>=0.40.0",
     "dotenv>=0.9.9",
     "gradio>=6.5.1",
     "hf-transfer>=0.1.9",
