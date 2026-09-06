@@ -32,16 +32,19 @@ class ChatterboxPipeline:
 
         # 2. Extract Acoustic Conditioning
         with torch.inference_mode():
-            # Speaker Vector (Voice Encoder)
-            ve_emb = self.ve.extract_speaker_embedding(ref_wav).unsqueeze(0)
+            # Speaker Vector (Voice Encoder strictly expects 16kHz)
+            if ref_sr != 16000:
+                ref_wav_16k = torchaudio.functional.resample(ref_wav, ref_sr, 16000)
+            else:
+                ref_wav_16k = ref_wav
+            ve_emb = self.ve.extract_speaker_embedding(ref_wav_16k).unsqueeze(0)
             
             # S3Gen Voice Prompt Dict (Mel + Prompt Tokens + Spk X-Vector)
             ref_dict = self.s3gen.embed_ref(ref_wav, ref_sr)
             
-            # T3 Perceiver Prompt (Variable length audio mapped to 32 tokens)
-            # Take up to 150 tokens (6 seconds) for the perceiver prompt
-            prompt_token_for_t3 = ref_dict["prompt_token"][:, :150]
-            cond_prompt_emb = self.s3gen.tokenizer.input_embedding(prompt_token_for_t3)
+            # T3 Perceiver Prompt: Embed speech tokens via Flow's embedding table
+            prompt_token_for_t3 = ref_dict["prompt_token"][:, :150].to(self.device)
+            cond_prompt_emb = self.s3gen.flow.input_embedding(prompt_token_for_t3)
             
             # Assemble T3 Conditionals
             t3_cond = T3Cond(
@@ -70,6 +73,8 @@ class ChatterboxPipeline:
             )
             
             # Stop token pruning
+            if speech_tokens.ndim >= 2:
+                speech_tokens = speech_tokens[0]
             speech_tokens = speech_tokens[speech_tokens < 6561]
             speech_tokens = speech_tokens.to(self.device)
 
@@ -80,8 +85,8 @@ class ChatterboxPipeline:
                 n_cfm_timesteps=10 # Default for non-meanflow standard models
             )
             
-            # Save Output
-            wav = wav.squeeze(0).cpu()
+            # Save Output safely
+            wav = wav.cpu().squeeze()
             torchaudio.save(output_path, wav.unsqueeze(0), 24000)
             
         return output_path
