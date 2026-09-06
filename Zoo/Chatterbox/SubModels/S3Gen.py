@@ -231,9 +231,19 @@ class CAMPPlus(nn.Module):
 
     @torch.inference_mode()
     def inference(self, audio: torch.Tensor) -> torch.Tensor:
-        features = [Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80) for au in [audio.squeeze()]]
+        # 1. Kaldi.fbank strictly requires audio to be on the CPU
+        audio_cpu = audio.squeeze().cpu().float()
+        
+        # 2. Extract features on CPU
+        features = [Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80) for au in [audio_cpu]]
         feature = features[0] - features[0].mean(dim=0, keepdim=True)
-        return self.forward(feature.unsqueeze(0).to(torch.float32))
+        
+        # 3. Move the extracted features to the GPU (or whatever device the model is on)
+        device = next(self.parameters()).device
+        feature = feature.unsqueeze(0).to(dtype=torch.float32, device=device)
+        
+        # 4. Pass through the network
+        return self.forward(feature)
 
 
 # =====================================================================

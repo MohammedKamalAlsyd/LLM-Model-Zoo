@@ -27,7 +27,7 @@ class ChatterboxPipeline:
         """Generates TTS using zero-shot cloning."""
         
         # 1. Load Reference Audio
-        ref_wav, ref_sr = torchaudio.load(reference_audio_path, backend="soundfile")
+        ref_wav, ref_sr = torchaudio.load(reference_audio_path)
         ref_wav = ref_wav.mean(dim=0) # mono
 
         # 2. Extract Acoustic Conditioning
