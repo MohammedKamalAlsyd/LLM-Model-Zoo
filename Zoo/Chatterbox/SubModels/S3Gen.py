@@ -955,7 +955,7 @@ class HiFTGenerator(nn.Module):
     def decode(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         spec = torch.stft(
             s.squeeze(1), 16, 4, 16, window=self.stft_window.to(x.device),
-            center=False, return_complex=True
+            return_complex=True
         )
         spec = torch.view_as_real(spec)
         s_stft = torch.cat([spec[..., 0], spec[..., 1]], dim=1)
