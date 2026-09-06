@@ -16,53 +16,90 @@ class ChatterboxPipeline:
         self.tokenizer = self.models["tokenizer"]
         
     def generate_speech(
-        self, 
-        text_prompt: str, 
+        self,
+        text_prompt: str,
         reference_audio_path: str,
         language_id: str,
         output_path: str,
         exaggeration: float = 0.5,
-        cfg_weight: float = 0.5
+        cfg_weight: float = 0.5,
     ):
         """Generates TTS using zero-shot cloning."""
-        
-        # 1. Load Reference Audio
-        ref_wav, ref_sr = torchaudio.load(reference_audio_path)
-        ref_wav = ref_wav.mean(dim=0) # mono
 
-        # 2. Extract Acoustic Conditioning
+        # 1. Load reference audio
+        ref_wav, ref_sr = torchaudio.load(reference_audio_path)
+        ref_wav = ref_wav.mean(dim=0)  # mono
+
+        # 2. Extract acoustic conditioning
         with torch.inference_mode():
-            # Speaker Vector (Voice Encoder strictly expects 16kHz)
+
+            # Speaker vector: voice encoder expects 16 kHz
             if ref_sr != 16000:
-                ref_wav_16k = torchaudio.functional.resample(ref_wav, ref_sr, 16000)
+                ref_wav_16k = torchaudio.functional.resample(
+                    ref_wav,
+                    ref_sr,
+                    16000,
+                )
             else:
                 ref_wav_16k = ref_wav
-            ve_emb = self.ve.extract_speaker_embedding(ref_wav_16k).unsqueeze(0)
-            
-            # S3Gen Voice Prompt Dict (Mel + Prompt Tokens + Spk X-Vector)
-            ref_dict = self.s3gen.embed_ref(ref_wav, ref_sr)
-            
-            # T3 Perceiver Prompt: Embed speech tokens via Flow's embedding table
-            prompt_token_for_t3 = ref_dict["prompt_token"][:, :150].to(self.device)
-            cond_prompt_emb = self.t3.speech_emb(prompt_token_for_t3)
-            cond_prompt_emb = cond_prompt_emb + self.t3.speech_pos_emb(prompt_token_for_t3)
-            
-            # Assemble T3 Conditionals
+
+            ve_emb = self.ve.extract_speaker_embedding(
+                ref_wav_16k
+            ).unsqueeze(0)
+
+            # S3Gen conditioning
+            ref_dict = self.s3gen.embed_ref(
+                ref_wav,
+                ref_sr,
+            )
+
+            # T3 prompt embedding
+            prompt_token_for_t3 = ref_dict["prompt_token"][:, :150].to(
+                self.device
+            )
+
+            cond_prompt_emb = self.t3.speech_emb(
+                prompt_token_for_t3
+            )
+
+            cond_prompt_emb = (
+                cond_prompt_emb
+                + self.t3.speech_pos_emb(prompt_token_for_t3)
+            )
+
+            # Assemble T3 conditionals
             t3_cond = T3Cond(
                 speaker_emb=ve_emb.to(self.device),
                 cond_prompt_speech_emb=cond_prompt_emb.to(self.device),
-                emotion_adv=torch.tensor([[[exaggeration]]], device=self.device)
+                emotion_adv=torch.tensor(
+                    [[[exaggeration]]],
+                    device=self.device,
+                ),
             )
 
-            # 3. Process Text
-            text_tokens = self.tokenizer.text_to_tokens(text_prompt, lang=language_id).to(self.device)
-            
-            # Pad with SOT and EOT tokens
-            sot, eot = self.t3.hp.start_text_token, self.t3.hp.stop_text_token
-            text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-            text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+            # 3. Process text
+            text_tokens = self.tokenizer.text_to_tokens(
+                text_prompt,
+                lang=language_id,
+            ).to(self.device)
 
-            # 4. Generate S3 Tokens via T3 (Auto-handles CFG natively inside `generate`)
+            # SOT / EOT
+            sot = self.t3.hp.start_text_token
+            eot = self.t3.hp.stop_text_token
+
+            text_tokens = F.pad(
+                text_tokens,
+                (1, 0),
+                value=sot,
+            )
+
+            text_tokens = F.pad(
+                text_tokens,
+                (0, 1),
+                value=eot,
+            )
+
+            # 4. Generate S3 tokens
             speech_tokens = self.t3.generate(
                 t3_cond=t3_cond,
                 text_tokens=text_tokens,
@@ -70,25 +107,37 @@ class ChatterboxPipeline:
                 top_p=1.0,
                 min_p=0.05,
                 repetition_penalty=1.2,
-                cfg_weight=cfg_weight
+                cfg_weight=cfg_weight,
             )
-            
-            # Stop token pruning
+
+            # Remove batch dimension
             if speech_tokens.ndim >= 2:
                 speech_tokens = speech_tokens[0]
-            speech_tokens = speech_tokens[speech_tokens < 6561]
-            speech_tokens = speech_tokens.to(self.device)
 
-            # 5. Decode to Audio via S3Gen
-            wav = self.s3gen.generate(
+            # Remove invalid S3 tokens
+            speech_tokens = speech_tokens[
+                speech_tokens < 6561
+            ].to(self.device)
+
+            # 5. Decode S3 tokens -> waveform
+            wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
-                ref_dict=ref_dict,
-                n_cfm_timesteps=10 # Default for non-meanflow standard models
+                ref_dict=ref_dict,   # <-- FIX
             )
-            
-            # Save Output safely
-            wav = wav.cpu().squeeze()
-            wav = wav / torch.max(torch.abs(wav)).clamp(min=1e-5) # Safety Normalize
-            torchaudio.save(output_path, wav.unsqueeze(0), 24000)
-            
+
+            # Keep as torch.Tensor
+            wav = wav.squeeze(0).detach().cpu()
+            wav = wav.squeeze()
+
+            # Safety normalization
+            peak = torch.max(torch.abs(wav)).clamp(min=1e-5)
+            wav = wav / peak
+
+            # Save output
+            torchaudio.save(
+                output_path,
+                wav.unsqueeze(0),
+                24000,
+            )
+
         return output_path
