@@ -960,8 +960,6 @@ class HiFTGenerator(nn.Module):
         spec = torch.view_as_real(spec)
         s_stft = torch.cat([spec[..., 0], spec[..., 1]], dim=1)
 
-        print("speech_feat:", speech_feat.shape)
-        print("f0:", f0.shape)
         print("s:", s.shape)
         print("s_stft:", s_stft.shape)
 
