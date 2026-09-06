@@ -861,27 +861,51 @@ class HiFTGenerator(nn.Module):
     def __init__(self):
         super().__init__()
         self.m_source = SourceModuleHnNSF(24000, 8)
-        self.f0_upsamp = nn.Upsample(scale_factor=480)
+        self.f0_upsamp = nn.Upsample(scale_factor=480)  # product of upsample_rates * hop_len = 8*5*3*4 = 480
         self.f0_predictor = ConvRNNF0Predictor(80, 512)
 
         self.conv_pre = weight_norm(nn.Conv1d(80, 512, 7, 1, padding=3))
+
+        # Upsample blocks (transposed convolutions)
         self.ups = nn.ModuleList([
             weight_norm(nn.ConvTranspose1d(512, 256, 16, 8, padding=4)),
             weight_norm(nn.ConvTranspose1d(256, 128, 11, 5, padding=3)),
             weight_norm(nn.ConvTranspose1d(128, 64, 7, 3, padding=2))
         ])
+        upsample_rates = [8, 5, 3]  # must match the strides above
+        self.istft_params = {"n_fft": 16, "hop_len": 4}
 
-        self.source_downs = nn.ModuleList([
-            nn.Conv1d(18, 256, kernel_size=30, stride=15, padding=7),
-            nn.Conv1d(18, 128, kernel_size=6, stride=3, padding=1),
-            nn.Conv1d(18, 64, kernel_size=1, stride=1)
-        ])
-        self.source_resblocks = nn.ModuleList([
-            ResBlock(256, 7, [1, 3, 5]),
-            ResBlock(128, 7, [1, 3, 5]),
-            ResBlock(64, 11, [1, 3, 5])
-        ])
+        # ---- Dynamic source downsample layers (FIXED) ----
+        downsample_rates = [1] + upsample_rates[::-1][:-1]  # [1, 3, 5]
+        downsample_cum_rates = np.cumprod(downsample_rates)  # [1, 3, 15]
+        # We only create source blocks for the first two upsample blocks.
+        # The third upsample block does not fuse source information.
+        source_resblock_kernel_sizes = [7, 11]       # two blocks only
+        source_resblock_dilation_sizes = [[1, 3, 5], [1, 3, 5]]
 
+        self.source_downs = nn.ModuleList()
+        self.source_resblocks = nn.ModuleList()
+        for i, (u, k, d) in enumerate(zip(
+            downsample_cum_rates[::-1][:2],  # [15, 3] -> only first two
+            source_resblock_kernel_sizes,
+            source_resblock_dilation_sizes
+        )):
+            # output channels follow the same pattern as the upsample blocks
+            out_channels = 512 // (2 ** (i + 1))   # i=0 -> 256, i=1 -> 128
+            if u == 1:
+                self.source_downs.append(
+                    nn.Conv1d(self.istft_params["n_fft"] + 2, out_channels, 1, 1)
+                )
+            else:
+                self.source_downs.append(
+                    nn.Conv1d(self.istft_params["n_fft"] + 2, out_channels, u * 2, u, padding=(u // 2))
+                )
+            self.source_resblocks.append(
+                ResBlock(out_channels, k, d)
+            )
+        # -------------------------------------------------
+
+        # Residual blocks (3 per upsample block, total 9)
         self.resblocks = nn.ModuleList()
         for ch in [256, 128, 64]:
             for k in [3, 7, 11]:
@@ -904,14 +928,17 @@ class HiFTGenerator(nn.Module):
         for i in range(3):
             x = F.leaky_relu(x, 0.1)
             x = self.ups[i](x)
+
             if i == 2:
                 x = self.reflection_pad(x)
 
-            si = self.source_downs[i](s_stft)
-            si = self.source_resblocks[i](si)
-            x = x + si
+            # Only fuse source for the first two blocks (i=0,1)
+            if i < len(self.source_downs):
+                si = self.source_downs[i](s_stft)
+                si = self.source_resblocks[i](si)
+                x = x + si
 
-            xs: Optional[torch.Tensor] = None
+            xs = None
             for j in range(3):
                 block_out = self.resblocks[i * 3 + j](x)
                 xs = block_out if xs is None else xs + block_out
