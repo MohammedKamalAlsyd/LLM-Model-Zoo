@@ -40,8 +40,8 @@ class ChatterboxPipeline:
             
             # T3 Perceiver Prompt (Variable length audio mapped to 32 tokens)
             # Take up to 150 tokens (6 seconds) for the perceiver prompt
-            prompt_tokens_for_t3 = ref_dict["prompt_tokens"][:, :150]
-            cond_prompt_emb = self.s3gen.tokenizer.input_embedding(prompt_tokens_for_t3)
+            prompt_token_for_t3 = ref_dict["prompt_token"][:, :150]
+            cond_prompt_emb = self.s3gen.tokenizer.input_embedding(prompt_token_for_t3)
             
             # Assemble T3 Conditionals
             t3_cond = T3Cond(
