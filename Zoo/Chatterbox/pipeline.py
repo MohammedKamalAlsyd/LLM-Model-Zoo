@@ -44,7 +44,8 @@ class ChatterboxPipeline:
             
             # T3 Perceiver Prompt: Embed speech tokens via Flow's embedding table
             prompt_token_for_t3 = ref_dict["prompt_token"][:, :150].to(self.device)
-            cond_prompt_emb = self.s3gen.flow.input_embedding(prompt_token_for_t3)
+            cond_prompt_emb = self.t3.speech_emb(prompt_token_for_t3)
+            cond_prompt_emb = cond_prompt_emb + self.t3.speech_pos_emb(prompt_token_for_t3)
             
             # Assemble T3 Conditionals
             t3_cond = T3Cond(
