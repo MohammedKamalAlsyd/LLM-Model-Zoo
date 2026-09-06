@@ -803,36 +803,56 @@ class ResBlock(nn.Module):
 
 
 class SineGen(nn.Module):
-    def __init__(self, samp_rate: int = 24000, harmonic_num: int = 8):
+    """Sine wave generator with harmonic overtones and noise."""
+    def __init__(self, samp_rate: int = 24000, harmonic_num: int = 8,
+                 sine_amp: float = 0.1, noise_std: float = 0.003,
+                 voiced_threshold: float = 10):
         super().__init__()
         self.harmonic_num = harmonic_num
         self.sampling_rate = samp_rate
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.voiced_threshold = voiced_threshold
 
     def forward(self, f0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1)), device=f0.device)
+        # f0 shape: (batch, 1, time)
+        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1)),
+                            device=f0.device, dtype=f0.dtype)
         for i in range(self.harmonic_num + 1):
-            F_mat[:, i : i + 1, :] = f0 * (i + 1) / self.sampling_rate
+            F_mat[:, i:i+1, :] = f0 * (i + 1) / self.sampling_rate
+
         theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
-        phase_vec = (torch.rand(f0.size(0), self.harmonic_num + 1, 1, device=f0.device) * 2 * np.pi) - np.pi
+        u_dist = torch.distributions.uniform.Uniform(low=-np.pi, high=np.pi)
+        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(f0.device)
         phase_vec[:, 0, :] = 0
-        sine_waves = 0.1 * torch.sin(theta_mat + phase_vec)
-        uv = (f0 > 10).float()
-        noise = (uv * 0.003 + (1 - uv) * (0.1 / 3)) * torch.randn_like(sine_waves)
-        return sine_waves * uv + noise, uv, noise
+
+        sine_waves = self.sine_amp * torch.sin(theta_mat + phase_vec)
+        uv = (f0 > self.voiced_threshold).float()
+
+        noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+        noise = noise_amp * torch.randn_like(sine_waves)
+
+        sine_waves = sine_waves * uv + noise
+        return sine_waves, uv, noise
 
 
 class SourceModuleHnNSF(nn.Module):
+    """Source module for harmonic-plus-noise excitation."""
     def __init__(self, sampling_rate: int = 24000, harmonic_num: int = 8):
         super().__init__()
-        self.l_sin_gen = SineGen(sampling_rate, harmonic_num)
+        self.l_sin_gen = SineGen(sampling_rate, harmonic_num,
+                                 sine_amp=0.1, noise_std=0.003,
+                                 voiced_threshold=10)
         self.l_linear = nn.Linear(harmonic_num + 1, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x shape: (batch, time, 1)  [F0 values]
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2))
-            sine_wavs = sine_wavs.transpose(1, 2)
-            uv = uv.transpose(1, 2)
-        sine_merge = torch.tanh(self.l_linear(sine_wavs.transpose(1, 2))).transpose(1, 2)
+            sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2))  # (batch, harmonic_num+1, time)
+            sine_wavs = sine_wavs.transpose(1, 2)                 # (batch, time, harmonic_num+1)
+            uv = uv.transpose(1, 2)                               # (batch, time, 1)
+        # Linear layer expects last dimension = harmonic_num+1
+        sine_merge = torch.tanh(self.l_linear(sine_wavs))         # (batch, time, 1)
         noise = torch.randn_like(uv) * (0.1 / 3)
         return sine_merge, noise, uv
 
