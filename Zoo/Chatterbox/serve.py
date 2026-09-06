@@ -1,6 +1,7 @@
 # python -m Zoo.Chatterbox.serve
 import os
 import tempfile
+from pathlib import Path
 import torch
 import gradio as gr
 from typing import Optional
@@ -11,6 +12,16 @@ from Zoo.Chatterbox.pipeline import ChatterboxPipeline
 
 # Load environment variables (e.g., HF_TOKEN) if present
 load_dotenv()
+
+# Handle Windows-specific DLL loading for ffmpeg
+if os.name == "nt":
+    FFMPEG_BIN = Path(r"C:\ffmpeg\bin")
+
+    if FFMPEG_BIN.exists():
+        os.add_dll_directory(str(FFMPEG_BIN))
+        os.environ["PATH"] = (
+            f"{FFMPEG_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+        )
 
 # Global pipeline instance with strict typing for Pylance
 GLOBAL_PIPELINE: Optional[ChatterboxPipeline] = None
@@ -89,7 +100,7 @@ def launch_app():
                 ref_audio = gr.Audio(
                     label="Reference Voice (Upload or Record 3-5 seconds)", 
                     type="filepath", 
-                    format="wav"
+                    sources=["upload", "microphone"]
                 )
                 
                 with gr.Accordion("Advanced Settings", open=False):
@@ -112,7 +123,7 @@ def launch_app():
             outputs=[audio_output]
         )
 
-    demo.launch(server_name="127.0.0.1", share=True, debug=True)
+    demo.launch(server_name="127.0.0.1", debug=True)
 
 if __name__ == "__main__":
     launch_app()
