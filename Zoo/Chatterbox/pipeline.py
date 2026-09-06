@@ -88,6 +88,7 @@ class ChatterboxPipeline:
             
             # Save Output safely
             wav = wav.cpu().squeeze()
+            wav = wav / torch.max(torch.abs(wav)).clamp(min=1e-5) # Safety Normalize
             torchaudio.save(output_path, wav.unsqueeze(0), 24000)
             
         return output_path

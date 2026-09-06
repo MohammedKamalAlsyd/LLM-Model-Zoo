@@ -243,7 +243,7 @@ class T3(nn.Module):
         mask_t = torch.arange(text_tokens.size(1), device=self.device)[None] >= text_lens[:, None]
         mask_s = torch.arange(speech_tokens.size(1), device=self.device)[None] >= speech_lens[:, None]
         
-        loss_t = F.cross_entropy(t_logits, text_tokens.masked_fill(mask_t, -100), ignore_index=-100)
+        loss_t = F.cross_entropy(t_logits.transpose(1, 2), text_tokens.masked_fill(mask_t, -100), ignore_index=-100)
         loss_s = F.cross_entropy(s_logits, speech_tokens.masked_fill(mask_s, -100), ignore_index=-100)
         return loss_t, loss_s
 

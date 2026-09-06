@@ -306,18 +306,27 @@ class RelPositionMultiHeadedAttention(nn.Module):
         self.pos_bias_u = nn.Parameter(torch.Tensor(n_head, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.Tensor(n_head, self.d_k))
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
+def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
         B, T, _ = query.size()
+        
+        # 1. Project Q without transposing yet! Shape remains (B, T, h, d_k)
         q = self.linear_q(query).view(B, -1, self.h, self.d_k)
+        
+        # 2. Add bias to Q. Because q is (B, T, h, d_k) and pos_bias is (h, d_k),
+        # PyTorch broadcasting matches perfectly. Then we transpose for Matmul.
+        q_u = (q + self.pos_bias_u.to(q.device)).transpose(1, 2) # -> (B, h, T, d_k)
+        q_v = (q + self.pos_bias_v.to(q.device)).transpose(1, 2) # -> (B, h, T, d_k)
+
+        # 3. Process K, V, and P directly into transposed shapes
         k = self.linear_k(key).view(B, -1, self.h, self.d_k).transpose(1, 2)
         v = self.linear_v(value).view(B, -1, self.h, self.d_k).transpose(1, 2)
         p = self.linear_pos(pos_emb).view(pos_emb.size(0), -1, self.h, self.d_k).transpose(1, 2)
 
-        q_u = (q + self.pos_bias_u.to(q.device)).transpose(1, 2)
-        q_v = (q + self.pos_bias_v.to(q.device)).transpose(1, 2)
+        # 4. Matrix Multiplications
         matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
         matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
 
+        # 5. Shift & Masking
         zero_pad = torch.zeros((matrix_bd.size(0), matrix_bd.size(1), matrix_bd.size(2), 1), device=matrix_bd.device, dtype=matrix_bd.dtype)
         matrix_bd = torch.cat([zero_pad, matrix_bd], dim=-1)
         matrix_bd = matrix_bd.view(matrix_bd.size(0), matrix_bd.size(1), matrix_bd.size(3) + 1, matrix_bd.size(2))[:, :, 1:].view_as(matrix_bd)[:, :, :, :matrix_bd.size(-1) // 2 + 1]
@@ -325,8 +334,11 @@ class RelPositionMultiHeadedAttention(nn.Module):
         scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)
         if mask.size(2) > 0:
             scores = scores.masked_fill(mask.unsqueeze(1).eq(0)[:, :, :, :scores.size(-1)], -1e9)
+            
+        # 6. Apply Attention to V
         attn = torch.softmax(scores, dim=-1)
         x = (attn @ v).transpose(1, 2).contiguous().view(B, -1, self.h * self.d_k)
+        
         return self.linear_out(x)
 
 
@@ -595,6 +607,7 @@ class ConditionalDecoder(nn.Module):
             x = resnet_down(x, mask_down, t_emb)
             x = rearrange(x, "b c t -> b t c").contiguous()
             attn_mask = mask_to_bias(mask_down.bool() == 1, x.dtype)
+            attn_mask = attn_mask.unsqueeze(1) # Changes (B, 1, T) to (B, 1, 1, T)
             for transformer_block in tb_down:
                 tb = cast(BasicTransformerBlock, transformer_block)
                 x = tb(x, attention_mask=attn_mask)
