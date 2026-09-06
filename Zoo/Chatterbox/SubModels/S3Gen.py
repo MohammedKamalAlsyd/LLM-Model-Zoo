@@ -306,7 +306,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         self.pos_bias_u = nn.Parameter(torch.Tensor(n_head, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.Tensor(n_head, self.d_k))
 
-def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
         B, T, _ = query.size()
         
         # 1. Project Q without transposing yet! Shape remains (B, T, h, d_k)
