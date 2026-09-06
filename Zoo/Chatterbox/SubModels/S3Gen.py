@@ -326,10 +326,12 @@ class RelPositionMultiHeadedAttention(nn.Module):
         matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
         matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
 
-        # 5. Shift & Masking
-        zero_pad = torch.zeros((matrix_bd.size(0), matrix_bd.size(1), matrix_bd.size(2), 1), device=matrix_bd.device, dtype=matrix_bd.dtype)
-        matrix_bd = torch.cat([zero_pad, matrix_bd], dim=-1)
-        matrix_bd = matrix_bd.view(matrix_bd.size(0), matrix_bd.size(1), matrix_bd.size(3) + 1, matrix_bd.size(2))[:, :, 1:].view_as(matrix_bd)[:, :, :, :matrix_bd.size(-1) // 2 + 1]
+        # 5. Shift & Masking  -- FIXED relative position shift
+        B, H, T1, T2 = matrix_bd.shape
+        zero_pad = torch.zeros((B, H, T1, 1), device=matrix_bd.device, dtype=matrix_bd.dtype)
+        matrix_bd_padded = torch.cat([zero_pad, matrix_bd], dim=-1)   # (B, H, T1, T2+1)
+        matrix_bd_shifted = matrix_bd_padded.view(B, H, T2 + 1, T1)[:, :, 1:]  # (B, H, T2, T1)
+        matrix_bd = matrix_bd_shifted.view(B, H, T1, T2)[:, :, :, :T1]  # keep only first T1 columns
 
         scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)
         if mask.size(2) > 0:
