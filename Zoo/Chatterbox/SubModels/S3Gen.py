@@ -147,7 +147,10 @@ class CAMLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.linear_local(x)
-        pooled = F.avg_pool1d(x, 100, 100, ceil_mode=True).unsqueeze(-1).expand(*x.shape[:-1], 100).reshape(*x.shape[:-1], -1)[..., :x.shape[-1]]
+        seg = F.avg_pool1d(x, 100, 100, ceil_mode=True)
+        shape = seg.shape
+        pooled = seg.unsqueeze(-1).expand(*shape, 100).reshape(*shape[:-1], -1)[..., :x.shape[-1]]
+        
         context = x.mean(-1, keepdim=True) + pooled
         m = torch.sigmoid(self.linear2(F.relu(self.linear1(context))))
         return y * m
