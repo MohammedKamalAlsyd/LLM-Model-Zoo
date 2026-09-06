@@ -960,26 +960,16 @@ class HiFTGenerator(nn.Module):
         spec = torch.view_as_real(spec)
         s_stft = torch.cat([spec[..., 0], spec[..., 1]], dim=1)
 
-        print("s:", s.shape)
-        print("s_stft:", s_stft.shape)
-
         x = self.conv_pre(x)
-        print("conv_pre:", x.shape)
         for i in range(3):
             x = F.leaky_relu(x, 0.1)
             x = self.ups[i](x)
-            print(f"up[{i}]:", x.shape)
-
+            
             if i == 2:
                 x = self.reflection_pad(x)
-                print(f"reflection[{i}]:", x.shape)
-
+                
             si = self.source_downs[i](s_stft)
-            print(f"source_down[{i}]:", si.shape)
-
             si = self.source_resblocks[i](si)
-            print(f"source_resblock[{i}]:", si.shape)
-
             x = x + si
 
         x = F.leaky_relu(x)

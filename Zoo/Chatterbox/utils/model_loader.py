@@ -6,7 +6,8 @@ from safetensors.torch import load_file
 
 # Fixed imports based on your structure
 from Zoo.Chatterbox.SubModels.T3 import T3, T3Config
-from Zoo.Chatterbox.SubModels.S3Gen import S3Gen
+from Zoo.Chatterbox.Temp.s3gen import S3Gen
+# from Zoo.Chatterbox.SubModels.S3Gen import S3Gen
 from Zoo.Chatterbox.SubModels.voice_encoder import VoiceEncoder
 from Zoo.Chatterbox.SubModels.MTLTokenizer import MTLTokenizer
 
