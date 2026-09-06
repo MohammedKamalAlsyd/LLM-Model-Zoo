@@ -101,26 +101,20 @@ class AttentionBlock(nn.Module):
         self.to_k = nn.Linear(dim, dim)
         self.to_v = nn.Linear(dim, dim)
         self.proj_out = nn.Linear(dim, dim)
-        self.rel_pos_bias = nn.Embedding(32, num_heads)  # 32 buckets
-
-    def _get_rel_bias(self, q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
-        q_pos = torch.arange(q_len, device=device).unsqueeze(1)
-        k_pos = torch.arange(k_len, device=device).unsqueeze(0)
-        n = torch.clamp(-(k_pos - q_pos), min=0)
-        bucket = torch.where(n < 16, n, 16 + (torch.log(n.float() / 16) / math.log(64 / 16) * 16).long())
-        bucket = torch.clamp(bucket, max=31)
-        return self.rel_pos_bias(bucket).permute(2, 0, 1).unsqueeze(0) * ((1024 // self.num_heads) ** 0.5)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         x1_n, x2_n = self.norm(x1), self.norm(x2)
+        
+        # Split heads
         q = self.to_q(x1_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
         k = self.to_k(x2_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
         v = self.to_v(x2_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
         
+        # Scaled Dot-Product Attention (without the relative bias)
         sim = torch.einsum("bhlt,bhst->bhls", q, k) * (q.size(-1) ** -0.5)
-        sim = sim + self._get_rel_bias(x1.size(1), x2.size(1), x1.device)
         out = torch.einsum("bhls,bhst->bhlt", F.softmax(sim, dim=-1), v)
         
+        # Combine heads
         out = out.transpose(1, 2).flatten(-2)
         return x1 + self.proj_out(out)
 
