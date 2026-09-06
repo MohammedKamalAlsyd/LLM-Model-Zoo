@@ -112,7 +112,7 @@ def launch_app():
             outputs=[audio_output]
         )
 
-    demo.launch(server_name="127.0.0.1", share=False)
+    demo.launch(server_name="127.0.0.1", share=True, debug=True)
 
 if __name__ == "__main__":
     launch_app()
