@@ -308,7 +308,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
         B, T, _ = query.size()
-        q = self.linear_q(query).view(B, -1, self.h, self.d_k).transpose(1, 2)
+        q = self.linear_q(query).view(B, -1, self.h, self.d_k)
         k = self.linear_k(key).view(B, -1, self.h, self.d_k).transpose(1, 2)
         v = self.linear_v(value).view(B, -1, self.h, self.d_k).transpose(1, 2)
         p = self.linear_pos(pos_emb).view(pos_emb.size(0), -1, self.h, self.d_k).transpose(1, 2)
