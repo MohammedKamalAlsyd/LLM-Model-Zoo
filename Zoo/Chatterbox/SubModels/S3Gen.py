@@ -961,17 +961,26 @@ class HiFTGenerator(nn.Module):
         s_stft = torch.cat([spec[..., 0], spec[..., 1]], dim=1)
 
         x = self.conv_pre(x)
-        for i in range(3):
+
+        for i in range(len(self.ups)):
             x = F.leaky_relu(x, 0.1)
             x = self.ups[i](x)
-            
-            if i == 2:
+
+            if i == len(self.ups) - 1:
                 x = self.reflection_pad(x)
-                
+
+            # Harmonic/noise source fusion.
             si = self.source_downs[i](s_stft)
             si = self.source_resblocks[i](si)
             x = x + si
 
+            # Residual blocks with skip connections.
+            xs = torch.zeros_like(x)
+            for j in range(len(self.resblocks) // len(self.ups)):
+                residual = self.resblocks[i * (len(self.resblocks) // len(self.ups)) + j](x)
+                xs = xs + residual
+            x = xs / (len(self.resblocks) // len(self.ups))
+            
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         mag = torch.clip(torch.exp(x[:, :9, :]), max=1e2)
