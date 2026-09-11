@@ -1,50 +1,25 @@
-from typing import Optional, Union
-import librosa
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-# Shared Chatterbox Audio Constants
-SAMPLE_RATE = 16_000
-N_FFT = 400
-HOP_SIZE = 160
+def extract_mel_spectrogram(audio: torch.Tensor, mel_filters: torch.Tensor, window: torch.Tensor, hp) -> torch.Tensor:
+    """Computes Mel spectrogram exactly matching original Chatterbox librosa configuration."""
+    if hp.preemphasis > 0:
+        audio = torch.cat([audio[..., :1], audio[..., 1:] - hp.preemphasis * audio[..., :-1]], dim=-1).clamp(-1, 1)
 
+    mag = torch.stft(audio if audio.ndim == 2 else audio.unsqueeze(0), n_fft=hp.n_fft, 
+                     hop_length=hp.hop_size, win_length=hp.win_size, window=window.to(audio.device), 
+                     center=True, pad_mode="reflect", return_complex=True).abs()
 
-def load_audio_tensor(wav_input: Union[str, np.ndarray, torch.Tensor], trim_db: Optional[float] = None) -> torch.Tensor:
-    """Loads audio from path/array/tensor and standardizes to a 16kHz 1D PyTorch Tensor."""
-    if isinstance(wav_input, str):
-        wav, _ = librosa.load(wav_input, sr=SAMPLE_RATE)
-    elif isinstance(wav_input, torch.Tensor):
-        wav = wav_input.squeeze().cpu().numpy()
-    else:
-        wav = np.asarray(wav_input, dtype=np.float32).squeeze()
+    if hp.mel_power != 1.0: 
+        mag = mag.pow(hp.mel_power)
         
-    if trim_db is not None:
-        wav, _ = librosa.effects.trim(wav, top_db=trim_db)
+    mel = torch.matmul(mel_filters.to(audio.device).unsqueeze(0), mag)
+
+    if hp.mel_type == "db": 
+        mel = 20.0 * torch.log10(torch.clamp(mel, min=hp.stft_magnitude_min))
         
-    return torch.from_numpy(wav).float()
-
-
-def get_mel_basis(n_mels: int, fmin: int = 0, fmax: int = 8000) -> torch.Tensor:
-    """Precomputes the Mel filterbank matrix."""
-    filters = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=n_mels, fmin=fmin, fmax=fmax)
-    return torch.from_numpy(filters).float()
-
-
-def extract_power_spectrogram(audio: torch.Tensor, window: torch.Tensor, padding: int = 0) -> torch.Tensor:
-    """Computes STFT power magnitudes [B, F, T]. Matches librosa.stft exactly but runs on GPU."""
-    if audio.ndim == 1:
-        audio = audio.unsqueeze(0)
-    if padding > 0:
-        audio = F.pad(audio, (0, padding))
+    if hp.normalized_mels:
+        min_db = 20.0 * np.log10(hp.stft_magnitude_min)
+        mel = (mel - min_db) / (-min_db + 15.0)
         
-    stft = torch.stft(
-        audio,
-        n_fft=N_FFT,
-        hop_length=HOP_SIZE,
-        window=window,
-        center=True,
-        pad_mode="reflect",
-        return_complex=True
-    )
-    return stft[..., :-1].abs() ** 2.0
+    return mel

@@ -64,6 +64,3 @@ class MTLTokenizer:
         for token in [EOT, UNK, " "]:
             text = text.replace(token, "")
         return text.replace(SPACE, " ").strip()
-
-
-

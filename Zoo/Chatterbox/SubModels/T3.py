@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -42,9 +41,10 @@ LLAMA_520M_CONFIG: Dict[str, Any] = {
     },
 }
 
+
 @dataclass
 class T3Config:
-    text_tokens_dict_size: int = 704      # 704 (EN) or 2454 (Multilingual)
+    text_tokens_dict_size: int = 2454     # 2454 for Multilingual v3 (704 for EN-only)
     start_text_token: int = 255
     stop_text_token: int = 0
     max_text_tokens: int = 2048
@@ -57,19 +57,36 @@ class T3Config:
     llama_config_name: str = "Llama_520M"
     input_pos_emb: str = "learned"
     speaker_embed_size: int = 256
+    speech_cond_prompt_len: int = 150
     emotion_adv: bool = True
-    
+
     @property
     def n_channels(self) -> int:
         return 1024
 
+    @classmethod
+    def multilingual(cls):
+        return cls(text_tokens_dict_size=2454)
+
+    @classmethod
+    def english_only(cls):
+        return cls(text_tokens_dict_size=704)
+
 
 @dataclass
 class T3Cond:
-    """Dataclass aligning inputs from `voice_encoder` and `S3Tokenizer` to T3."""
-    speaker_emb: torch.Tensor                                     # From VoiceEncoder [1, 256]
-    cond_prompt_speech_emb: Optional[torch.Tensor] = None        # From S3Tokenizer (Embedded)
-    emotion_adv: Optional[Union[torch.Tensor, float]] = 0.5      # Accepts scalar float or Tensor
+    speaker_emb: torch.Tensor                                     # [1, 256] from VoiceEncoder
+    clap_emb: Optional[torch.Tensor] = None                       # Unused in v3, kept for signature
+    cond_prompt_speech_tokens: Optional[torch.Tensor] = None     # [1, T] from S3Tokenizer
+    cond_prompt_speech_emb: Optional[torch.Tensor] = None        # Embedded internally by T3
+    emotion_adv: Optional[Union[torch.Tensor, float]] = 0.5
+
+    def to(self, device=None, dtype=None):
+        for k, v in self.__dict__.items():
+            if torch.is_tensor(v):
+                is_fp = v.dtype in (torch.float16, torch.float32, torch.bfloat16)
+                setattr(self, k, v.to(device=device, dtype=dtype if is_fp else None))
+        return self
 
 
 # ==========================================
@@ -87,76 +104,67 @@ class LearnedPositionEmbeddings(nn.Module):
     def get_fixed_embedding(self, idx: Union[int, torch.Tensor]) -> torch.Tensor:
         device = self.emb.weight.device
         idx_tensor = idx if torch.is_tensor(idx) else torch.tensor(idx, device=device)
-        idx_tensor = torch.atleast_2d(idx_tensor).to(device)
-        return self.emb(idx_tensor)
+        return self.emb(torch.atleast_2d(idx_tensor).to(device))
 
 
-class AttentionBlock(nn.Module):
-    """Condensed Perceiver Attention Block preserving exact weight signatures."""
-    def __init__(self, dim: int, num_heads: int):
+class AttentionBlock2(nn.Module):
+    """Matches the exact naming and structure of Chatterbox's Perceiver AttentionBlock2."""
+    def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
         self.num_heads = num_heads
-        self.norm = nn.LayerNorm(dim)
-        self.to_q = nn.Linear(dim, dim)
-        self.to_k = nn.Linear(dim, dim)
-        self.to_v = nn.Linear(dim, dim)
-        self.proj_out = nn.Linear(dim, dim)
+        self.head_dim = channels // num_heads
+        self.norm = nn.LayerNorm(channels)
+        self.to_q = nn.Linear(channels, channels)
+        self.to_k = nn.Linear(channels, channels)
+        self.to_v = nn.Linear(channels, channels)
+        self.proj_out = nn.Linear(channels, channels)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1_n, x2_n = self.norm(x1), self.norm(x2)
-        
-        # Split heads
-        q = self.to_q(x1_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
-        k = self.to_k(x2_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
-        v = self.to_v(x2_n).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
-        
-        # Scaled Dot-Product Attention (without the relative bias)
-        sim = torch.einsum("bhlt,bhst->bhls", q, k) * (q.size(-1) ** -0.5)
-        out = torch.einsum("bhls,bhst->bhlt", F.softmax(sim, dim=-1), v)
-        
-        # Combine heads
-        out = out.transpose(1, 2).flatten(-2)
+        B, L1, C = x1.shape
+        _, L2, _ = x2.shape
+
+        q = self.to_q(self.norm(x1)).view(B, L1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.to_k(self.norm(x2)).view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(self.norm(x2)).view(B, L2, self.num_heads, self.head_dim).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).contiguous().view(B, L1, C)
         return x1 + self.proj_out(out)
 
 
 class Perceiver(nn.Module):
-    """Compresses variable length audio prompts down to exactly 32 tokens."""
-    def __init__(self, query_tokens: int = 32, dim: int = 1024, heads: int = 4):
+    def __init__(self, pre_attention_query_token: int = 32, embedding_dim: int = 1024, num_attn_heads: int = 4):
         super().__init__()
-        self.pre_attention_query = nn.Parameter(torch.empty(1, query_tokens, dim))
+        self.pre_attention_query = nn.Parameter(torch.empty(1, pre_attention_query_token, embedding_dim))
         self.pre_attention_query.data.uniform_(-0.05, 0.05)
-        self.attn = AttentionBlock(dim, heads)
+        self.attn = AttentionBlock2(embedding_dim, num_attn_heads)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         q = self.pre_attention_query.expand(h.size(0), -1, -1)
-        pre_att = self.attn(q, h)          # Cross-Attention
-        return self.attn(pre_att, pre_att) # Self-Attention
+        pre_att = self.attn(q, h)          # Cross-attention
+        return self.attn(pre_att, pre_att) # Self-attention
 
 
 class T3CondEnc(nn.Module):
     def __init__(self, hp: T3Config):
         super().__init__()
+        self.hp = hp
         self.spkr_enc = nn.Linear(hp.speaker_embed_size, hp.n_channels)
         self.emotion_adv_fc = nn.Linear(1, hp.n_channels, bias=False) if hp.emotion_adv else None
-        self.perceiver = Perceiver(dim=hp.n_channels)
+        self.perceiver = Perceiver(embedding_dim=hp.n_channels)
 
     def forward(self, cond: T3Cond) -> torch.Tensor:
-        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, 256))[:, None]
+        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, self.hp.speaker_embed_size))[:, None]
         empty = torch.zeros_like(cond_spkr[:, :0])
-        
+
         cond_prompt = self.perceiver(cond.cond_prompt_speech_emb) if cond.cond_prompt_speech_emb is not None else empty
-        
-        # Safely convert float or tensor to proper shape for emotion embedding
+
+        cond_emo = empty
         if self.emotion_adv_fc is not None and cond.emotion_adv is not None:
-            if torch.is_tensor(cond.emotion_adv):
-                emo_tensor = cond.emotion_adv.to(cond_spkr.device, dtype=cond_spkr.dtype)
-            else:
-                emo_tensor = torch.tensor(cond.emotion_adv, device=cond_spkr.device, dtype=cond_spkr.dtype)
-            cond_emo = self.emotion_adv_fc(emo_tensor.view(-1, 1, 1))
-        else:
-            cond_emo = empty
-        
-        # Concat Shape: [B, 1(Spkr) + 32(Prompt) + 1(Emo), 1024]
+            emo_val = cond.emotion_adv if torch.is_tensor(cond.emotion_adv) else torch.tensor(cond.emotion_adv)
+            cond_emo = self.emotion_adv_fc(emo_val.to(device=cond_spkr.device, dtype=cond_spkr.dtype).view(-1, 1, 1))
+
+        # Shape: [B, 1 (spkr) + 32 (prompt) + 1 (emo), 1024]
         return torch.cat((cond_spkr, empty, cond_prompt, cond_emo), dim=1)
 
 
@@ -164,39 +172,45 @@ class T3CondEnc(nn.Module):
 # 3. Main T3 Model
 # ==========================================
 class T3(nn.Module):
-    """Chatterbox T3 Decoder-Only TTS SubModel."""
-    def __init__(self, hp: T3Config = T3Config()):
+    """Chatterbox T3 Multilingual Autoregressive Backbone."""
+    def __init__(self, hp: Optional[T3Config] = None):
         super().__init__()
-        self.hp = hp
-        self.dim = hp.n_channels
+        self.hp = hp or T3Config.multilingual()
+        self.dim = self.hp.n_channels
 
-        # Using from_dict avoids Pylance **dict unpacking type collisions
         self.cfg = LlamaConfig.from_dict(LLAMA_520M_CONFIG)
         self.tfmr = LlamaModel(self.cfg)
 
-        self.cond_enc = T3CondEnc(hp)
-        self.text_emb = nn.Embedding(hp.text_tokens_dict_size, self.dim)
-        self.speech_emb = nn.Embedding(hp.speech_tokens_dict_size, self.dim)
+        self.cond_enc = T3CondEnc(self.hp)
+        self.text_emb = nn.Embedding(self.hp.text_tokens_dict_size, self.dim)
+        self.speech_emb = nn.Embedding(self.hp.speech_tokens_dict_size, self.dim)
 
-        self.text_pos_emb = LearnedPositionEmbeddings(hp.max_text_tokens + 2, self.dim)
-        self.speech_pos_emb = LearnedPositionEmbeddings(hp.max_speech_tokens + 4, self.dim)
+        self.text_pos_emb = LearnedPositionEmbeddings(self.hp.max_text_tokens + 2, self.dim)
+        self.speech_pos_emb = LearnedPositionEmbeddings(self.hp.max_speech_tokens + 4, self.dim)
 
-        self.text_head = nn.Linear(self.dim, hp.text_tokens_dict_size, bias=False)
-        self.speech_head = nn.Linear(self.dim, hp.speech_tokens_dict_size, bias=False)
+        self.speech_head = nn.Linear(self.dim, self.hp.speech_tokens_dict_size, bias=False)
 
     @property
     def device(self) -> torch.device:
         return self.speech_head.weight.device
 
+    def prepare_conditioning(self, t3_cond: T3Cond):
+        # Embed discrete prompt tokens using speech and position embeddings
+        if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
+            t3_cond.cond_prompt_speech_emb = (
+                self.speech_emb(t3_cond.cond_prompt_speech_tokens)
+                + self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            )
+        return self.cond_enc(t3_cond)
+
     def prepare_input_embeds(
         self, t3_cond: T3Cond, text_tokens: torch.Tensor, speech_tokens: torch.Tensor, cfg_weight: float = 0.0
     ):
-        cond_emb = self.cond_enc(t3_cond)  
-        
+        cond_emb = self.prepare_conditioning(t3_cond)
         text_emb = self.text_emb(text_tokens) + self.text_pos_emb(text_tokens)
         speech_emb = self.speech_emb(speech_tokens) + self.speech_pos_emb(speech_tokens)
 
-        # Unconditional pass for CFG (Zeroes out text tokens for batch index 1)
+        # Apply Unconditional masking for CFG (batch index 1 is unconditional)
         if cfg_weight > 0.0 and text_emb.size(0) > 1:
             text_emb[1].zero_()
 
@@ -206,119 +220,76 @@ class T3(nn.Module):
         embeds = torch.cat([cond_emb, text_emb, speech_emb], dim=1)
         return embeds, cond_emb.size(1)
 
-    def forward(
-        self, 
-        t3_cond: T3Cond, 
-        text_tokens: torch.Tensor, 
-        text_lens: torch.Tensor, 
-        speech_tokens: torch.Tensor, 
-        speech_lens: torch.Tensor
-    ):
-        embeds, len_cond = self.prepare_input_embeds(t3_cond, text_tokens, speech_tokens)
-        hidden_states = self.tfmr(inputs_embeds=embeds, use_cache=False).last_hidden_state
-
-        B, _, dim = hidden_states.shape
-        text_latents = torch.zeros(B, text_tokens.size(1), dim, device=self.device)
-        speech_latents = torch.zeros(B, speech_tokens.size(1), dim, device=self.device)
-        
-        for i in range(B):
-            t_end = len_cond + text_lens[i].item()
-            s_start = len_cond + text_tokens.size(1)
-            s_end = s_start + speech_lens[i].item()
-            text_latents[i, :text_lens[i]] = hidden_states[i, len_cond:t_end]
-            speech_latents[i, :speech_lens[i]] = hidden_states[i, s_start:s_end]
-
-        return self.text_head(text_latents), self.speech_head(speech_latents)
-
-    def loss(
-        self, 
-        t3_cond: T3Cond, 
-        text_tokens: torch.Tensor, 
-        text_lens: torch.Tensor, 
-        speech_tokens: torch.Tensor, 
-        speech_lens: torch.Tensor
-    ):
-        t_logits, s_logits = self.forward(t3_cond, text_tokens, text_lens, speech_tokens, speech_lens)
-        
-        mask_t = torch.arange(text_tokens.size(1), device=self.device)[None] >= text_lens[:, None]
-        mask_s = torch.arange(speech_tokens.size(1), device=self.device)[None] >= speech_lens[:, None]
-        
-        loss_t = F.cross_entropy(t_logits.transpose(1, 2), text_tokens.masked_fill(mask_t, -100), ignore_index=-100)
-        loss_s = F.cross_entropy(s_logits, speech_tokens.masked_fill(mask_s, -100), ignore_index=-100)
-        return loss_t, loss_s
-
     @torch.inference_mode()
-    def generate(
-        self, 
-        t3_cond: T3Cond, 
-        text_tokens: torch.Tensor, 
+    def inference(
+        self,
+        t3_cond: T3Cond,
+        text_tokens: torch.Tensor,
         max_new_tokens: int = 1000,
-        temperature: float = 0.8, 
-        top_p: float = 0.95, 
-        min_p: float = 0.05, 
-        repetition_penalty: float = 1.2, 
-        cfg_weight: float = 3.0
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        min_p: float = 0.05,
+        repetition_penalty: float = 1.2,
+        cfg_weight: float = 0.5,
+        **kwargs,
     ) -> torch.Tensor:
-        """Optimized custom loop with built-in Classifier-Free Guidance (CFG)."""
+        """Generation method called directly by ChatterboxMultilingualTTS."""
         text_tokens = torch.atleast_2d(text_tokens).to(self.device)
-        
-        # 1. Expand batch for CFG [Conditional, Unconditional]
-        if cfg_weight > 0.0:
+
+        # If batch size is 1 and CFG is requested, expand to batch size 2 [cond, uncond]
+        if cfg_weight > 0.0 and text_tokens.size(0) == 1:
             text_tokens = text_tokens.repeat(2, 1)
-            if t3_cond.cond_prompt_speech_emb is not None:
-                t3_cond.cond_prompt_speech_emb = t3_cond.cond_prompt_speech_emb.repeat(2, 1, 1)
-            t3_cond.speaker_emb = t3_cond.speaker_emb.repeat(2, 1)
-            if t3_cond.emotion_adv is not None:
-                val = float(t3_cond.emotion_adv) if not torch.is_tensor(t3_cond.emotion_adv) else t3_cond.emotion_adv.item()
-                t3_cond.emotion_adv = torch.tensor([val, val], device=self.device)
-        
-        # 2. Get initial Embeds
-        bos = torch.tensor([[self.hp.start_speech_token]], device=self.device).repeat(text_tokens.size(0), 1)
-        inputs_embeds, _ = self.prepare_input_embeds(t3_cond, text_tokens, bos, cfg_weight=cfg_weight)
 
-        # Logits Processors
-        rep_pen = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
-        min_p_warp = MinPLogitsWarper(min_p=min_p)
-        top_p_warp = TopPLogitsWarper(top_p=top_p)
+        B = text_tokens.size(0)
+        bos_tokens = torch.full((B, 1), self.hp.start_speech_token, dtype=torch.long, device=self.device)
+        inputs_embeds, _ = self.prepare_input_embeds(t3_cond, text_tokens, bos_tokens, cfg_weight=cfg_weight)
 
-        generated_ids = bos[:1].clone()
-        predicted = []
-        
-        # Forward pass 1: Full Context
+        # Instantiate logit processors
+        rep_pen_proc = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+        min_p_warp = MinPLogitsWarper(min_p=float(min_p))
+        top_p_warp = TopPLogitsWarper(top_p=float(top_p))
+
+        generated_ids = bos_tokens[:1].clone()
+        predicted_tokens = []
+
+        # Forward pass 1: Process the full prefix context
         out = self.tfmr(inputs_embeds=inputs_embeds, use_cache=True)
-        past = out.past_key_values
-        
-        # Forward pass N: Token by Token
-        for i in range(max_new_tokens):
-            hidden = out.last_hidden_state[:, -1, :]
-            logits = self.speech_head(hidden)
+        past_key_values = out.past_key_values
 
-            # Extract CFG
-            if cfg_weight > 0.0:
+        for i in range(max_new_tokens):
+            last_hidden = out.last_hidden_state[:, -1:, :]
+            logits = self.speech_head(last_hidden).squeeze(1)  # (B, Vocab)
+
+            # CFG combining
+            if cfg_weight > 0.0 and B > 1:
                 cond, uncond = logits[0:1], logits[1:2]
                 logits = cond + cfg_weight * (cond - uncond)
-            
-            # Processing & Sampling
-            logits = rep_pen(generated_ids, logits)
+            else:
+                logits = logits[0:1]
+
+            # Sample next token
+            ids_for_pen = generated_ids[:1]
+            logits = rep_pen_proc(ids_for_pen, logits)
             if temperature != 1.0:
                 logits = logits / temperature
-            logits = min_p_warp(generated_ids, logits)
-            logits = top_p_warp(generated_ids, logits)
+            logits = min_p_warp(ids_for_pen, logits)
+            logits = top_p_warp(ids_for_pen, logits)
 
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            predicted.append(next_token)
+            next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
+
+            predicted_tokens.append(next_token)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             if next_token.item() == self.hp.stop_speech_token:
                 break
 
-            # Embed next token for next step
+            # Forward pass N: Single token step with cached KV
             next_embed = self.speech_emb(next_token) + self.speech_pos_emb.get_fixed_embedding(i + 1)
-            if cfg_weight > 0.0:
-                next_embed = next_embed.repeat(2, 1, 1)
-            
-            out = self.tfmr(inputs_embeds=next_embed, past_key_values=past, use_cache=True)
-            past = out.past_key_values
+            if B > 1:
+                next_embed = next_embed.expand(B, -1, -1)
 
-        return torch.cat(predicted, dim=1)
+            out = self.tfmr(inputs_embeds=next_embed, past_key_values=past_key_values, use_cache=True)
+            past_key_values = out.past_key_values
+
+        return torch.cat(predicted_tokens, dim=1)
