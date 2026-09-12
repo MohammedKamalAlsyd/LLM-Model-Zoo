@@ -158,7 +158,7 @@ def launch_ui():
             outputs=[output_image, output_text],
         )
 
-    demo.launch(server_name="0.0.0.0", share=False)
+    demo.launch(server_name="0.0.0.0", share=True)
 
 
 if __name__ == "__main__":
