@@ -20,7 +20,8 @@ class CLIPAttention(nn.Module):
         k = self.k_proj(x).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=(attention_mask is None))
+        # attention_mask is already a combined 4D [B, 1, S, S] float causal mask
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(b, s, self.embed_dim)
         return self.out_proj(out)
 
@@ -89,7 +90,22 @@ class CLIPTextTransformer(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         hidden_states = self.embeddings(input_ids)
-        hidden_states = self.encoder(hidden_states, attention_mask=attention_mask)
+        b, seq_len = input_ids.shape
+        device = input_ids.device
+        dtype = hidden_states.dtype
+
+        # 1. Base Causal Mask: upper triangular filled with -inf [1, 1, seq_len, seq_len]
+        causal_mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
+        causal_mask = torch.triu(causal_mask, diagonal=1)[None, None, :, :]
+
+        # 2. Combine with padding mask (converting int64 [B, seq_len] to additive float [B, 1, 1, seq_len])
+        if attention_mask is not None:
+            pad_mask = torch.where(attention_mask[:, None, None, :].bool(), 0.0, float("-inf")).to(dtype)
+            combined_mask = causal_mask + pad_mask
+        else:
+            combined_mask = causal_mask
+
+        hidden_states = self.encoder(hidden_states, attention_mask=combined_mask)
         return self.final_layer_norm(hidden_states)
 
 
