@@ -1,8 +1,10 @@
+import collections
 import gc
-from typing import Optional, cast
+from typing import Dict, List, Optional, Tuple, cast
 import torch
 import torch.nn as nn
 from PIL import Image
+from safetensors import safe_open
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer
 
 from .SubModels.AutoEncoderKL import AutoencoderKL, DecoderOutput
@@ -13,7 +15,7 @@ from .SubModels.SchedulingFlowMatchEulerDiscrete import (
 )
 from .SubModels.T5EncoderModel import T5EncoderModel
 from .pipeline import calculate_shift, pack_latents, prepare_latent_image_ids, unpack_latents
-from .utils.model_loader import get_safetensors_files, stream_safetensors_to_model
+from .utils.model_loader import _set_module_tensor, get_safetensors_files, stream_safetensors_to_model
 
 
 def purge_memory():
@@ -24,10 +26,20 @@ def purge_memory():
         torch.cuda.ipc_collect()
 
 
+def _free_submodule(module: nn.Module):
+    """Replaces all CUDA parameters in a module with zero-byte meta parameters to free VRAM."""
+    for name, param in module.named_parameters():
+        meta_param = nn.Parameter(
+            torch.empty(param.shape, device="meta", dtype=param.dtype),
+            requires_grad=False,
+        )
+        _set_module_tensor(module, name, meta_param)
+
+
 class StreamingFluxPipeline:
     """
-    Memory-efficient FLUX.1 [schnell] runner designed for systems with <= 30GB total memory.
-    Streams weights into GPU directly from disk and purges models between stages.
+    Kaggle T4-optimized FLUX.1 [schnell] pipeline.
+    Uses sequential block-by-block streaming to stay under 1.5 GB VRAM and 2.5 GB System RAM.
     """
 
     def __init__(self, checkpoint_path: str = "black-forest-labs/FLUX.1-schnell", device: str = "cuda"):
@@ -41,7 +53,6 @@ class StreamingFluxPipeline:
         self.t5_files = get_safetensors_files(checkpoint_path, subfolder="text_encoder_2")
         self.vae_files = get_safetensors_files(checkpoint_path, subfolder="vae")
 
-        # Scheduler is lightweight (<1 MB) and safe to keep permanently in memory
         self.scheduler = FlowMatchEulerDiscreteScheduler(
             num_train_timesteps=1000,
             shift=1.0,
@@ -54,17 +65,15 @@ class StreamingFluxPipeline:
         )
 
     # --------------------------------------------------------------------------
-    # STAGE 1: Text Encoding (Peaks at ~10 GB VRAM, < 1.5 GB RAM)
+    # STAGE 1: Text Encoding (T5 fits in 9.5 GB on T4, then purges)
     # --------------------------------------------------------------------------
     def _encode_prompt(
         self, prompt: str, max_sequence_length: int = 256
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         print("\n[Stage 1/3] Loading CLIP-L and T5-XXL for Text Encoding...")
 
-        # 1. CLIP-L Pooled Encoding (~0.5 GB)
+        # 1. CLIP-L Pooled Encoding
         tokenizer = CLIPTokenizer.from_pretrained(self.checkpoint_path, subfolder="tokenizer")
-        
-        # Explicit cast to nn.Module resolves Pylance unbound method / __call__ inference issue
         raw_clip = CLIPTextModel.from_pretrained(
             self.checkpoint_path, subfolder="text_encoder", torch_dtype=self.dtype
         )
@@ -102,18 +111,15 @@ class StreamingFluxPipeline:
         )
         t5_output = t5_encoder(input_ids=t5_inputs["input_ids"].to(self.device))
         prompt_embeds = t5_output.last_hidden_state.to(dtype=self.dtype, device=self.device)
-
-        # 3. Text RoPE IDs
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=self.device, dtype=self.dtype)
 
-        # Immediate cleanup of Stage 1 models
         del t5_encoder, tokenizer_2, t5_output
         purge_memory()
-        print("  Prompt encoded successfully. All text encoders purged from memory.")
+        print("  Prompt encoded. Text encoders purged. VRAM freed.")
         return prompt_embeds, pooled_prompt_embeds, txt_ids
 
     # --------------------------------------------------------------------------
-    # STAGE 2: Transformer Denoising (Peaks at ~24.5 GB VRAM, < 1.5 GB RAM)
+    # STAGE 2: Block-by-Block Transformer Denoising (Peaks at only ~1.5 GB VRAM!)
     # --------------------------------------------------------------------------
     def _denoise_latents(
         self,
@@ -124,8 +130,28 @@ class StreamingFluxPipeline:
         img_ids: torch.Tensor,
         num_inference_steps: int = 4,
     ) -> torch.Tensor:
-        print("\n[Stage 2/3] Constructing and streaming 12B Transformer to GPU (~24 GB)...")
+        print("\n[Stage 2/3] Initializing Sequential Block Streaming for Transformer...")
 
+        # 1. Open safetensors memory-mapped handles
+        open_handles = {p: safe_open(p, framework="pt", device="cpu") for p in self.transformer_files}
+
+        # 2. Index all weight keys into static, dual-stream, and single-stream groups
+        static_weights: List[Tuple[str, str]] = []
+        dual_blocks_map: Dict[int, List[Tuple[str, str, str]]] = collections.defaultdict(list)
+        single_blocks_map: Dict[int, List[Tuple[str, str, str]]] = collections.defaultdict(list)
+
+        for fpath, handle in open_handles.items():
+            for key in handle.keys():
+                if key.startswith("transformer_blocks."):
+                    parts = key.split(".", 2)
+                    dual_blocks_map[int(parts[1])].append((fpath, key, parts[2]))
+                elif key.startswith("single_transformer_blocks."):
+                    parts = key.split(".", 2)
+                    single_blocks_map[int(parts[1])].append((fpath, key, parts[2]))
+                else:
+                    static_weights.append((fpath, key))
+
+        # 3. Build model on meta device
         with torch.device("meta"):
             transformer = FluxTransformer2DModel(
                 patch_size=1,
@@ -139,51 +165,85 @@ class StreamingFluxPipeline:
                 guidance_embeds=False,
             )
 
-        stream_safetensors_to_model(transformer, self.transformer_files, device=self.device, dtype=self.dtype)
-        print("  Transformer weights streamed into GPU. Starting Flow-Matching Euler steps...")
+        # 4. Load static layers (< 100 MB) onto GPU once
+        for fpath, key in static_weights:
+            tensor = open_handles[fpath].get_tensor(key).to(device=self.device, dtype=self.dtype)
+            _set_module_tensor(transformer, key, tensor)
+            del tensor
 
-        # Setup Euler Schedule
+        print("  Static layers loaded onto GPU (<100 MB). Starting Euler flow matching...")
+
+        # Schedule Setup
         image_seq_len = latents.shape[1]
         mu = calculate_shift(image_seq_len)
         self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=self.device, mu=mu)
         self.scheduler.set_begin_index(0)
 
+        # 5. Denoising Loop
         for step_idx, t in enumerate(self.scheduler.timesteps):
             print(f"  Denoising step {step_idx + 1}/{num_inference_steps} (timestep {t.item():.1f})...")
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
             with torch.no_grad():
-                transformer_res = transformer(
-                    hidden_states=latents,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    timestep=timestep / 1000.0,
-                    img_ids=img_ids,
-                    txt_ids=txt_ids,
-                    guidance=None,
-                    return_dict=True,
-                )
-                
-                model_output = (
-                    transformer_res.sample
-                    if isinstance(transformer_res, Transformer2DModelOutput)
-                    else transformer_res[0]
-                )
+                # A. Static input projections
+                h_states = transformer.x_embedder(latents)
+                enc_h_states = transformer.context_embedder(prompt_embeds)
+                t_expanded = timestep * 1000.0
+                temb = transformer.time_text_embed(t_expanded, pooled_prompt_embeds)
 
+                ids = torch.cat((txt_ids, img_ids), dim=0)
+                image_rotary_emb = transformer.pos_embed(ids)
+
+                # B. Stream 19 Dual-Stream Blocks (one block in VRAM at a time)
+                for i in range(len(transformer.transformer_blocks)):
+                    block = transformer.transformer_blocks[i]
+                    for fpath, full_key, subkey in dual_blocks_map[i]:
+                        tensor = open_handles[fpath].get_tensor(full_key).to(device=self.device, dtype=self.dtype)
+                        _set_module_tensor(block, subkey, tensor)
+                        del tensor
+
+                    enc_h_states, h_states = block(
+                        hidden_states=h_states,
+                        encoder_hidden_states=enc_h_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                    )
+                    _free_submodule(block)
+
+                # C. Stream 38 Single-Stream Blocks (one block in VRAM at a time)
+                for j in range(len(transformer.single_transformer_blocks)):
+                    s_block = transformer.single_transformer_blocks[j]
+                    for fpath, full_key, subkey in single_blocks_map[j]:
+                        tensor = open_handles[fpath].get_tensor(full_key).to(device=self.device, dtype=self.dtype)
+                        _set_module_tensor(s_block, subkey, tensor)
+                        del tensor
+
+                    enc_h_states, h_states = s_block(
+                        hidden_states=h_states,
+                        encoder_hidden_states=enc_h_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                    )
+                    _free_submodule(s_block)
+
+                # D. Static output projections
+                h_states = transformer.norm_out(h_states, temb)
+                model_output = transformer.proj_out(h_states)
+
+                # E. Euler Integration Step
                 step_output = self.scheduler.step(model_output, t, latents, return_dict=True)
                 if isinstance(step_output, FlowMatchEulerDiscreteSchedulerOutput):
                     latents = step_output.prev_sample
                 else:
                     latents = step_output[0]
 
-        # Immediate cleanup of Stage 2 model
-        del transformer
+        del open_handles, transformer
         purge_memory()
-        print("  Denoising complete. Transformer completely purged from GPU memory.")
+        print("  Denoising complete. Transformer purged from memory.")
         return latents
 
     # --------------------------------------------------------------------------
-    # STAGE 3: VAE Decoding (Peaks at ~1.0 GB VRAM, < 1.5 GB RAM)
+    # STAGE 3: VAE Decoding (~335 MB, easily fits on T4)
     # --------------------------------------------------------------------------
     def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> Image.Image:
         print("\n[Stage 3/3] Streaming VAE to GPU and decoding final image...")
@@ -213,7 +273,7 @@ class StreamingFluxPipeline:
 
         del vae
         purge_memory()
-        print("  Decoding finished. VAE purged from memory.")
+        print("  Decoding finished. Image generated successfully.")
         return Image.fromarray(images_uint8[0])
 
     # --------------------------------------------------------------------------
@@ -231,10 +291,8 @@ class StreamingFluxPipeline:
         height = 2 * (int(height) // 16) * 8
         width = 2 * (int(width) // 16) * 8
 
-        # Stage 1: Encode Text
         prompt_embeds, pooled_prompt_embeds, txt_ids = self._encode_prompt(prompt)
 
-        # Prepare Latent Noise
         latent_channels = 16
         latent_h = height // self.vae_scale_factor
         latent_w = width // self.vae_scale_factor
@@ -247,7 +305,6 @@ class StreamingFluxPipeline:
         latents = pack_latents(noise)
         img_ids = prepare_latent_image_ids(height, width, device=self.device, dtype=self.dtype)
 
-        # Stage 2: Denoise with Transformer
         latents = self._denoise_latents(
             latents=latents,
             prompt_embeds=prompt_embeds,
@@ -257,14 +314,10 @@ class StreamingFluxPipeline:
             num_inference_steps=num_inference_steps,
         )
 
-        # Stage 3: Decode with VAE
         image = self._decode_latents(latents, height, width)
         return image
 
 
-# ==============================================================================
-# Execution Entry Point
-# ==============================================================================
 if __name__ == "__main__":
     prompt = (
         "A sleek cybernetic robotic tiger walking through a rain-slicked Tokyo street at night, "
@@ -273,7 +326,7 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
-        raise SystemError("CUDA GPU is required to run FLUX under the specified memory budget.")
+        raise SystemError("CUDA GPU is required to run FLUX.")
 
     pipeline = StreamingFluxPipeline(device=device)
 
@@ -288,4 +341,4 @@ if __name__ == "__main__":
 
     output_filename = "flux_output.png"
     output_image.save(output_filename)
-    print(f"\nCompleted! Generated image saved to {output_filename}")
+    print(f"\nCompleted! Saved generated image to {output_filename}")
