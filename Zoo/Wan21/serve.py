@@ -7,11 +7,12 @@ import random
 import subprocess
 import sys
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union, cast
 
 # Enable PyTorch expandable segments to prevent VRAM fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import diffusers
 import gradio as gr
 import imageio
 import numpy as np
@@ -24,6 +25,9 @@ from PIL import Image
 from tqdm import tqdm
 
 from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
+
+# Safely extract AudioLDMPipeline to satisfy static analyzers
+AudioLDMPipeline = getattr(diffusers, "AudioLDMPipeline", None)
 
 # -----------------------------------------------------------------------------
 # CUDA & cuDNN Global Optimization Configuration
@@ -80,28 +84,28 @@ class KaggleMemoryManager:
             logger.info(f"[{tag}] VRAM Allocated: {alloc:.1f}MB | Reserved: {res:.1f}MB")
 
 
-def sync_vae_device(vae: Any, target_device: torch.device, dtype: torch.dtype = torch.float32):
+def sync_vae_device(vae: Any, target_device: Union[torch.device, str], dtype: torch.dtype = torch.float32):
     """
     Synchronizes the entire WanVAE state (model, device attribute, mean, std, scale)
     to a single target device and dtype to prevent cross-device mismatches.
     """
-    target_device = torch.device(target_device)
-    vae.device = target_device
+    device_obj = torch.device(target_device)
+    vae.device = device_obj
     vae.dtype = dtype
 
     if hasattr(vae, "model") and vae.model is not None:
-        vae.model = vae.model.to(device=target_device, dtype=dtype)
+        vae.model = vae.model.to(device=device_obj, dtype=dtype)
     if hasattr(vae, "mean") and isinstance(vae.mean, torch.Tensor):
-        vae.mean = vae.mean.to(device=target_device, dtype=dtype)
+        vae.mean = vae.mean.to(device=device_obj, dtype=dtype)
     if hasattr(vae, "std") and isinstance(vae.std, torch.Tensor):
-        vae.std = vae.std.to(device=target_device, dtype=dtype)
+        vae.std = vae.std.to(device=device_obj, dtype=dtype)
     
     # Rebuild scale tuple on target device
     if hasattr(vae, "mean") and hasattr(vae, "std"):
         vae.scale = [vae.mean, 1.0 / vae.std]
     elif hasattr(vae, "scale") and isinstance(vae.scale, (list, tuple)):
         vae.scale = [
-            s.to(device=target_device, dtype=dtype) if isinstance(s, torch.Tensor) else s
+            s.to(device=device_obj, dtype=dtype) if isinstance(s, torch.Tensor) else s
             for s in vae.scale
         ]
 
@@ -111,12 +115,17 @@ class WanAudioEngine:
 
     def __init__(self, device: torch.device):
         self.device = device
-        self.pipe = None
+        self.pipe: Any = None
+        self._load_failed: bool = False
 
     def _lazy_load(self):
-        if self.pipe is None:
+        if self.pipe is None and not self._load_failed:
+            if AudioLDMPipeline is None:
+                logger.warning("AudioLDMPipeline is not installed in current diffusers package.")
+                self._load_failed = True
+                return
+
             try:
-                from diffusers import AudioLDMPipeline
                 logger.info("Loading AudioLDM pipeline for sound effect generation...")
                 self.pipe = AudioLDMPipeline.from_pretrained(
                     "cvssp/audioldm-s-full-v2",
@@ -125,22 +134,25 @@ class WanAudioEngine:
                 self.pipe = self.pipe.to(self.device)
             except Exception as e:
                 logger.error(f"Failed to initialize AudioLDM: {e}")
-                self.pipe = False
+                self._load_failed = True
+                self.pipe = None
 
     def generate_sound(self, prompt: str, duration_sec: float, output_wav_path: str) -> bool:
         self._lazy_load()
-        if not self.pipe:
+        if self.pipe is None or self._load_failed:
             logger.warning("Audio generator is unavailable. Skipping sound synthesis.")
             return False
 
         try:
             logger.info(f"Generating {duration_sec:.2f}s audio for prompt: '{prompt[:60]}...'")
-            audio = self.pipe(
+            result = self.pipe(
                 prompt=prompt,
                 negative_prompt="low quality, noise, distortion, static, speaking, talking, speech",
                 num_inference_steps=20,
                 audio_length_in_s=max(1.0, duration_sec),
-            ).audios[0]
+            )
+            
+            audio = result.audios[0] if hasattr(result, "audios") else result[0][0]
 
             # Convert to 16-bit PCM WAV
             audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
@@ -164,7 +176,7 @@ def mux_audio_video(video_path: str, audio_path: str, output_path: str) -> str:
             "-shortest",
             output_path
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         logger.info(f"Audio muxing complete: {output_path}")
         return output_path
     except Exception as e:
@@ -219,7 +231,7 @@ class WanGradioPipeline:
         shift: float = 3.0,
         seed: int = -1,
         enable_audio: bool = True,
-        progress=gr.Progress(track_tqdm=True),
+        progress: Optional[gr.Progress] = None,
     ) -> str:
         KaggleMemoryManager.flush()
         KaggleMemoryManager.report_vram("Before Generation")
@@ -256,6 +268,9 @@ class WanGradioPipeline:
         y = None
 
         if task == "i2v" and image is not None:
+            if self.c.clip is None:
+                raise ValueError("CLIP model is required for Image-to-Video but was not found in container.")
+
             logger.info("Processing conditioning image...")
             self.c.clip.model.to(self.device)
             img_t = TF.to_tensor(image).sub_(0.5).div_(0.5).to(self.device)
@@ -311,12 +326,12 @@ class WanGradioPipeline:
         # 4. DiT Sampling Loop (Kept on GPU throughout the loop)
         # ---------------------------------------------------------------------
         logger.info(f"Loading DiT backbone ({self.dtype}) to GPU for denoising...")
-        self.c.dit.to(device=self.device, dtype=self.dtype)
+        cast(torch.nn.Module, self.c.dit).to(device=self.device, dtype=self.dtype)
         KaggleMemoryManager.report_vram("DiT Active")
 
         latent = noise
         with torch.amp.autocast("cuda", dtype=self.dtype):
-            for t in progress.tqdm(timesteps, desc="Sampling Video Frames"):
+            for t in tqdm(timesteps, desc="Sampling Video Frames"):
                 latent_input = [latent]
                 t_tensor = torch.tensor([t], device=self.device)
 
@@ -334,7 +349,7 @@ class WanGradioPipeline:
                 )[0]
 
         logger.info("Denoising complete. Unloading DiT from GPU...")
-        self.c.dit.to("cpu")
+        cast(torch.nn.Module, self.c.dit).to("cpu")
         KaggleMemoryManager.flush()
         KaggleMemoryManager.report_vram("DiT Offloaded")
 
@@ -380,10 +395,10 @@ class WanGradioPipeline:
         return silent_video_path
 
     def _render_mp4(self, tensor: torch.Tensor, output_path: str, fps: int = 16):
-        tensor = tensor.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255.0).byte()
-        tensor = tensor.permute(1, 2, 3, 0).cpu().numpy()
+        scaled_tensor = tensor.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255.0).byte()
+        frames_np = scaled_tensor.permute(1, 2, 3, 0).cpu().numpy()
         writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
-        for frame in tensor:
+        for frame in frames_np:
             writer.append_data(frame)
         writer.close()
         logger.info(f"Rendered video saved: {output_path}")
@@ -410,8 +425,10 @@ def init_pipeline(model_scale: str):
 
 
 def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
+    global pipeline_instance
     if pipeline_instance is None:
         init_pipeline("1.3B")
+    assert pipeline_instance is not None, "Pipeline failed to initialize"
     w, h = [int(x) for x in resolution.split("x")]
     return pipeline_instance.generate(
         task="t2v",
@@ -429,8 +446,10 @@ def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, ena
 
 
 def run_i2v(image, prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
+    global pipeline_instance
     if pipeline_instance is None:
         init_pipeline("1.3B")
+    assert pipeline_instance is not None, "Pipeline failed to initialize"
     w, h = [int(x) for x in resolution.split("x")]
     return pipeline_instance.generate(
         task="i2v",
