@@ -18,9 +18,9 @@ def box_xyxy_to_cxcywh(x: torch.Tensor) -> torch.Tensor:
     return torch.stack(b, dim=-1)
 
 def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-    x = x.clamp(min=0, max=1)
+    x = x.clamp(min=0.0, max=1.0)
     x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
+    x2 = (1.0 - x).clamp(min=eps)
     return torch.log(x1 / x2)
 
 def concat_padded_sequences(seq1: torch.Tensor, mask1: torch.Tensor, seq2: torch.Tensor, mask2: torch.Tensor):
@@ -103,6 +103,9 @@ class Sam3Attention(nn.Module):
         k = self.k_proj(key).view(b, k_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(value).view(b, k_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
 
+        if attention_mask is not None and attention_mask.dtype != q.dtype:
+            attention_mask = attention_mask.to(q.dtype)
+
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
         out = out.transpose(1, 2).contiguous().view(b, q_len, self.hidden_size)
         return self.o_proj(out), None
@@ -124,9 +127,10 @@ def apply_rotary_pos_emb_2d(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
 
 class Sam3ViTRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor
+
     def __init__(self, head_dim: int = 64, rope_theta: float = 10000.0):
         super().__init__()
-        spatial_dim = head_dim // 2
+        spatial_dim = head_dim // 2  # 32
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -137,11 +141,12 @@ class Sam3ViTRotaryEmbedding(nn.Module):
         cos = freqs.cos()
         sin = freqs.sin()
 
-        freq_h, freq_w = cos[:, 1], cos[:, 0]
-        cos_hw = torch.cat([freq_h, freq_w], dim=-1)[None, ...].repeat_interleave(2, dim=-1)
+        # Exact match with modeling_sam3.py: cat([freq[:, 0], freq[:, 1]])
+        freq_w_cos, freq_h_cos = cos[:, 0], cos[:, 1]
+        cos_hw = torch.cat([freq_w_cos, freq_h_cos], dim=-1)[None, ...].repeat_interleave(2, dim=-1)
 
-        freq_h, freq_w = sin[:, 1], sin[:, 0]
-        sin_hw = torch.cat([freq_h, freq_w], dim=-1)[None, ...].repeat_interleave(2, dim=-1)
+        freq_w_sin, freq_h_sin = sin[:, 0], sin[:, 1]
+        sin_hw = torch.cat([freq_w_sin, freq_h_sin], dim=-1)[None, ...].repeat_interleave(2, dim=-1)
 
         return cos_hw, sin_hw
 
