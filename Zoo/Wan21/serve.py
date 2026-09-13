@@ -67,6 +67,32 @@ class KaggleMemoryManager:
             logger.info(f"[{tag}] VRAM Allocated: {alloc:.1f}MB | Reserved: {res:.1f}MB")
 
 
+def sync_vae_device(vae: Any, target_device: torch.device, dtype: torch.dtype = torch.float32):
+    """
+    Synchronizes the entire WanVAE state (model, device attribute, mean, std, scale)
+    to a single target device and dtype to prevent cross-device mismatches.
+    """
+    target_device = torch.device(target_device)
+    vae.device = target_device
+    vae.dtype = dtype
+
+    if hasattr(vae, "model") and vae.model is not None:
+        vae.model = vae.model.to(device=target_device, dtype=dtype)
+    if hasattr(vae, "mean") and isinstance(vae.mean, torch.Tensor):
+        vae.mean = vae.mean.to(device=target_device, dtype=dtype)
+    if hasattr(vae, "std") and isinstance(vae.std, torch.Tensor):
+        vae.std = vae.std.to(device=target_device, dtype=dtype)
+    
+    # Rebuild scale tuple on target device
+    if hasattr(vae, "mean") and hasattr(vae, "std"):
+        vae.scale = [vae.mean, 1.0 / vae.std]
+    elif hasattr(vae, "scale") and isinstance(vae.scale, (list, tuple)):
+        vae.scale = [
+            s.to(device=target_device, dtype=dtype) if isinstance(s, torch.Tensor) else s
+            for s in vae.scale
+        ]
+
+
 class WanGradioPipeline:
 
     def __init__(self, container: WanModelContainer):
@@ -75,7 +101,7 @@ class WanGradioPipeline:
         
         # Hardware-aware precision assignment:
         # T4 (sm_75) and P100 (sm_60) do not have BF16 Tensor Cores.
-        # Running BF16 causes software emulation (5x-10x slower) and cuDNN conv3d rejections.
+        # Running BF16 causes slow software emulation (5x-10x slower) and cuDNN conv3d rejections.
         if torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
             if major < 8:
@@ -133,7 +159,7 @@ class WanGradioPipeline:
         context = self.c.text_encoder([prompt], device=torch.device("cpu"))
         context_null = self.c.text_encoder([negative_prompt], device=torch.device("cpu"))
 
-        # Transfer only the final token embeddings to GPU
+        # Transfer only the token embeddings to GPU
         context = [t.to(device=self.device, dtype=self.dtype) for t in context]
         context_null = [t.to(device=self.device, dtype=self.dtype) for t in context_null]
 
@@ -152,15 +178,10 @@ class WanGradioPipeline:
             self.c.clip.model.to("cpu")
             KaggleMemoryManager.flush()
 
-            # Execute VAE Encoding strictly in FP32 with autocast disabled
+            # Fully synchronize VAE to GPU in float32 for clean encoding
+            sync_vae_device(self.c.vae, self.device, dtype=torch.float32)
+
             with torch.amp.autocast("cuda", enabled=False):
-                self.c.vae.model.to(device=self.device, dtype=torch.float32)
-                if hasattr(self.c.vae, "scale") and isinstance(self.c.vae.scale, (list, tuple)):
-                    self.c.vae.scale = [
-                        s.to(device=self.device, dtype=torch.float32) if isinstance(s, torch.Tensor) else s 
-                        for s in self.c.vae.scale
-                    ]
-                
                 img_scaled = F.interpolate(img_t.unsqueeze(0), size=(ren_h, ren_w), mode="bicubic")
                 cond_video = torch.cat([
                     img_scaled.transpose(1, 2),
@@ -169,7 +190,7 @@ class WanGradioPipeline:
 
                 y_img = self.c.vae.encode([cond_video])[0].to(dtype=self.dtype)
 
-            self.c.vae.model.to("cpu")
+            sync_vae_device(self.c.vae, "cpu", dtype=torch.float32)
             KaggleMemoryManager.flush()
 
             msk = torch.zeros(1, frame_num, lat_h, lat_w, device=self.device, dtype=self.dtype)
@@ -232,23 +253,19 @@ class WanGradioPipeline:
         KaggleMemoryManager.report_vram("DiT Offloaded")
 
         # ---------------------------------------------------------------------
-        # 5. VAE Latent Decode (Forced to Float32 to prevent slow_conv3d crash)
+        # 5. VAE Latent Decode (All VAE tensors synchronized to GPU in FP32)
         # ---------------------------------------------------------------------
         logger.info("Loading VAE to GPU for temporal decoding in FP32...")
         
-        # Explicitly decode in float32 with autocast disabled
-        with torch.amp.autocast("cuda", enabled=False):
-            self.c.vae.model.to(device=self.device, dtype=torch.float32)
-            if hasattr(self.c.vae, "scale") and isinstance(self.c.vae.scale, (list, tuple)):
-                self.c.vae.scale = [
-                    s.to(device=self.device, dtype=torch.float32) if isinstance(s, torch.Tensor) else s 
-                    for s in self.c.vae.scale
-                ]
+        # Synchronize model, mean, std, and scale tensors completely to GPU in FP32
+        sync_vae_device(self.c.vae, self.device, dtype=torch.float32)
 
+        # Decode strictly in float32 with autocast disabled
+        with torch.amp.autocast("cuda", enabled=False):
             latent_f32 = latent.to(device=self.device, dtype=torch.float32)
             video = self.c.vae.decode([latent_f32])[0]
 
-        self.c.vae.model.to("cpu")
+        sync_vae_device(self.c.vae, "cpu", dtype=torch.float32)
         KaggleMemoryManager.flush()
 
         output_filename = f"wan_video_{int(time.time())}.mp4"
