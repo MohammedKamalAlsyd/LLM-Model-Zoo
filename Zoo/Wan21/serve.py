@@ -28,11 +28,11 @@ from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
 if torch.cuda.is_available():
     # cuDNN MUST be enabled for 3D convolutions on CUDA
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = False  # Avoid algorithm search overhead on variable video shapes
+    torch.backends.cudnn.benchmark = False  # Avoid algorithm search overhead on dynamic shapes
     
     # Configure PyTorch 2.x SDPA backends
     major, _ = torch.cuda.get_device_capability()
-    torch.backends.cuda.enable_flash_sdp(major >= 8)       # FlashAttention only on Ampere+ (sm_80+)
+    torch.backends.cuda.enable_flash_sdp(major >= 8)       # FlashAttention on Ampere+ (sm_80+)
     torch.backends.cuda.enable_mem_efficient_sdp(True)    # High-speed memory-efficient attention on T4
     torch.backends.cuda.enable_math_sdp(True)             # Fallback math kernel
 
@@ -71,7 +71,7 @@ class WanGradioPipeline:
 
     def __init__(self, container: WanModelContainer):
         self.c = container
-        self.device = self.c.device
+        self.device = torch.device(self.c.device) if isinstance(self.c.device, str) else self.c.device
         
         # Hardware-aware precision assignment:
         # T4 (sm_75) and P100 (sm_60) do not have BF16 Tensor Cores.
@@ -122,7 +122,9 @@ class WanGradioPipeline:
         seq_len = math.ceil((lat_h * lat_w) / (self.c.patch_size[1] * self.c.patch_size[2]) * F_lat)
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        
+        # Generator device matches target tensor device to avoid PyTorch device mismatch
+        generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # ---------------------------------------------------------------------
         # 1. Linguistic Encoding on CPU RAM (Zero GPU VRAM used)
@@ -131,7 +133,7 @@ class WanGradioPipeline:
         context = self.c.text_encoder([prompt], device=torch.device("cpu"))
         context_null = self.c.text_encoder([negative_prompt], device=torch.device("cpu"))
 
-        # Transfer only the token embeddings to GPU
+        # Transfer only the final token embeddings to GPU
         context = [t.to(device=self.device, dtype=self.dtype) for t in context]
         context_null = [t.to(device=self.device, dtype=self.dtype) for t in context_null]
 
@@ -153,6 +155,12 @@ class WanGradioPipeline:
             # Execute VAE Encoding strictly in FP32 with autocast disabled
             with torch.amp.autocast("cuda", enabled=False):
                 self.c.vae.model.to(device=self.device, dtype=torch.float32)
+                if hasattr(self.c.vae, "scale") and isinstance(self.c.vae.scale, (list, tuple)):
+                    self.c.vae.scale = [
+                        s.to(device=self.device, dtype=torch.float32) if isinstance(s, torch.Tensor) else s 
+                        for s in self.c.vae.scale
+                    ]
+                
                 img_scaled = F.interpolate(img_t.unsqueeze(0), size=(ren_h, ren_w), mode="bicubic")
                 cond_video = torch.cat([
                     img_scaled.transpose(1, 2),
@@ -210,7 +218,7 @@ class WanGradioPipeline:
                 v_uncond = self.c.dit(latent_input, t=t_tensor, **arg_uncond)[0]
                 v_guided = v_uncond + guide_scale * (v_cond - v_uncond)
 
-                # High-order ODE multistep update
+                # High-order ODE multistep step
                 latent = self.c.scheduler.step(
                     model_output=v_guided,
                     timestep=t,
@@ -231,6 +239,12 @@ class WanGradioPipeline:
         # Explicitly decode in float32 with autocast disabled
         with torch.amp.autocast("cuda", enabled=False):
             self.c.vae.model.to(device=self.device, dtype=torch.float32)
+            if hasattr(self.c.vae, "scale") and isinstance(self.c.vae.scale, (list, tuple)):
+                self.c.vae.scale = [
+                    s.to(device=self.device, dtype=torch.float32) if isinstance(s, torch.Tensor) else s 
+                    for s in self.c.vae.scale
+                ]
+
             latent_f32 = latent.to(device=self.device, dtype=torch.float32)
             video = self.c.vae.decode([latent_f32])[0]
 
