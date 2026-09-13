@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -26,18 +27,18 @@ from tqdm import tqdm
 
 from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
 
-# Safely extract AudioLDMPipeline to satisfy static analyzers
-AudioLDMPipeline = getattr(diffusers, "AudioLDMPipeline", None)
+# Safely extract diffusers pipelines and schedulers to avoid Pylance reportPrivateImportUsage
+AudioLDM2Pipeline: Any = getattr(diffusers, "AudioLDM2Pipeline", None)
+AudioLDMPipeline: Any = getattr(diffusers, "AudioLDMPipeline", None)
+DPMSolverMultistepScheduler: Any = getattr(diffusers, "DPMSolverMultistepScheduler", None)
 
 # -----------------------------------------------------------------------------
 # CUDA & cuDNN Global Optimization Configuration
 # -----------------------------------------------------------------------------
 if torch.cuda.is_available():
-    # cuDNN MUST be enabled for 3D convolutions on CUDA
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False  # Avoid algorithm search overhead on dynamic shapes
     
-    # Configure PyTorch 2.x SDPA backends
     major, _ = torch.cuda.get_device_capability()
     torch.backends.cuda.enable_flash_sdp(major >= 8)       # FlashAttention on Ampere+ (sm_80+)
     torch.backends.cuda.enable_mem_efficient_sdp(True)    # High-speed memory-efficient attention on T4
@@ -46,7 +47,7 @@ if torch.cuda.is_available():
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WanGradioServer")
 
-# High-impact English negative prompt derived from UMT5 multimodal embeddings
+# High-impact English negative prompt for Wan2.1
 DEFAULT_NEG_PROMPT_EN = (
     "bright colors, overexposed, static, blurry details, subtitles, artwork, "
     "painting, still frame, washed out, worst quality, low quality, JPEG artifacts, "
@@ -55,14 +56,26 @@ DEFAULT_NEG_PROMPT_EN = (
     "three legs, crowded background, walking backwards"
 )
 
+# High-impact audio negative prompt to eliminate static, white noise, and muffled audio
+DEFAULT_AUDIO_NEG_PROMPT = (
+    "white noise, static, hiss, buzzing, low quality, muffled, distorted, out of focus, "
+    "crackling, garbled speech, alien sounds, clipping, microphone interference"
+)
+
 DEFAULT_T2V_PROMPT = (
     "A majestic bald eagle soaring over snow-capped mountain peaks during sunset, "
     "golden hour lighting, cinematic 4k, mountain winds blowing through the canyon"
+)
+DEFAULT_T2V_AUDIO_PROMPT = (
+    "howling mountain winds blowing through canyon, high-pitched eagle screech, nature ambient audio, high quality"
 )
 
 DEFAULT_I2V_PROMPT = (
     "Gentle ocean waves rolling onto a tropical beach, palm trees swaying softly in the breeze, "
     "golden sunset reflections on the water, cinematic slow motion"
+)
+DEFAULT_I2V_AUDIO_PROMPT = (
+    "gentle ocean waves crashing on sand, soft wind rustling in palm leaves, realistic beach soundscape"
 )
 
 
@@ -100,7 +113,6 @@ def sync_vae_device(vae: Any, target_device: Union[torch.device, str], dtype: to
     if hasattr(vae, "std") and isinstance(vae.std, torch.Tensor):
         vae.std = vae.std.to(device=device_obj, dtype=dtype)
     
-    # Rebuild scale tuple on target device
     if hasattr(vae, "mean") and hasattr(vae, "std"):
         vae.scale = [vae.mean, 1.0 / vae.std]
     elif hasattr(vae, "scale") and isinstance(vae.scale, (list, tuple)):
@@ -110,8 +122,22 @@ def sync_vae_device(vae: Any, target_device: Union[torch.device, str], dtype: to
         ]
 
 
+def sanitize_audio_prompt(visual_prompt: str) -> str:
+    """Strips visual-only adjectives and appends acoustic enhancers."""
+    visual_junk = [
+        r"4k", r"8k", r"cinematic", r"photorealistic", r"hyperrealistic", r"overexposed",
+        r"underexposed", r"lighting", r"golden hour", r"bokeh", r"sharp focus", r"close up",
+        r"wide angle", r"ultra detailed", r"masterpiece", r"aspect ratio", r"unreal engine"
+    ]
+    cleaned = visual_prompt
+    for pattern in visual_junk:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return f"clear environmental sound of {cleaned}, ambient recording, realistic high fidelity audio"
+
+
 class WanAudioEngine:
-    """Lightweight Audio/Foley synthesis engine to generate audio tracks for videos."""
+    """High-Fidelity Audio & Foley synthesis engine using AudioLDM-2."""
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -120,46 +146,73 @@ class WanAudioEngine:
 
     def _lazy_load(self):
         if self.pipe is None and not self._load_failed:
-            if AudioLDMPipeline is None:
-                logger.warning("AudioLDMPipeline is not installed in current diffusers package.")
+            pipeline_cls = AudioLDM2Pipeline if AudioLDM2Pipeline is not None else AudioLDMPipeline
+            if pipeline_cls is None:
+                logger.warning("AudioLDM pipelines are not available in the installed diffusers package.")
                 self._load_failed = True
                 return
 
             try:
-                logger.info("Loading AudioLDM pipeline for sound effect generation...")
-                self.pipe = AudioLDMPipeline.from_pretrained(
-                    "cvssp/audioldm-s-full-v2",
+                logger.info("Loading AudioLDM-2 pipeline ('cvssp/audioldm2') for sound synthesis...")
+                self.pipe = pipeline_cls.from_pretrained(
+                    "cvssp/audioldm2",
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 )
-                self.pipe = self.pipe.to(self.device)
-            except Exception as e:
-                logger.error(f"Failed to initialize AudioLDM: {e}")
-                self._load_failed = True
-                self.pipe = None
+                
+                # Replace default scheduler with DPM-Solver++ to remove diffusion background hiss
+                if DPMSolverMultistepScheduler is not None:
+                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
 
-    def generate_sound(self, prompt: str, duration_sec: float, output_wav_path: str) -> bool:
+                self.pipe = self.pipe.to(self.device)
+                logger.info("AudioLDM-2 successfully loaded on GPU.")
+            except Exception as e:
+                logger.error(f"Failed to initialize AudioLDM-2: {e}. Attempting basic AudioLDM fallback...")
+                if AudioLDMPipeline is not None:
+                    try:
+                        self.pipe = AudioLDMPipeline.from_pretrained(
+                            "cvssp/audioldm-m-full",
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        ).to(self.device)
+                        logger.info("AudioLDM fallback loaded successfully.")
+                    except Exception as ex:
+                        logger.error(f"Audio fallback failed: {ex}")
+                        self._load_failed = True
+                        self.pipe = None
+                else:
+                    self._load_failed = True
+                    self.pipe = None
+
+    def generate_sound(
+        self,
+        audio_prompt: str,
+        duration_sec: float,
+        output_wav_path: str,
+        audio_neg_prompt: str = DEFAULT_AUDIO_NEG_PROMPT,
+    ) -> bool:
         self._lazy_load()
         if self.pipe is None or self._load_failed:
-            logger.warning("Audio generator is unavailable. Skipping sound synthesis.")
+            logger.warning("Audio engine unavailable. Skipping sound synthesis.")
             return False
 
         try:
-            logger.info(f"Generating {duration_sec:.2f}s audio for prompt: '{prompt[:60]}...'")
+            logger.info(f"Synthesizing audio ({duration_sec:.1f}s) for sound prompt: '{audio_prompt}'")
+            
             result = self.pipe(
-                prompt=prompt,
-                negative_prompt="low quality, noise, distortion, static, speaking, talking, speech",
-                num_inference_steps=20,
-                audio_length_in_s=max(1.0, duration_sec),
+                prompt=audio_prompt,
+                negative_prompt=audio_neg_prompt,
+                num_inference_steps=25,
+                guidance_scale=3.5,  # Sweet spot for AudioLDM2 to prevent noise saturation
+                audio_length_in_s=max(1.5, duration_sec),
             )
             
             audio = result.audios[0] if hasattr(result, "audios") else result[0][0]
 
-            # Convert to 16-bit PCM WAV
+            # Convert to 16-bit PCM WAV at 16kHz
             audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
             wavfile.write(output_wav_path, rate=16000, data=audio_int16)
             return True
         except Exception as e:
-            logger.error(f"Audio generation failed: {e}")
+            logger.error(f"Audio synthesis failed: {e}")
             return False
 
 
@@ -193,7 +246,6 @@ class WanGradioPipeline:
         
         # Hardware-aware precision assignment:
         # T4 (sm_75) and P100 (sm_60) do not have BF16 Tensor Cores.
-        # Running BF16 causes slow software emulation (5x-10x slower) and cuDNN conv3d rejections.
         if torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
             if major < 8:
@@ -220,6 +272,7 @@ class WanGradioPipeline:
         task: str = "t2v",
         prompt: str = "",
         negative_prompt: str = DEFAULT_NEG_PROMPT_EN,
+        audio_prompt: str = "",
         image: Optional[Image.Image] = None,
         first_frame: Optional[Image.Image] = None,
         last_frame: Optional[Image.Image] = None,
@@ -241,13 +294,16 @@ class WanGradioPipeline:
             prompt = DEFAULT_T2V_PROMPT if task == "t2v" else DEFAULT_I2V_PROMPT
             logger.info(f"Using default testing prompt: {prompt}")
 
+        # Derive intelligent acoustic prompt if not explicitly specified
+        if not audio_prompt or audio_prompt.strip() == "":
+            audio_prompt = sanitize_audio_prompt(prompt)
+            logger.info(f"Auto-generated acoustic prompt: {audio_prompt}")
+
         lat_h, lat_w, ren_h, ren_w = self._prepare_canvas(height, width)
         F_lat = (frame_num - 1) // self.c.vae_stride[0] + 1
         seq_len = math.ceil((lat_h * lat_w) / (self.c.patch_size[1] * self.c.patch_size[2]) * F_lat)
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        
-        # Generator device matches target tensor device to avoid PyTorch device mismatch
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # ---------------------------------------------------------------------
@@ -373,18 +429,17 @@ class WanGradioPipeline:
         self._render_mp4(video, silent_video_path, fps=16)
 
         # ---------------------------------------------------------------------
-        # 6. Optional Sound Effect Synthesis & Multiplexing
+        # 6. AudioLDM-2 Sound Effect Synthesis & Multiplexing
         # ---------------------------------------------------------------------
         if enable_audio:
             duration = frame_num / 16.0
             wav_path = f"wan_audio_{timestamp}.wav"
-            audio_success = self.audio_engine.generate_sound(prompt, duration, wav_path)
+            audio_success = self.audio_engine.generate_sound(audio_prompt, duration, wav_path)
 
             if audio_success and os.path.exists(wav_path):
                 final_video_path = f"wan_video_with_audio_{timestamp}.mp4"
                 final_path = mux_audio_video(silent_video_path, wav_path, final_video_path)
                 
-                # Cleanup intermediate WAV file
                 try:
                     os.remove(wav_path)
                 except Exception:
@@ -424,7 +479,7 @@ def init_pipeline(model_scale: str):
     return f"Model successfully loaded: {model_scale} (Optimized for Kaggle GPU, T5 on CPU)"
 
 
-def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
+def run_t2v(prompt, neg_prompt, audio_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
     global pipeline_instance
     if pipeline_instance is None:
         init_pipeline("1.3B")
@@ -434,6 +489,7 @@ def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, ena
         task="t2v",
         prompt=prompt,
         negative_prompt=neg_prompt,
+        audio_prompt=audio_prompt,
         width=w,
         height=h,
         frame_num=int(frames),
@@ -445,7 +501,7 @@ def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, ena
     )
 
 
-def run_i2v(image, prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
+def run_i2v(image, prompt, neg_prompt, audio_prompt, resolution, frames, steps, cfg, shift, seed, enable_audio):
     global pipeline_instance
     if pipeline_instance is None:
         init_pipeline("1.3B")
@@ -455,6 +511,7 @@ def run_i2v(image, prompt, neg_prompt, resolution, frames, steps, cfg, shift, se
         task="i2v",
         prompt=prompt,
         negative_prompt=neg_prompt,
+        audio_prompt=audio_prompt,
         image=image,
         width=w,
         height=h,
@@ -479,9 +536,9 @@ def build_app() -> gr.Blocks:
         gr.HTML(custom_css)
         gr.Markdown(
             """
-            # Wan2.1: Unified Video Studio with Audio (Kaggle T4 / P100 Optimized)
-            Generate spatio-temporally coherent videos using the **Wan2.1** Continuous Flow-Matching DiT architecture.
-            *Includes synchronized AI sound effect generation & audio-video muxing.*
+            # Wan2.1: Unified Video Studio with AudioLDM-2 (Kaggle Optimized)
+            Generate high-definition video using **Wan2.1 Continuous Flow-Matching DiT**, paired with 
+            **AudioLDM-2** acoustic synthesis for high-fidelity Foley sound effects.
             """
         )
 
@@ -503,9 +560,15 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=5):
                         t2v_prompt = gr.Textbox(
-                            label="Prompt",
+                            label="Video Prompt",
                             value=DEFAULT_T2V_PROMPT,
                             lines=3,
+                        )
+                        t2v_audio_prompt = gr.Textbox(
+                            label="Audio / Sound Effect Prompt",
+                            value=DEFAULT_T2V_AUDIO_PROMPT,
+                            info="Describe acoustic sounds (e.g., wind, eagle cry, water waves) rather than visual descriptors.",
+                            lines=2,
                         )
                         t2v_neg_prompt = gr.Textbox(
                             label="Negative Prompt (English)",
@@ -526,9 +589,9 @@ def build_app() -> gr.Blocks:
                                 info="33 frames (~2 sec) renders in ~2-3 minutes.",
                             )
                         t2v_audio = gr.Checkbox(
-                            label="Generate AI Sound Effects (Audio)",
+                            label="Generate Synchronized Audio (AudioLDM-2)",
                             value=True,
-                            info="Synthesizes sound effects matching the prompt and synchronizes to video duration.",
+                            info="Synthesizes high-fidelity Foley and soundscapes matching the audio prompt.",
                         )
                         with gr.Accordion("Advanced Sampling Parameters", open=False):
                             t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=50, value=20, step=1)
@@ -536,14 +599,14 @@ def build_app() -> gr.Blocks:
                             t2v_shift = gr.Slider(label="Flow Shift Factor", minimum=1.0, maximum=8.0, value=3.0, step=0.5)
                             t2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
 
-                        t2v_btn = gr.Button("Generate Video", variant="primary", elem_classes=["generate-btn"])
+                        t2v_btn = gr.Button("Generate Video with Audio", variant="primary", elem_classes=["generate-btn"])
 
                     with gr.Column(scale=5):
                         t2v_output = gr.Video(label="Rendered Video (with Audio)", autoplay=True)
 
                 t2v_btn.click(
                     fn=run_t2v,
-                    inputs=[t2v_prompt, t2v_neg_prompt, t2v_res, t2v_frames, t2v_steps, t2v_cfg, t2v_shift, t2v_seed, t2v_audio],
+                    inputs=[t2v_prompt, t2v_neg_prompt, t2v_audio_prompt, t2v_res, t2v_frames, t2v_steps, t2v_cfg, t2v_shift, t2v_seed, t2v_audio],
                     outputs=[t2v_output],
                 )
 
@@ -557,14 +620,20 @@ def build_app() -> gr.Blocks:
                             value=DEFAULT_I2V_PROMPT,
                             lines=2,
                         )
+                        i2v_audio_prompt = gr.Textbox(
+                            label="Audio / Sound Effect Prompt",
+                            value=DEFAULT_I2V_AUDIO_PROMPT,
+                            info="Describe the sounds you expect to hear in this scene.",
+                            lines=2,
+                        )
                         i2v_neg_prompt = gr.Textbox(label="Negative Prompt", value=DEFAULT_NEG_PROMPT_EN, lines=2)
                         with gr.Row():
                             i2v_res = gr.Dropdown(label="Resolution", choices=["832x480", "480x832"], value="832x480")
                             i2v_frames = gr.Dropdown(label="Frames", choices=[17, 33, 49, 81], value=33)
                         i2v_audio = gr.Checkbox(
-                            label="Generate AI Sound Effects (Audio)",
+                            label="Generate Synchronized Audio (AudioLDM-2)",
                             value=True,
-                            info="Synthesizes sound effects matching the scene.",
+                            info="Synthesizes high-fidelity soundscapes.",
                         )
                         with gr.Accordion("Advanced Parameters", open=False):
                             i2v_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=20, step=1)
@@ -572,14 +641,14 @@ def build_app() -> gr.Blocks:
                             i2v_shift = gr.Slider(label="Shift Factor", minimum=1.0, maximum=6.0, value=3.0, step=0.5)
                             i2v_seed = gr.Number(label="Seed", value=-1)
 
-                        i2v_btn = gr.Button("Animate Image", variant="primary", elem_classes=["generate-btn"])
+                        i2v_btn = gr.Button("Animate Image with Audio", variant="primary", elem_classes=["generate-btn"])
 
                     with gr.Column(scale=5):
                         i2v_output = gr.Video(label="Animated Output (with Audio)", autoplay=True)
 
                 i2v_btn.click(
                     fn=run_i2v,
-                    inputs=[i2v_image, i2v_prompt, i2v_neg_prompt, i2v_res, i2v_frames, i2v_steps, i2v_cfg, i2v_shift, i2v_seed, i2v_audio],
+                    inputs=[i2v_image, i2v_prompt, i2v_neg_prompt, i2v_audio_prompt, i2v_res, i2v_frames, i2v_steps, i2v_cfg, i2v_shift, i2v_seed, i2v_audio],
                     outputs=[i2v_output],
                 )
 
@@ -588,5 +657,4 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_app()
-    # Share=True creates a public gradio.live link accessible outside Kaggle
     app.queue(max_size=3).launch(share=True, server_port=7860)
