@@ -1,0 +1,71 @@
+flowchart TD
+    subgraph ClientLayer ["1. Client & Request Dispatcher"]
+        Req["Unified Request\n(Prompt, Neg Prompt, Task, Media, Steps, Resolution)"]
+        Serve["serve.py (FastAPI & CLI Server)"]
+        Req --> Serve
+    end
+
+    subgraph LoaderLayer ["2. Model Loader & Weights Management"]
+        ML["utils/model_loader.py\n(HuggingFace Hub / Local Cache)"]
+        Serve -->|Request Init| ML
+        HF[("HuggingFace Hub\nWan-AI/Wan2.1-*")] -.->|Download/Stream Checkpoints| ML
+        
+        subgraph SubModelsInst ["SubModels Namespace"]
+            T5M["SubModels/T5.py\n(UMT5-XXL Encoder)"]
+            CLIPM["SubModels/CLIP.py\n(XLM-RoBERTa ViT-H/14)"]
+            UNetM["SubModels/UNet.py\n(WanModel / VaceWanModel)"]
+            VAEM["SubModels/VAE.py\n(WanVAE 3D Causal Conv)"]
+            DDPMM["SubModels/DDPM.py\n(FlowUniPC / FlowDPM++)"]
+        end
+        ML --> T5M
+        ML --> CLIPM
+        ML --> UNetM
+        ML --> VAEM
+        ML --> DDPMM
+    end
+
+    subgraph ConditionLayer ["3. Conditioning & Latent Setup"]
+        TaskSwitch{Task Type?}
+        Serve --> TaskSwitch
+
+        TaskSwitch -->|t2v| T2V_Prep["Text Only\nPrompt -> UMT5 Tokenizer"]
+        TaskSwitch -->|i2v| I2V_Prep["Image + Text\nImg -> CLIP (Layer 31) + VAE Latent\nMask: First Frame = 1, Rest = 0"]
+        TaskSwitch -->|flf2v| FLF_Prep["First & Last Frame + Text\nFrames -> CLIP + VAE Latent\nMask: First & Last = 1, Rest = 0"]
+        TaskSwitch -->|vace| VACE_Prep["Video / Mask / Control\nControl Latents -> Vace Patch Embedding"]
+
+        T2V_Prep --> T5_Enc["T5.py: Text Context [B, 512, Dim]"]
+        I2V_Prep --> T5_Enc
+        I2V_Prep --> CLIP_Enc["CLIP.py: Visual Context [B, 257, Dim]"]
+        FLF_Prep --> T5_Enc
+        FLF_Prep --> CLIP_FLF["CLIP.py: Dual Visual Context [B, 514, Dim]"]
+
+        NoiseInit["Latent Noise Initialization\nx_1 ~ N(0, I) [16, F_lat, H_lat, W_lat]"]
+    end
+
+    subgraph DenoiseLoop ["4. Continuous Flow-Matching Trajectory"]
+        DDPMM --> TimeShift["Time-Shifted Schedule\nsigma = (S*s) / (1 + (S-1)*s)"]
+        TimeShift --> ODEIter["Iterative ODE Stepping (Timesteps t = T ... 0)"]
+        
+        subgraph DiT_Forward ["UNet.py: 3D DiT Forward Pass"]
+            AdaLN["Timestep t -> Sinusoidal -> AdaLN (e0..e5)"]
+            RoPE["3D Factorized RoPE (F, H, W)"]
+            SelfAttn["Self-Attention + QK-RMSNorm"]
+            CrossAttn["Dual Cross-Attention:\nText Attn + Visual Attn"]
+            FFN["Gated-GELU Feed-Forward"]
+            AdaLN --> SelfAttn
+            RoPE --> SelfAttn
+            SelfAttn --> CrossAttn --> FFN
+        end
+
+        ODEIter -->|x_t, t, Context| DiT_Forward
+        DiT_Forward -->|Velocity v_cond, v_uncond| CFG["Classifier-Free Guidance:\nv = v_uncond + s * (v_cond - v_uncond)"]
+        CFG -->|v_guided| DDPMM_Step["DDPM.py: Scheduler Step\nUpdate x_{t-1} via UniPC / DPM++"]
+        DDPMM_Step --> ODEIter
+    end
+
+    subgraph DecodeLayer ["5. Decoding & Serialization"]
+        ODEIter -->|Clean Latent x_0| VAEDecode["VAE.py: Streaming Causal 3D Decode\n(Frame-by-frame CACHE_T=2 buffer)"]
+        VAEDecode --> VideoTensor["RGB Video Tensor [3, F, H, W]"]
+        VideoTensor --> MP4Writer["imageio / ffmpeg H.264 Encoder"]
+        MP4Writer --> OutFile["Rendered Video File (.mp4)"]
+    end

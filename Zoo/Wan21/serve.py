@@ -1,0 +1,377 @@
+# Copyright 2024-2025 The Alibaba Wan Team Authors and Project Contributors.
+import gc
+import logging
+import math
+import os
+import random
+import sys
+import time
+from typing import Any, Optional, Tuple
+
+import gradio as gr
+import imageio
+import torch
+import torch.cuda.amp as amp
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image
+from tqdm import tqdm
+
+from utils.model_loader import WanModelContainer, load_wan_submodels
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("WanGradioServer")
+
+# High-impact English negative prompt derived from UMT5 multimodal embeddings
+DEFAULT_NEG_PROMPT_EN = (
+    "bright colors, overexposed, static, blurry details, subtitles, artwork, "
+    "painting, still frame, washed out, worst quality, low quality, JPEG artifacts, "
+    "ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn face, "
+    "deformed, disfigured, malformed limbs, fused fingers, motionless, cluttered background, "
+    "three legs, crowded background, walking backwards"
+)
+
+
+class KaggleMemoryManager:
+    """Utilities to strictly enforce memory limits on 16GB GPUs."""
+
+    @staticmethod
+    def flush():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    @staticmethod
+    def report_vram(tag: str = ""):
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / (1024**2)
+            res = torch.cuda.memory_reserved() / (1024**2)
+            logger.info(f"[{tag}] VRAM Allocated: {alloc:.1f}MB | Reserved: {res:.1f}MB")
+
+
+class WanGradioPipeline:
+
+    def __init__(self, container: WanModelContainer):
+        self.c = container
+        self.device = self.c.device
+
+    def _prepare_canvas(self, height: int, width: int) -> Tuple[int, int, int, int]:
+        dh = self.c.vae_stride[1] * self.c.patch_size[1]
+        dw = self.c.vae_stride[2] * self.c.patch_size[2]
+        lat_h = round(height / dh) * self.c.patch_size[1]
+        lat_w = round(width / dw) * self.c.patch_size[2]
+        return lat_h, lat_w, lat_h * self.c.vae_stride[1], lat_w * self.c.vae_stride[2]
+
+    @torch.no_grad()
+    def generate(
+        self,
+        task: str = "t2v",
+        prompt: str = "",
+        negative_prompt: str = DEFAULT_NEG_PROMPT_EN,
+        image: Optional[Image.Image] = None,
+        first_frame: Optional[Image.Image] = None,
+        last_frame: Optional[Image.Image] = None,
+        width: int = 832,
+        height: int = 480,
+        frame_num: int = 49,
+        steps: int = 30,
+        guide_scale: float = 5.0,
+        shift: float = 3.0,
+        seed: int = -1,
+        progress=gr.Progress(track_tqdm=True),
+    ) -> str:
+        KaggleMemoryManager.flush()
+        KaggleMemoryManager.report_vram("Before Generation")
+
+        lat_h, lat_w, ren_h, ren_w = self._prepare_canvas(height, width)
+        F_lat = (frame_num - 1) // self.c.vae_stride[0] + 1
+        seq_len = math.ceil((lat_h * lat_w) / (self.c.patch_size[1] * self.c.patch_size[2]) * F_lat)
+
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        # ---------------------------------------------------------------------
+        # 1. Linguistic Encoding on CPU (0MB GPU VRAM used)
+        # ---------------------------------------------------------------------
+        logger.info("Encoding text prompts in System RAM (CPU)...")
+        context = self.c.text_encoder([prompt], device=torch.device("cpu"))
+        context_null = self.c.text_encoder([negative_prompt], device=torch.device("cpu"))
+
+        # Transfer only final embedding tensors to GPU
+        context = [t.to(self.device) for t in context]
+        context_null = [t.to(self.device) for t in context_null]
+
+        # ---------------------------------------------------------------------
+        # 2. Image Conditioning (I2V / FLF2V)
+        # ---------------------------------------------------------------------
+        clip_fea = None
+        y = None
+
+        if task == "i2v" and image is not None:
+            logger.info("Processing conditioning image...")
+            self.c.clip.model.to(self.device)
+            img_t = TF.to_tensor(image).sub_(0.5).div_(0.5).to(self.device)
+            clip_fea = self.c.clip.visual([img_t[:, None, :, :]])
+
+            self.c.clip.model.to("cpu")
+            KaggleMemoryManager.flush()
+
+            self.c.vae.model.to(self.device)
+            img_scaled = F.interpolate(img_t.unsqueeze(0), size=(ren_h, ren_w), mode="bicubic")
+            y_img = self.c.vae.encode([
+                torch.cat([img_scaled.transpose(1, 2), torch.zeros(1, 3, frame_num - 1, ren_h, ren_w, device=self.device)], dim=2).squeeze(0)
+            ])[0]
+
+            self.c.vae.model.to("cpu")
+            KaggleMemoryManager.flush()
+
+            msk = torch.zeros(1, frame_num, lat_h, lat_w, device=self.device)
+            msk[:, 0] = 1.0
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w).transpose(1, 2)[0]
+            y = [torch.cat([msk, y_img], dim=0)]
+
+        # ---------------------------------------------------------------------
+        # 3. Flow Matching Noise Setup
+        # ---------------------------------------------------------------------
+        noise = torch.randn(
+            16, F_lat, lat_h, lat_w,
+            dtype=torch.float32,
+            generator=generator,
+        ).to(self.device)
+
+        self.c.scheduler.set_timesteps(num_inference_steps=steps, device=self.device, shift=shift)
+        timesteps = self.c.scheduler.timesteps
+
+        arg_cond = {"context": context, "seq_len": seq_len}
+        arg_uncond = {"context": context_null, "seq_len": seq_len}
+        if y is not None:
+            arg_cond["y"] = y
+            arg_uncond["y"] = y
+        if clip_fea is not None:
+            arg_cond["clip_fea"] = clip_fea
+            arg_uncond["clip_fea"] = clip_fea
+
+        # ---------------------------------------------------------------------
+        # 4. DiT Sampling Loop (Loaded to GPU, then unloaded)
+        # ---------------------------------------------------------------------
+        logger.info("Loading DiT backbone to GPU for denoising...")
+        self.c.dit.to(self.device)
+        KaggleMemoryManager.report_vram("DiT Active")
+
+        latent = noise
+        with amp.autocast(dtype=self.c.param_dtype):
+            for t in progress.tqdm(timesteps, desc="Sampling Video Frames"):
+                latent_input = [latent]
+                t_tensor = torch.tensor([t], device=self.device)
+
+                v_cond = self.c.dit(latent_input, t=t_tensor, **arg_cond)[0]
+                v_uncond = self.c.dit(latent_input, t=t_tensor, **arg_uncond)[0]
+                v_guided = v_uncond + guide_scale * (v_cond - v_uncond)
+
+                latent = self.c.scheduler.step(
+                    model_output=v_guided,
+                    timestep=t,
+                    sample=latent,
+                    return_dict=False,
+                )[0]
+
+        logger.info("Denoising complete. Unloading DiT from GPU...")
+        self.c.dit.to("cpu")
+        KaggleMemoryManager.flush()
+        KaggleMemoryManager.report_vram("DiT Offloaded")
+
+        # ---------------------------------------------------------------------
+        # 5. VAE Latent Decode
+        # ---------------------------------------------------------------------
+        logger.info("Loading VAE to GPU for temporal decoding...")
+        self.c.vae.model.to(self.device)
+
+        video = self.c.vae.decode([latent])[0]
+
+        self.c.vae.model.to("cpu")
+        KaggleMemoryManager.flush()
+
+        output_filename = f"wan_video_{int(time.time())}.mp4"
+        self._render_mp4(video, output_filename, fps=16)
+        return output_filename
+
+    def _render_mp4(self, tensor: torch.Tensor, output_path: str, fps: int = 16):
+        tensor = tensor.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255.0).byte()
+        tensor = tensor.permute(1, 2, 3, 0).cpu().numpy()
+        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        for frame in tensor:
+            writer.append_data(frame)
+        writer.close()
+        logger.info(f"Rendered video saved: {output_path}")
+
+
+# ============================================================================
+# Gradio Web Interface Construction
+# ============================================================================
+
+pipeline_instance: Optional[WanGradioPipeline] = None
+
+
+def init_pipeline(model_scale: str):
+    global pipeline_instance
+    KaggleMemoryManager.flush()
+    container = load_wan_submodels(
+        task="t2v",
+        scale=model_scale,
+        offload_model=True,
+        t5_cpu=True,
+    )
+    pipeline_instance = WanGradioPipeline(container)
+    return f"Model successfully loaded: {model_scale} (T5 on CPU RAM, Sequential Offloading Active)"
+
+
+def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed):
+    if pipeline_instance is None:
+        init_pipeline("1.3B")
+    w, h = [int(x) for x in resolution.split("x")]
+    return pipeline_instance.generate(
+        task="t2v",
+        prompt=prompt,
+        negative_prompt=neg_prompt,
+        width=w,
+        height=h,
+        frame_num=int(frames),
+        steps=int(steps),
+        guide_scale=float(cfg),
+        shift=float(shift),
+        seed=int(seed),
+    )
+
+
+def run_i2v(image, prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed):
+    if pipeline_instance is None:
+        init_pipeline("1.3B")
+    w, h = [int(x) for x in resolution.split("x")]
+    return pipeline_instance.generate(
+        task="i2v",
+        prompt=prompt,
+        negative_prompt=neg_prompt,
+        image=image,
+        width=w,
+        height=h,
+        frame_num=int(frames),
+        steps=int(steps),
+        guide_scale=float(cfg),
+        shift=float(shift),
+        seed=int(seed),
+    )
+
+
+def build_app() -> gr.Blocks:
+    custom_css = """
+    .gradio-container {max-width: 1100px !important; margin: 0 auto !important;}
+    .generate-btn {background: #ff5722 !important; color: white !important; font-size: 16px !important;}
+    """
+
+    with gr.Blocks(title="Wan2.1 Unified Video Studio", css=custom_css) as demo:
+        gr.Markdown(
+            """
+            # Wan2.1: Unified Video Studio (Kaggle T4 Optimized)
+            Generate spatio-temporally coherent videos using the **Wan2.1** Continuous Flow-Matching DiT architecture.
+            *T4 Optimization: Text Encoder pinned to CPU RAM, Dynamic GPU load/unload.*
+            """
+        )
+
+        with gr.Row():
+            scale_dropdown = gr.Dropdown(
+                label="Model Size",
+                choices=["1.3B", "14B"],
+                value="1.3B",
+                info="1.3B is strictly recommended for Kaggle T4 (16GB VRAM).",
+            )
+            load_status = gr.Textbox(label="System Status", value="Ready to initialize", interactive=False)
+            init_btn = gr.Button("Initialize / Switch Model", variant="secondary")
+
+        init_btn.click(fn=init_pipeline, inputs=[scale_dropdown], outputs=[load_status])
+
+        with gr.Tabs():
+            # Tab 1: Text to Video
+            with gr.TabItem("Text to Video (T2V)"):
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        t2v_prompt = gr.Textbox(
+                            label="Prompt",
+                            placeholder="A majestic bald eagle soaring over snow-capped mountains during golden hour...",
+                            lines=3,
+                        )
+                        t2v_neg_prompt = gr.Textbox(
+                            label="Negative Prompt (English)",
+                            value=DEFAULT_NEG_PROMPT_EN,
+                            lines=2,
+                        )
+                        with gr.Row():
+                            t2v_res = gr.Dropdown(
+                                label="Resolution",
+                                choices=["832x480", "480x832", "1280x720", "720x1280"],
+                                value="832x480",
+                                info="480p is recommended for fast T4 rendering.",
+                            )
+                            t2v_frames = gr.Dropdown(
+                                label="Frames (4n+1)",
+                                choices=[33, 49, 81],
+                                value=49,
+                                info="49 frames ≈ 3 sec at 16 fps.",
+                            )
+                        with gr.Accordion("Advanced Sampling Parameters", open=False):
+                            t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=60, value=30, step=1)
+                            t2v_cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=12.0, value=5.0, step=0.5)
+                            t2v_shift = gr.Slider(label="Flow Shift Factor", minimum=1.0, maximum=8.0, value=3.0, step=0.5)
+                            t2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+
+                        t2v_btn = gr.Button("Generate Video", variant="primary", elem_classes=["generate-btn"])
+
+                    with gr.Column(scale=5):
+                        t2v_output = gr.Video(label="Rendered Video", autoplay=True)
+
+                t2v_btn.click(
+                    fn=run_t2v,
+                    inputs=[t2v_prompt, t2v_neg_prompt, t2v_res, t2v_frames, t2v_steps, t2v_cfg, t2v_shift, t2v_seed],
+                    outputs=[t2v_output],
+                )
+
+            # Tab 2: Image to Video
+            with gr.TabItem("Image to Video (I2V)"):
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        i2v_image = gr.Image(label="Input Anchor Frame", type="pil")
+                        i2v_prompt = gr.Textbox(
+                            label="Motion Prompt",
+                            placeholder="The camera pans around the subject as gentle wind moves the scene...",
+                            lines=2,
+                        )
+                        i2v_neg_prompt = gr.Textbox(label="Negative Prompt", value=DEFAULT_NEG_PROMPT_EN, lines=2)
+                        with gr.Row():
+                            i2v_res = gr.Dropdown(label="Resolution", choices=["832x480", "480x832"], value="832x480")
+                            i2v_frames = gr.Dropdown(label="Frames", choices=[33, 49, 81], value=49)
+
+                        with gr.Accordion("Advanced Parameters", open=False):
+                            i2v_steps = gr.Slider(label="Steps", minimum=20, maximum=50, value=30, step=1)
+                            i2v_cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=10.0, value=5.0, step=0.5)
+                            i2v_shift = gr.Slider(label="Shift Factor", minimum=1.0, maximum=6.0, value=3.0, step=0.5)
+                            i2v_seed = gr.Number(label="Seed", value=-1)
+
+                        i2v_btn = gr.Button("Animate Image", variant="primary", elem_classes=["generate-btn"])
+
+                    with gr.Column(scale=5):
+                        i2v_output = gr.Video(label="Animated Output", autoplay=True)
+
+                i2v_btn.click(
+                    fn=run_i2v,
+                    inputs=[i2v_image, i2v_prompt, i2v_neg_prompt, i2v_res, i2v_frames, i2v_steps, i2v_cfg, i2v_shift, i2v_seed],
+                    outputs=[i2v_output],
+                )
+
+    return demo
+
+
+if __name__ == "__main__":
+    app = build_app()
+    # Share=True creates a public gradio.live URL accessible outside Kaggle notebooks
+    app.queue(max_size=3).launch(share=True, server_port=7860)
