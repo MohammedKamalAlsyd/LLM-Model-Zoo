@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import re
-import string
 from typing import Callable, List, Optional, Tuple, Union
 
 import ftfy
@@ -148,24 +147,50 @@ class T5RelativeEmbedding(nn.Module):
         return rel_buckets
 
 
-class T5SelfAttentionBlock(nn.Module):
+class T5SelfAttention(nn.Module):
+    """
+    Self-Attention Block matching official checkpoint state_dict:
+    - 'attn' (not 'self_attn')
+    - 'pos_embedding' inside each block when shared_pos=False
+    """
 
-    def __init__(self, dim: int, dim_attn: int, dim_ffn: int, num_heads: int, num_buckets: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        dim_attn: int,
+        dim_ffn: int,
+        num_heads: int,
+        num_buckets: int,
+        shared_pos: bool = False,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        self.dim = dim
+        self.shared_pos = shared_pos
         self.norm1 = T5LayerNorm(dim)
-        self.self_attn = T5Attention(dim, dim_attn, num_heads, dropout)
+        # Attribute name MUST be 'attn' to match official state_dict
+        self.attn = T5Attention(dim, dim_attn, num_heads, dropout)
         self.norm2 = T5LayerNorm(dim)
         self.ffn = T5FeedForward(dim, dim_ffn, dropout)
+        self.pos_embedding = None if shared_pos else T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, pos_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = fp16_clamp(x + self.self_attn(self.norm1(x), mask=mask, pos_bias=pos_bias))
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        pos_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        e = pos_bias if self.shared_pos else self.pos_embedding(x.size(1), x.size(1))
+        x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
         x = fp16_clamp(x + self.ffn(self.norm2(x)))
         return x
 
 
 class T5Encoder(nn.Module):
     """
-    UMT5-XXL Encoder matching official state_dict directly.
+    UMT5-XXL Encoder matching official Wan2.1 checkpoint structure:
+    - 24 layers
+    - shared_pos=False (relative position table per block)
     """
 
     def __init__(
@@ -177,15 +202,16 @@ class T5Encoder(nn.Module):
         num_heads: int = 64,
         num_layers: int = 24,
         num_buckets: int = 32,
+        shared_pos: bool = False,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.dim = dim
         self.token_embedding = nn.Embedding(vocab_size, dim)
-        self.pos_embedding = T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True)
+        self.pos_embedding = T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True) if shared_pos else None
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            T5SelfAttentionBlock(dim, dim_attn, dim_ffn, num_heads, num_buckets, dropout)
+            T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets, shared_pos=shared_pos, dropout=dropout)
             for _ in range(num_layers)
         ])
         self.norm = T5LayerNorm(dim)
@@ -193,7 +219,7 @@ class T5Encoder(nn.Module):
     def forward(self, ids: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.token_embedding(ids)
         x = self.dropout(x)
-        e = self.pos_embedding(x.size(1), x.size(1))
+        e = self.pos_embedding(x.size(1), x.size(1)) if self.pos_embedding is not None else None
         for block in self.blocks:
             x = block(x, mask=mask, pos_bias=e)
         x = self.norm(x)
@@ -203,7 +229,7 @@ class T5Encoder(nn.Module):
 
 class T5EncoderModel:
     """
-    Unified High-level Text Encoder Interface with built-in HuggingFace Tokenizer.
+    High-level UMT5-XXL text encoder with Hugging Face state_dict compatibility.
     """
 
     def __init__(
@@ -219,14 +245,30 @@ class T5EncoderModel:
         self.dtype = dtype
         self.device = torch.device(device)
 
-        self.model = T5Encoder().to(dtype=dtype, device=self.device).eval().requires_grad_(False)
+        # UMT5-XXL has shared_pos=False in Wan2.1
+        self.model = T5Encoder(shared_pos=False).to(dtype=dtype, device=self.device).eval().requires_grad_(False)
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             logging.info(f"Loading T5 weights from {checkpoint_path}")
             state = torch.load(checkpoint_path, map_location="cpu")
             if "state_dict" in state:
                 state = state["state_dict"]
-            self.model.load_state_dict(state, assign=True)
+
+            # Resilient Key Normalization (Handles self_attn vs attn variations)
+            renamed_state = {}
+            for k, v in state.items():
+                new_k = k
+                # Support older or third-party checkpoints if present
+                if ".self_attn." in new_k:
+                    new_k = new_k.replace(".self_attn.", ".attn.")
+                renamed_state[new_k] = v
+
+            missing, unexpected = self.model.load_state_dict(renamed_state, strict=False)
+            if missing:
+                logging.warning(f"T5 missing keys: {missing[:5]} (total {len(missing)})")
+            if unexpected:
+                logging.warning(f"T5 unexpected keys: {unexpected[:5]} (total {len(unexpected)})")
+            logging.info("T5Encoder state_dict loaded successfully.")
 
         if shard_fn is not None:
             self.model = shard_fn(self.model)
@@ -234,7 +276,7 @@ class T5EncoderModel:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     @classmethod
-    def from_pretrained(cls, checkpoint_dir: str, tokenizer_path="google/umt5-xxl", device="cpu", dtype=torch.bfloat16):
+    def from_pretrained(cls, checkpoint_dir: str, tokenizer_path: str = "google/umt5-xxl", device: str = "cpu", dtype: torch.dtype = torch.bfloat16):
         pth = os.path.join(checkpoint_dir, "models_t5_umt5-xxl-enc-bf16.pth")
         tok = os.path.join(checkpoint_dir, "google/umt5-xxl") if os.path.exists(os.path.join(checkpoint_dir, "google/umt5-xxl")) else tokenizer_path
         return cls(checkpoint_path=pth, tokenizer_path=tok, device=device, dtype=dtype)
