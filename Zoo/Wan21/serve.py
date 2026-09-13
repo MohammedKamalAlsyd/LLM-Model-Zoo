@@ -18,6 +18,8 @@ from PIL import Image
 from tqdm import tqdm
 
 from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WanGradioServer")
@@ -161,7 +163,7 @@ class WanGradioPipeline:
         KaggleMemoryManager.report_vram("DiT Active")
 
         latent = noise
-        with amp.autocast(dtype=self.c.param_dtype):
+        with torch.amp.autocast('cuda', dtype=self.c.param_dtype):
             for t in progress.tqdm(timesteps, desc="Sampling Video Frames"):
                 latent_input = [latent]
                 t_tensor = torch.tensor([t], device=self.device)

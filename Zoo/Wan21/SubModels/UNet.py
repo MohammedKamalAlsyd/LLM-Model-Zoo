@@ -4,7 +4,6 @@ import os
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -20,11 +19,13 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
-    sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half, device=position.device).to(position).div(half)))
+    sinusoid = torch.outer(
+        position,
+        torch.pow(10000, -torch.arange(half, device=position.device).to(position).div(half)),
+    )
     return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
 
 
-@amp.autocast(enabled=False)
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -34,7 +35,6 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Ten
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-@amp.autocast(enabled=False)
 def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     n, c = x.size(2), x.size(3) // 2
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -55,6 +55,24 @@ def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -
         x_i = torch.cat([x_i, x[i, seq_len:]])
         output.append(x_i)
     return torch.stack(output).float()
+
+
+def chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    """
+    Prevents 18+ GB allocation on GPUs without FlashAttention-2 (e.g. Turing T4)
+    by slicing Query tokens into manageable chunks.
+    """
+    s = q.size(2)
+    if s <= chunk_size:
+        return F.scaled_dot_product_attention(q, k, v)
+
+    out = torch.empty_like(q)
+    for i in range(0, s, chunk_size):
+        end_idx = min(i + chunk_size, s)
+        out[:, :, i:end_idx] = F.scaled_dot_product_attention(
+            q[:, :, i:end_idx], k, v
+        )
+    return out
 
 
 class WanRMSNorm(nn.Module):
@@ -105,7 +123,9 @@ class WanSelfAttention(nn.Module):
         k = rope_apply(k, grid_sizes, freqs).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v)
+        # Chunked SDPA for T4 safety
+        out = chunked_attention(q, k, v, chunk_size=1024)
+
         out = out.transpose(1, 2).flatten(2)
         return self.o(out)
 
@@ -196,17 +216,14 @@ class WanAttentionBlock(nn.Module):
         context: torch.Tensor,
         context_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        with amp.autocast(dtype=torch.float32):
-            e_mod = (self.modulation + e).chunk(6, dim=1)
+        e_mod = (self.modulation + e).chunk(6, dim=1)
 
         y = self.self_attn(self.norm1(x).float() * (1 + e_mod[1]) + e_mod[0], seq_lens, grid_sizes, freqs)
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e_mod[2]
+        x = x + y * e_mod[2]
 
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
         y = self.ffn(self.norm2(x).float() * (1 + e_mod[4]) + e_mod[3])
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e_mod[5]
+        x = x + y * e_mod[5]
         return x
 
 
@@ -222,10 +239,8 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-        with amp.autocast(dtype=torch.float32):
-            e_mod = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e_mod[1]) + e_mod[0])
-        return x
+        e_mod = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+        return self.head(self.norm(x) * (1 + e_mod[1]) + e_mod[0])
 
 
 class MLPProj(nn.Module):
@@ -250,10 +265,6 @@ class MLPProj(nn.Module):
 
 
 class WanModel(ModelMixin, ConfigMixin):
-    """
-    Unified 3D Diffusion Transformer Backbone for Wan2.1.
-    Directly compatible with safetensors weights from Wan-AI on HuggingFace.
-    """
 
     @register_to_config
     def __init__(
@@ -339,9 +350,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
         context = self.text_embedding(
             torch.stack([
@@ -446,5 +456,4 @@ class VaceWanModel(WanModel):
         )
 
 
-# Alias UNet to WanModel for standard diffusers/SD project nomenclature
 WanUNet = WanModel
