@@ -1,9 +1,10 @@
 import collections
 import gc
-import math
 import os
-from typing import Dict, List, Optional, Tuple, cast
+import random
+from typing import Any, Dict, List, Optional, Tuple, cast
 
+import gradio as gr
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -13,6 +14,7 @@ from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer
 
 from .SubModels.AutoEncoderKL import AutoencoderKL, DecoderOutput
 from .SubModels.FluxTransformer2DModel import (
+    AdaLayerNormContinuous,
     CombinedTimestepTextProjEmbeddings,
     FluxPosEmbed,
     FluxSingleTransformerBlock,
@@ -68,9 +70,12 @@ def get_safetensors_files(repo_id: str, subfolder: str) -> List[str]:
 
 
 def set_submodule_tensor(module: nn.Module, subkey: str, tensor: torch.Tensor):
-    """Copies tensor data directly into an existing submodule parameter."""
+    """
+    Copies tensor data directly into an existing submodule parameter.
+    Uses 'curr: Any' to avoid Pylance reportIndexIssue on Module indexing.
+    """
     parts = subkey.split(".")
-    curr = module
+    curr: Any = module
     for part in parts[:-1]:
         if part.isdigit():
             curr = curr[int(part)]
@@ -133,9 +138,12 @@ class StreamingFluxPipeline:
             return_tensors="pt",
         )
         clip_output = text_encoder(input_ids=clip_inputs["input_ids"].to(self.device))
-        pooled_prompt_embeds = getattr(clip_output, "pooler_output", clip_output[1]).to(
-            dtype=self.dtype, device=self.device
-        )
+
+        if hasattr(clip_output, "pooler_output") and clip_output.pooler_output is not None:
+            pooled = clip_output.pooler_output
+        else:
+            pooled = clip_output[1]
+        pooled_prompt_embeds = pooled.to(dtype=self.dtype, device=self.device)
 
         del text_encoder, tokenizer, raw_clip
         purge_memory()
@@ -158,7 +166,7 @@ class StreamingFluxPipeline:
                             pass
                     del tensor
 
-        # Crucial fix: tie encoder.embed_tokens to shared.weight if not explicitly loaded
+        # Tie encoder.embed_tokens to shared.weight
         if hasattr(t5_encoder, "shared") and hasattr(t5_encoder.encoder, "embed_tokens"):
             t5_encoder.encoder.embed_tokens.weight.data.copy_(t5_encoder.shared.weight.data)
 
@@ -219,8 +227,6 @@ class StreamingFluxPipeline:
         )
         pos_embed = FluxPosEmbed(theta=10000, axes_dim=(16, 56, 56)).to(self.device)
 
-        from .SubModels.FluxTransformer2DModel import AdaLayerNormContinuous
-
         norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6).to(
             self.device, self.dtype
         )
@@ -271,7 +277,7 @@ class StreamingFluxPipeline:
                 h_states = x_embedder(latents)
                 enc_h_states = context_embedder(prompt_embeds)
 
-                # Correct: timestep is already in [0, 1000]; do NOT multiply by 1000!
+                # Correct: timestep is already in [0, 1000]
                 temb = time_text_embed(timestep, pooled_prompt_embeds)
 
                 # B. Execute 19 Dual-Stream Blocks using the single dual_template
@@ -413,27 +419,146 @@ class StreamingFluxPipeline:
         return image
 
 
-if __name__ == "__main__":
-    prompt = (
-        "A sleek cybernetic robotic tiger walking through a rain-slicked Tokyo street at night, "
-        "neon reflections, 8k resolution, cinematic lighting"
-    )
+# ==============================================================================
+# Gradio Interface & Predefined Prompts
+# ==============================================================================
 
+PREDEFINED_PROMPTS = [
+    [
+        "A sleek cybernetic robotic tiger walking through a rain-slicked Tokyo street at night, neon reflections, 8k resolution, cinematic lighting",
+        1024,
+        1024,
+        4,
+        42,
+    ],
+    [
+        "An ethereal portrait of a mystical forest guardian, antlers entangled with blooming wisteria and bioluminescent mushrooms, photorealistic, 8k",
+        1024,
+        1024,
+        4,
+        1234,
+    ],
+    [
+        "A futuristic retro-synthwave DeLorean sports car driving along a luminous hyperspace cosmic highway, vibrant purple and cyan nebulae",
+        1024,
+        1024,
+        4,
+        777,
+    ],
+    [
+        "Macro photography of an intricate mechanical pocket watch mechanism made entirely of transparent iridescent crystal and glowing clockwork gears",
+        1024,
+        1024,
+        4,
+        999,
+    ],
+    [
+        "Architectural photography of an avant-garde brutalist villa carved seamlessly inside sandstone canyon cliffs, dramatic golden hour sunset",
+        1024,
+        1024,
+        4,
+        2024,
+    ],
+]
+
+
+def create_ui(pipeline: StreamingFluxPipeline):
+    def generate_fn(
+        prompt: str,
+        height: int = 1024,
+        width: int = 1024,
+        steps: int = 4,
+        seed: int = 42,
+        randomize_seed: bool = False,
+    ):
+        if randomize_seed or seed == -1:
+            seed = random.randint(0, 2**31 - 1)
+
+        generator = torch.Generator(device=pipeline.device).manual_seed(int(seed))
+        image = pipeline(
+            prompt=prompt,
+            height=int(height),
+            width=int(width),
+            num_inference_steps=int(steps),
+            generator=generator,
+        )
+        return image, seed
+
+    with gr.Blocks(theme="soft", title="FLUX.1 [schnell] Low-VRAM Studio") as demo:
+        gr.Markdown(
+            """
+            # ⚡ FLUX.1 [schnell] Low-VRAM Inference Studio
+            **12B Parameter Flow-Matching Transformer running via Sequential Block Streaming (< 1.5 GB VRAM peak).**
+            """
+        )
+
+        with gr.Row():
+            with gr.Column(scale=5):
+                prompt_input = gr.Textbox(
+                    label="Prompt",
+                    placeholder="Describe the image you want to generate...",
+                    lines=4,
+                )
+
+                with gr.Row():
+                    height_slider = gr.Slider(
+                        label="Height",
+                        minimum=512,
+                        maximum=1536,
+                        step=64,
+                        value=1024,
+                    )
+                    width_slider = gr.Slider(
+                        label="Width",
+                        minimum=512,
+                        maximum=1536,
+                        step=64,
+                        value=1024,
+                    )
+
+                with gr.Row():
+                    steps_slider = gr.Slider(
+                        label="Inference Steps (Schnell default: 4)",
+                        minimum=1,
+                        maximum=8,
+                        step=1,
+                        value=4,
+                    )
+                    seed_input = gr.Number(label="Seed", value=42, precision=0)
+                    random_seed_cb = gr.Checkbox(label="Randomize Seed", value=False)
+
+                generate_btn = gr.Button("🚀 Generate Image", variant="primary", size="lg")
+
+            with gr.Column(scale=5):
+                output_image = gr.Image(label="Generated Output", type="pil", interactive=False)
+                used_seed = gr.Number(label="Seed Used", interactive=False)
+
+        gr.Markdown("### 💡 Predefined Inspiration Prompts")
+        gr.Examples(
+            examples=PREDEFINED_PROMPTS,
+            inputs=[prompt_input, height_slider, width_slider, steps_slider, seed_input],
+            outputs=[output_image, used_seed],
+            fn=generate_fn,
+            cache_examples=False,
+        )
+
+        generate_btn.click(
+            fn=generate_fn,
+            inputs=[prompt_input, height_slider, width_slider, steps_slider, seed_input, random_seed_cb],
+            outputs=[output_image, used_seed],
+        )
+
+    return demo
+
+
+if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
         raise SystemError("CUDA GPU is required to run FLUX.")
 
+    print("Initializing Streaming Pipeline...")
     pipeline = StreamingFluxPipeline(device=device)
 
-    generator = torch.Generator(device=device).manual_seed(42)
-    output_image = pipeline(
-        prompt=prompt,
-        height=1024,
-        width=1024,
-        num_inference_steps=4,
-        generator=generator,
-    )
-
-    output_filename = "flux_output.png"
-    output_image.save(output_filename)
-    print(f"\nCompleted! Saved generated image to {output_filename}")
+    print("Launching Gradio Interface...")
+    ui = create_ui(pipeline)
+    ui.queue().launch(share=True)
