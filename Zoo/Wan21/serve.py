@@ -17,7 +17,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
-from utils.model_loader import WanModelContainer, load_wan_submodels
+from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WanGradioServer")

@@ -7,11 +7,11 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from SubModels.CLIP import CLIPModel
-from SubModels.DDPM import FlowDPMSolverMultistepScheduler, FlowUniPCMultistepScheduler, WanFlowScheduler
-from SubModels.T5 import T5EncoderModel
-from SubModels.UNet import VaceWanModel, WanModel
-from SubModels.VAE import WanVAE
+from Zoo.Wan21.SubModels.CLIP import CLIPModel
+from Zoo.Wan21.SubModels.DDPM import FlowDPMSolverMultistepScheduler, FlowUniPCMultistepScheduler, WanFlowScheduler
+from Zoo.Wan21.SubModels.T5 import T5EncoderModel
+from Zoo.Wan21.SubModels.UNet import VaceWanModel, WanModel
+from Zoo.Wan21.SubModels.VAE import WanVAE
 
 logger = logging.getLogger("WanModelLoader")
 
