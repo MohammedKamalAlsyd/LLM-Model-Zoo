@@ -8,6 +8,9 @@ import sys
 import time
 from typing import Any, Optional, Tuple
 
+# Enable PyTorch expandable segments to prevent VRAM fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import gradio as gr
 import imageio
 import torch
@@ -18,8 +21,20 @@ from PIL import Image
 from tqdm import tqdm
 
 from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# -----------------------------------------------------------------------------
+# CUDA & cuDNN Global Optimization Configuration
+# -----------------------------------------------------------------------------
+if torch.cuda.is_available():
+    # cuDNN MUST be enabled for 3D convolutions on CUDA
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = False  # Avoid algorithm search overhead on variable video shapes
+    
+    # Configure PyTorch 2.x SDPA backends
+    major, _ = torch.cuda.get_device_capability()
+    torch.backends.cuda.enable_flash_sdp(major >= 8)       # FlashAttention only on Ampere+ (sm_80+)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)    # High-speed memory-efficient attention on T4
+    torch.backends.cuda.enable_math_sdp(True)             # Fallback math kernel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WanGradioServer")
@@ -57,6 +72,22 @@ class WanGradioPipeline:
     def __init__(self, container: WanModelContainer):
         self.c = container
         self.device = self.c.device
+        
+        # Hardware-aware precision assignment:
+        # T4 (sm_75) and P100 (sm_60) do not have BF16 Tensor Cores.
+        # Running BF16 causes software emulation (5x-10x slower) and cuDNN conv3d rejections.
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            if major < 8:
+                self.dtype = torch.float16
+                logger.info(f"Hardware compute capability is {major}.x (T4/P100). Activating FP16 Tensor Cores.")
+            else:
+                self.dtype = getattr(self.c, "param_dtype", torch.bfloat16)
+                logger.info(f"Hardware compute capability is {major}.x (Ampere/Ada/Hopper). Using BF16.")
+        else:
+            self.dtype = torch.float32
+
+        self.c.param_dtype = self.dtype
 
     def _prepare_canvas(self, height: int, width: int) -> Tuple[int, int, int, int]:
         dh = self.c.vae_stride[1] * self.c.patch_size[1]
@@ -76,8 +107,8 @@ class WanGradioPipeline:
         last_frame: Optional[Image.Image] = None,
         width: int = 832,
         height: int = 480,
-        frame_num: int = 49,
-        steps: int = 30,
+        frame_num: int = 33,
+        steps: int = 20,
         guide_scale: float = 5.0,
         shift: float = 3.0,
         seed: int = -1,
@@ -94,15 +125,15 @@ class WanGradioPipeline:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         # ---------------------------------------------------------------------
-        # 1. Linguistic Encoding on CPU (0MB GPU VRAM used)
+        # 1. Linguistic Encoding on CPU RAM (Zero GPU VRAM used)
         # ---------------------------------------------------------------------
         logger.info("Encoding text prompts in System RAM (CPU)...")
         context = self.c.text_encoder([prompt], device=torch.device("cpu"))
         context_null = self.c.text_encoder([negative_prompt], device=torch.device("cpu"))
 
-        # Transfer only final embedding tensors to GPU
-        context = [t.to(self.device) for t in context]
-        context_null = [t.to(self.device) for t in context_null]
+        # Transfer only the token embeddings to GPU
+        context = [t.to(device=self.device, dtype=self.dtype) for t in context]
+        context_null = [t.to(device=self.device, dtype=self.dtype) for t in context_null]
 
         # ---------------------------------------------------------------------
         # 2. Image Conditioning (I2V / FLF2V)
@@ -119,16 +150,21 @@ class WanGradioPipeline:
             self.c.clip.model.to("cpu")
             KaggleMemoryManager.flush()
 
-            self.c.vae.model.to(self.device)
-            img_scaled = F.interpolate(img_t.unsqueeze(0), size=(ren_h, ren_w), mode="bicubic")
-            y_img = self.c.vae.encode([
-                torch.cat([img_scaled.transpose(1, 2), torch.zeros(1, 3, frame_num - 1, ren_h, ren_w, device=self.device)], dim=2).squeeze(0)
-            ])[0]
+            # Execute VAE Encoding strictly in FP32 with autocast disabled
+            with torch.amp.autocast("cuda", enabled=False):
+                self.c.vae.model.to(device=self.device, dtype=torch.float32)
+                img_scaled = F.interpolate(img_t.unsqueeze(0), size=(ren_h, ren_w), mode="bicubic")
+                cond_video = torch.cat([
+                    img_scaled.transpose(1, 2),
+                    torch.zeros(1, 3, frame_num - 1, ren_h, ren_w, device=self.device)
+                ], dim=2).squeeze(0).to(dtype=torch.float32)
+
+                y_img = self.c.vae.encode([cond_video])[0].to(dtype=self.dtype)
 
             self.c.vae.model.to("cpu")
             KaggleMemoryManager.flush()
 
-            msk = torch.zeros(1, frame_num, lat_h, lat_w, device=self.device)
+            msk = torch.zeros(1, frame_num, lat_h, lat_w, device=self.device, dtype=self.dtype)
             msk[:, 0] = 1.0
             msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
             msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w).transpose(1, 2)[0]
@@ -139,9 +175,10 @@ class WanGradioPipeline:
         # ---------------------------------------------------------------------
         noise = torch.randn(
             16, F_lat, lat_h, lat_w,
-            dtype=torch.float32,
+            dtype=self.dtype,
             generator=generator,
-        ).to(self.device)
+            device=self.device
+        )
 
         self.c.scheduler.set_timesteps(num_inference_steps=steps, device=self.device, shift=shift)
         timesteps = self.c.scheduler.timesteps
@@ -156,22 +193,24 @@ class WanGradioPipeline:
             arg_uncond["clip_fea"] = clip_fea
 
         # ---------------------------------------------------------------------
-        # 4. DiT Sampling Loop (Loaded to GPU, then unloaded)
+        # 4. DiT Sampling Loop (Kept on GPU throughout the loop)
         # ---------------------------------------------------------------------
-        logger.info("Loading DiT backbone to GPU for denoising...")
-        self.c.dit.to(self.device)
+        logger.info(f"Loading DiT backbone ({self.dtype}) to GPU for denoising...")
+        self.c.dit.to(device=self.device, dtype=self.dtype)
         KaggleMemoryManager.report_vram("DiT Active")
 
         latent = noise
-        with torch.amp.autocast('cuda', dtype=self.c.param_dtype):
+        with torch.amp.autocast("cuda", dtype=self.dtype):
             for t in progress.tqdm(timesteps, desc="Sampling Video Frames"):
                 latent_input = [latent]
                 t_tensor = torch.tensor([t], device=self.device)
 
+                # Classifier-Free Guidance (CFG) evaluations
                 v_cond = self.c.dit(latent_input, t=t_tensor, **arg_cond)[0]
                 v_uncond = self.c.dit(latent_input, t=t_tensor, **arg_uncond)[0]
                 v_guided = v_uncond + guide_scale * (v_cond - v_uncond)
 
+                # High-order ODE multistep update
                 latent = self.c.scheduler.step(
                     model_output=v_guided,
                     timestep=t,
@@ -185,12 +224,15 @@ class WanGradioPipeline:
         KaggleMemoryManager.report_vram("DiT Offloaded")
 
         # ---------------------------------------------------------------------
-        # 5. VAE Latent Decode
+        # 5. VAE Latent Decode (Forced to Float32 to prevent slow_conv3d crash)
         # ---------------------------------------------------------------------
-        logger.info("Loading VAE to GPU for temporal decoding...")
-        self.c.vae.model.to(self.device)
-
-        video = self.c.vae.decode([latent])[0]
+        logger.info("Loading VAE to GPU for temporal decoding in FP32...")
+        
+        # Explicitly decode in float32 with autocast disabled
+        with torch.amp.autocast("cuda", enabled=False):
+            self.c.vae.model.to(device=self.device, dtype=torch.float32)
+            latent_f32 = latent.to(device=self.device, dtype=torch.float32)
+            video = self.c.vae.decode([latent_f32])[0]
 
         self.c.vae.model.to("cpu")
         KaggleMemoryManager.flush()
@@ -226,7 +268,7 @@ def init_pipeline(model_scale: str):
         t5_cpu=True,
     )
     pipeline_instance = WanGradioPipeline(container)
-    return f"Model successfully loaded: {model_scale} (T5 on CPU RAM, Sequential Offloading Active)"
+    return f"Model successfully loaded: {model_scale} (Optimized for Kaggle GPU, T5 on CPU)"
 
 
 def run_t2v(prompt, neg_prompt, resolution, frames, steps, cfg, shift, seed):
@@ -268,16 +310,20 @@ def run_i2v(image, prompt, neg_prompt, resolution, frames, steps, cfg, shift, se
 
 def build_app() -> gr.Blocks:
     custom_css = """
+    <style>
     .gradio-container {max-width: 1100px !important; margin: 0 auto !important;}
     .generate-btn {background: #ff5722 !important; color: white !important; font-size: 16px !important;}
+    </style>
     """
 
-    with gr.Blocks(title="Wan2.1 Unified Video Studio", css=custom_css) as demo:
+    # Omitting 'css' argument in gr.Blocks to prevent Gradio 6.0 deprecation warnings
+    with gr.Blocks(title="Wan2.1 Unified Video Studio") as demo:
+        gr.HTML(custom_css)
         gr.Markdown(
             """
-            # Wan2.1: Unified Video Studio (Kaggle T4 Optimized)
+            # Wan2.1: Unified Video Studio (Kaggle T4 / P100 Optimized)
             Generate spatio-temporally coherent videos using the **Wan2.1** Continuous Flow-Matching DiT architecture.
-            *T4 Optimization: Text Encoder pinned to CPU RAM, Dynamic GPU load/unload.*
+            *T4 Optimizations: Tensor Core FP16 execution, FP32 cuDNN VAE decode, T5 CPU pinning.*
             """
         )
 
@@ -317,12 +363,12 @@ def build_app() -> gr.Blocks:
                             )
                             t2v_frames = gr.Dropdown(
                                 label="Frames (4n+1)",
-                                choices=[33, 49, 81],
-                                value=49,
-                                info="49 frames ≈ 3 sec at 16 fps.",
+                                choices=[17, 33, 49, 81],
+                                value=33,
+                                info="33 frames (~2 sec) renders in ~2-3 minutes.",
                             )
                         with gr.Accordion("Advanced Sampling Parameters", open=False):
-                            t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=60, value=30, step=1)
+                            t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=50, value=20, step=1)
                             t2v_cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=12.0, value=5.0, step=0.5)
                             t2v_shift = gr.Slider(label="Flow Shift Factor", minimum=1.0, maximum=8.0, value=3.0, step=0.5)
                             t2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
@@ -351,10 +397,10 @@ def build_app() -> gr.Blocks:
                         i2v_neg_prompt = gr.Textbox(label="Negative Prompt", value=DEFAULT_NEG_PROMPT_EN, lines=2)
                         with gr.Row():
                             i2v_res = gr.Dropdown(label="Resolution", choices=["832x480", "480x832"], value="832x480")
-                            i2v_frames = gr.Dropdown(label="Frames", choices=[33, 49, 81], value=49)
+                            i2v_frames = gr.Dropdown(label="Frames", choices=[17, 33, 49, 81], value=33)
 
                         with gr.Accordion("Advanced Parameters", open=False):
-                            i2v_steps = gr.Slider(label="Steps", minimum=20, maximum=50, value=30, step=1)
+                            i2v_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=20, step=1)
                             i2v_cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=10.0, value=5.0, step=0.5)
                             i2v_shift = gr.Slider(label="Shift Factor", minimum=1.0, maximum=6.0, value=3.0, step=0.5)
                             i2v_seed = gr.Number(label="Seed", value=-1)
@@ -375,5 +421,5 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_app()
-    # Share=True creates a public gradio.live URL accessible outside Kaggle notebooks
+    # Share=True creates a public gradio.live link accessible outside Kaggle
     app.queue(max_size=3).launch(share=True, server_port=7860)
