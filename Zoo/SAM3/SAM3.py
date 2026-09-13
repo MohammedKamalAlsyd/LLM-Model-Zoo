@@ -1,24 +1,23 @@
 import torch
 import torch.nn as nn
-from Zoo.SAM3.SubModels.SAM3VisionModel import Sam3VisionModel
+from Zoo.SAM3.SubModels.SAM3VisionModel import Sam3VisionModel, Sam3VisionNeck
 from Zoo.SAM3.SubModels.SAM3TextModel import Sam3TextEncoder
 from Zoo.SAM3.SubModels.SAM3GeometryEncoder import Sam3GeometryEncoder
 from Zoo.SAM3.SubModels.SAM3DETR import Sam3DetrEncoder, Sam3DetrDecoder, Sam3DotProductScoring
 from Zoo.SAM3.SubModels.SAM3MaskDecoder import Sam3MaskDecoder
+from Zoo.SAM3.SubModels.SAM3TrackerModel import Sam3TrackerModel
 from Zoo.SAM3.SubModels.SAM3Common import box_cxcywh_to_xyxy, inverse_sigmoid
 
-class Sam3Model(nn.Module):
+class Sam3DetectorModel(nn.Module):
     """
-    SAM3 Model Architecture.
-    All attribute names and sub-module hierarchies are configured to match
-    the official checkpoint keys 1:1, allowing direct strict=True loading.
+    Submodule matching all `detector_model.*` checkpoint keys.
     """
     def __init__(self):
         super().__init__()
-        # 1. Vision Backbone (ViT + Multi-scale FPN Neck)
+        # 1. Vision Backbone (ViT + FPN Neck)
         self.vision_encoder = Sam3VisionModel()
 
-        # 2. Text Backbone (CLIP Text Encoder)
+        # 2. Text Backbone (CLIP)
         self.text_encoder = Sam3TextEncoder(hidden_size=1024, projection_dim=512)
 
         # 3. Text Dimension Projection: 1024 -> 256
@@ -27,11 +26,11 @@ class Sam3Model(nn.Module):
         # 4. Geometry & Prompt Encoder
         self.geometry_encoder = Sam3GeometryEncoder(hidden_size=256, intermediate_size=2048, num_layers=3, num_heads=8)
 
-        # 5. DETR Encoder & Decoder
+        # 5. DETR Modules
         self.detr_encoder = Sam3DetrEncoder(hidden_size=256, intermediate_size=2048, num_layers=6, num_heads=8)
         self.detr_decoder = Sam3DetrDecoder(hidden_size=256, intermediate_size=2048, num_layers=6, num_queries=200, num_heads=8)
 
-        # 6. Dot Product Query Scoring
+        # 6. Scoring Head
         self.dot_product_scoring = Sam3DotProductScoring(hidden_size=256, intermediate_size=2048)
 
         # 7. Mask Decoder
@@ -58,7 +57,7 @@ class Sam3Model(nn.Module):
         text_features = self.text_projection(text_seq)
         text_mask = attention_mask.bool() if attention_mask is not None else None
 
-        # 3. Geometric Prompts (if any)
+        # 3. Geometric Prompts
         if input_boxes is not None and input_boxes.numel() > 0:
             if input_boxes_labels is None:
                 input_boxes_labels = torch.ones_like(input_boxes[..., 0], dtype=torch.long)
@@ -71,7 +70,6 @@ class Sam3Model(nn.Module):
                 img_feats=fpn_features_detr,
                 img_pos_embeds=fpn_positions_detr,
             )
-            # Concatenate text & geometric prompts
             combined_prompts = torch.cat([text_features, geo_features], dim=1)
             combined_mask = torch.cat([text_mask, geo_mask], dim=1) if text_mask is not None else geo_mask
         else:
@@ -95,7 +93,7 @@ class Sam3Model(nn.Module):
             spatial_shapes=spatial_shapes,
         )
 
-        # 6. Box Refinement & Scoring
+        # 6. Refinement & Scoring
         delta_boxes = self.detr_decoder.box_head(inter_outputs)
         pred_boxes_cxcywh = (inverse_sigmoid(inter_boxes) + delta_boxes).sigmoid()
         pred_boxes = box_cxcywh_to_xyxy(pred_boxes_cxcywh[-1])
@@ -109,7 +107,7 @@ class Sam3Model(nn.Module):
         presence_logits = inter_presence[-1]
         last_queries = inter_outputs[-1]
 
-        # 7. Mask Generation
+        # 7. Masks
         pred_masks, semantic_seg = self.mask_decoder(
             decoder_queries=last_queries,
             backbone_features=list(fpn_features_detr),
@@ -125,3 +123,26 @@ class Sam3Model(nn.Module):
             "presence_logits": presence_logits,
             "semantic_seg": semantic_seg,
         }
+
+
+class Sam3Model(nn.Module):
+    """
+    Complete SAM3 Architecture matching official weights 1:1.
+      - detector_model.*
+      - tracker_neck.*
+      - tracker_model.*
+    """
+    def __init__(self):
+        super().__init__()
+        # 1. Detector Module (Vision + DETR + Text + Masks)
+        self.detector_model = Sam3DetectorModel()
+
+        # 2. Tracking Feature Neck (Identical FPN topology for tracker features)
+        self.tracker_neck = Sam3VisionNeck(in_channels=1024, fpn_dim=256)
+
+        # 3. Video Tracking Memory Module (SAM2 Video Engine)
+        self.tracker_model = Sam3TrackerModel(hidden_size=256)
+
+    def forward(self, *args, **kwargs):
+        # Forward directly delegates to the detector for segmentation & detection
+        return self.detector_model(*args, **kwargs)
