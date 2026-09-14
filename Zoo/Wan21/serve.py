@@ -24,13 +24,14 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
+from transformers import GPT2LMHeadModel
 
 from Zoo.Wan21.utils.model_loader import WanModelContainer, load_wan_submodels
 
-# Safely extract diffusers pipelines and schedulers to avoid Pylance reportPrivateImportUsage
-AudioLDM2Pipeline: Any = getattr(diffusers, "AudioLDM2Pipeline", None)
-AudioLDMPipeline: Any = getattr(diffusers, "AudioLDMPipeline", None)
-DPMSolverMultistepScheduler: Any = getattr(diffusers, "DPMSolverMultistepScheduler", None)
+# Safely extract AudioLDM pipelines & DPMSolver to satisfy static analyzers
+AudioLDM2Pipeline = getattr(diffusers, "AudioLDM2Pipeline", None)
+AudioLDMPipeline = getattr(diffusers, "AudioLDMPipeline", None)
+DPMSolverMultistepScheduler = getattr(diffusers, "DPMSolverMultistepScheduler", None)
 
 # -----------------------------------------------------------------------------
 # CUDA & cuDNN Global Optimization Configuration
@@ -56,7 +57,7 @@ DEFAULT_NEG_PROMPT_EN = (
     "three legs, crowded background, walking backwards"
 )
 
-# High-impact audio negative prompt to eliminate static, white noise, and muffled audio
+# High-impact audio negative prompt to eliminate noise and static
 DEFAULT_AUDIO_NEG_PROMPT = (
     "white noise, static, hiss, buzzing, low quality, muffled, distorted, out of focus, "
     "crackling, garbled speech, alien sounds, clipping, microphone interference"
@@ -137,7 +138,7 @@ def sanitize_audio_prompt(visual_prompt: str) -> str:
 
 
 class WanAudioEngine:
-    """High-Fidelity Audio & Foley synthesis engine using AudioLDM-2."""
+    """Robust Audio synthesis engine with explicit GPT2LMHeadModel patch and fallbacks."""
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -146,41 +147,61 @@ class WanAudioEngine:
 
     def _lazy_load(self):
         if self.pipe is None and not self._load_failed:
-            pipeline_cls = AudioLDM2Pipeline if AudioLDM2Pipeline is not None else AudioLDMPipeline
-            if pipeline_cls is None:
-                logger.warning("AudioLDM pipelines are not available in the installed diffusers package.")
-                self._load_failed = True
-                return
+            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
+            # -----------------------------------------------------------------
+            # Primary: AudioLDM-2 with explicit GPT2LMHeadModel injection
+            # -----------------------------------------------------------------
             try:
-                logger.info("Loading AudioLDM-2 pipeline ('cvssp/audioldm2') for sound synthesis...")
-                self.pipe = pipeline_cls.from_pretrained(
-                    "cvssp/audioldm2",
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                )
+                logger.info("Initializing AudioLDM-2 ('cvssp/audioldm2') with GPT2LMHeadModel patch...")
                 
-                # Replace default scheduler with DPM-Solver++ to remove diffusion background hiss
+                # Explicitly instantiate GPT2LMHeadModel to bypass checkpoint config bug
+                lm = GPT2LMHeadModel.from_pretrained(
+                    "cvssp/audioldm2",
+                    subfolder="language_model",
+                    torch_dtype=torch_dtype,
+                )
+
+                if AudioLDM2Pipeline is not None:
+                    self.pipe = AudioLDM2Pipeline.from_pretrained(
+                        "cvssp/audioldm2",
+                        language_model=lm,
+                        torch_dtype=torch_dtype,
+                    )
+                else:
+                    raise ImportError("AudioLDM2Pipeline not exported in diffusers.")
+
                 if DPMSolverMultistepScheduler is not None:
                     self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
 
                 self.pipe = self.pipe.to(self.device)
                 logger.info("AudioLDM-2 successfully loaded on GPU.")
+                return
             except Exception as e:
-                logger.error(f"Failed to initialize AudioLDM-2: {e}. Attempting basic AudioLDM fallback...")
-                if AudioLDMPipeline is not None:
-                    try:
-                        self.pipe = AudioLDMPipeline.from_pretrained(
-                            "cvssp/audioldm-m-full",
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        ).to(self.device)
-                        logger.info("AudioLDM fallback loaded successfully.")
-                    except Exception as ex:
-                        logger.error(f"Audio fallback failed: {ex}")
-                        self._load_failed = True
-                        self.pipe = None
-                else:
-                    self._load_failed = True
-                    self.pipe = None
+                logger.warning(f"AudioLDM-2 failed to load: {e}. Activating fallback to AudioLDM-Medium...")
+
+            # -----------------------------------------------------------------
+            # Fallback: AudioLDM-Medium (CLAP-based, 100% stable across all versions)
+            # -----------------------------------------------------------------
+            try:
+                if AudioLDMPipeline is None:
+                    raise ImportError("AudioLDMPipeline not found in diffusers.")
+
+                logger.info("Loading fallback model: 'cvssp/audioldm-m-full'...")
+                self.pipe = AudioLDMPipeline.from_pretrained(
+                    "cvssp/audioldm-m-full",
+                    torch_dtype=torch_dtype,
+                )
+                if DPMSolverMultistepScheduler is not None:
+                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
+                    
+                self.pipe = self.pipe.to(self.device)
+                logger.info("AudioLDM-Medium successfully loaded on GPU.")
+                return
+            except Exception as ex:
+                logger.error(f"All audio models failed to load: {ex}")
+                self._load_failed = True
+                self.pipe = None
 
     def generate_sound(
         self,
@@ -195,21 +216,27 @@ class WanAudioEngine:
             return False
 
         try:
-            logger.info(f"Synthesizing audio ({duration_sec:.1f}s) for sound prompt: '{audio_prompt}'")
-            
+            logger.info(f"Synthesizing audio ({duration_sec:.1f}s) for prompt: '{audio_prompt}'")
+
             result = self.pipe(
                 prompt=audio_prompt,
                 negative_prompt=audio_neg_prompt,
                 num_inference_steps=25,
-                guidance_scale=3.5,  # Sweet spot for AudioLDM2 to prevent noise saturation
+                guidance_scale=3.5,
                 audio_length_in_s=max(1.5, duration_sec),
             )
-            
+
             audio = result.audios[0] if hasattr(result, "audios") else result[0][0]
 
-            # Convert to 16-bit PCM WAV at 16kHz
+            # Detect native vocoder sampling rate (defaults to 16000 Hz)
+            sample_rate = 16000
+            if hasattr(self.pipe, "vocoder") and hasattr(self.pipe.vocoder, "config"):
+                sample_rate = getattr(self.pipe.vocoder.config, "sampling_rate", 16000)
+
+            # Convert to 16-bit PCM WAV
             audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
-            wavfile.write(output_wav_path, rate=16000, data=audio_int16)
+            wavfile.write(output_wav_path, rate=sample_rate, data=audio_int16)
+            logger.info(f"Audio synthesized successfully -> {output_wav_path}")
             return True
         except Exception as e:
             logger.error(f"Audio synthesis failed: {e}")
@@ -229,11 +256,15 @@ def mux_audio_video(video_path: str, audio_path: str, output_path: str) -> str:
             "-shortest",
             output_path
         ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         logger.info(f"Audio muxing complete: {output_path}")
         return output_path
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr.decode("utf-8", errors="ignore") if e.stderr else str(e)
+        logger.warning(f"FFmpeg muxing failed: {err_msg}. Returning silent video.")
+        return video_path
     except Exception as e:
-        logger.warning(f"FFmpeg muxing failed ({e}). Returning silent video.")
+        logger.warning(f"Unexpected muxing error: {e}. Returning silent video.")
         return video_path
 
 
@@ -243,9 +274,7 @@ class WanGradioPipeline:
         self.c = container
         self.device = torch.device(self.c.device) if isinstance(self.c.device, str) else self.c.device
         self.audio_engine = WanAudioEngine(self.device)
-        
-        # Hardware-aware precision assignment:
-        # T4 (sm_75) and P100 (sm_60) do not have BF16 Tensor Cores.
+
         if torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
             if major < 8:
@@ -289,12 +318,10 @@ class WanGradioPipeline:
         KaggleMemoryManager.flush()
         KaggleMemoryManager.report_vram("Before Generation")
 
-        # Fallback to default testing prompt if empty
         if not prompt or prompt.strip() == "":
             prompt = DEFAULT_T2V_PROMPT if task == "t2v" else DEFAULT_I2V_PROMPT
             logger.info(f"Using default testing prompt: {prompt}")
 
-        # Derive intelligent acoustic prompt if not explicitly specified
         if not audio_prompt or audio_prompt.strip() == "":
             audio_prompt = sanitize_audio_prompt(prompt)
             logger.info(f"Auto-generated acoustic prompt: {audio_prompt}")
@@ -313,7 +340,6 @@ class WanGradioPipeline:
         context = self.c.text_encoder([prompt], device=torch.device("cpu"))
         context_null = self.c.text_encoder([negative_prompt], device=torch.device("cpu"))
 
-        # Transfer only the token embeddings to GPU
         context = [t.to(device=self.device, dtype=self.dtype) for t in context]
         context_null = [t.to(device=self.device, dtype=self.dtype) for t in context_null]
 
@@ -335,7 +361,6 @@ class WanGradioPipeline:
             self.c.clip.model.to("cpu")
             KaggleMemoryManager.flush()
 
-            # Fully synchronize VAE to GPU in float32 for clean encoding
             sync_vae_device(self.c.vae, self.device, dtype=torch.float32)
 
             with torch.amp.autocast("cuda", enabled=False):
@@ -391,12 +416,10 @@ class WanGradioPipeline:
                 latent_input = [latent]
                 t_tensor = torch.tensor([t], device=self.device)
 
-                # Classifier-Free Guidance (CFG) evaluations
                 v_cond = self.c.dit(latent_input, t=t_tensor, **arg_cond)[0]
                 v_uncond = self.c.dit(latent_input, t=t_tensor, **arg_uncond)[0]
                 v_guided = v_uncond + guide_scale * (v_cond - v_uncond)
 
-                # High-order ODE multistep step
                 latent = self.c.scheduler.step(
                     model_output=v_guided,
                     timestep=t,
@@ -423,13 +446,12 @@ class WanGradioPipeline:
         sync_vae_device(self.c.vae, "cpu", dtype=torch.float32)
         KaggleMemoryManager.flush()
 
-        # Render silent video file
         timestamp = int(time.time())
         silent_video_path = f"wan_silent_{timestamp}.mp4"
         self._render_mp4(video, silent_video_path, fps=16)
 
         # ---------------------------------------------------------------------
-        # 6. AudioLDM-2 Sound Effect Synthesis & Multiplexing
+        # 6. AudioLDM-2 Sound Synthesis & Multiplexing
         # ---------------------------------------------------------------------
         if enable_audio:
             duration = frame_num / 16.0
@@ -439,7 +461,7 @@ class WanGradioPipeline:
             if audio_success and os.path.exists(wav_path):
                 final_video_path = f"wan_video_with_audio_{timestamp}.mp4"
                 final_path = mux_audio_video(silent_video_path, wav_path, final_video_path)
-                
+
                 try:
                     os.remove(wav_path)
                 except Exception:
@@ -536,7 +558,7 @@ def build_app() -> gr.Blocks:
         gr.HTML(custom_css)
         gr.Markdown(
             """
-            # Wan2.1: Unified Video Studio with AudioLDM-2 (Kaggle Optimized)
+            # Wan2.1: Unified Video Studio with Audio (Kaggle Optimized)
             Generate high-definition video using **Wan2.1 Continuous Flow-Matching DiT**, paired with 
             **AudioLDM-2** acoustic synthesis for high-fidelity Foley sound effects.
             """
@@ -589,9 +611,9 @@ def build_app() -> gr.Blocks:
                                 info="33 frames (~2 sec) renders in ~2-3 minutes.",
                             )
                         t2v_audio = gr.Checkbox(
-                            label="Generate Synchronized Audio (AudioLDM-2)",
+                            label="Generate Synchronized Audio",
                             value=True,
-                            info="Synthesizes high-fidelity Foley and soundscapes matching the audio prompt.",
+                            info="Synthesizes high-fidelity Foley sound matching the audio prompt.",
                         )
                         with gr.Accordion("Advanced Sampling Parameters", open=False):
                             t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=50, value=20, step=1)
@@ -631,7 +653,7 @@ def build_app() -> gr.Blocks:
                             i2v_res = gr.Dropdown(label="Resolution", choices=["832x480", "480x832"], value="832x480")
                             i2v_frames = gr.Dropdown(label="Frames", choices=[17, 33, 49, 81], value=33)
                         i2v_audio = gr.Checkbox(
-                            label="Generate Synchronized Audio (AudioLDM-2)",
+                            label="Generate Synchronized Audio",
                             value=True,
                             info="Synthesizes high-fidelity soundscapes.",
                         )
