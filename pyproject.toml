@@ -9,6 +9,7 @@ dependencies = [
     "dicta-onnx>=1.0.9",
     "diffusers>=0.40.0",
     "dotenv>=0.9.9",
+    "foleycrafter",
     "ftfy>=6.3.1",
     "gradio>=6.5.1",
     "hf-transfer>=0.1.9",

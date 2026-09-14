@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors and Project Contributors.
 import gc
+import importlib
 import logging
 import math
 import os
@@ -18,6 +19,7 @@ import gradio as gr
 import imageio
 import numpy as np
 import scipy.io.wavfile as wavfile
+import scipy.signal as signal
 import torch
 import torch.cuda.amp as amp
 import torch.nn.functional as F
@@ -57,10 +59,10 @@ DEFAULT_NEG_PROMPT_EN = (
     "three legs, crowded background, walking backwards"
 )
 
-# High-impact audio negative prompt to eliminate noise and static
+# High-impact audio negative prompt to eliminate noise, hum, and hiss
 DEFAULT_AUDIO_NEG_PROMPT = (
     "white noise, static, hiss, buzzing, low quality, muffled, distorted, out of focus, "
-    "crackling, garbled speech, alien sounds, clipping, microphone interference"
+    "crackling, garbled speech, alien sounds, clipping, microphone interference, hum, monotone"
 )
 
 DEFAULT_T2V_PROMPT = (
@@ -68,7 +70,7 @@ DEFAULT_T2V_PROMPT = (
     "golden hour lighting, cinematic 4k, mountain winds blowing through the canyon"
 )
 DEFAULT_T2V_AUDIO_PROMPT = (
-    "howling mountain winds blowing through canyon, high-pitched eagle screech, nature ambient audio, high quality"
+    "howling mountain winds, distant high-pitched eagle screech, flapping wings in wind, realistic nature field recording"
 )
 
 DEFAULT_I2V_PROMPT = (
@@ -76,7 +78,7 @@ DEFAULT_I2V_PROMPT = (
     "golden sunset reflections on the water, cinematic slow motion"
 )
 DEFAULT_I2V_AUDIO_PROMPT = (
-    "gentle ocean waves crashing on sand, soft wind rustling in palm leaves, realistic beach soundscape"
+    "gentle ocean waves breaking on wet sand, soft tropical breeze rustling in palm leaves, coastal surf soundscape"
 )
 
 
@@ -124,122 +126,230 @@ def sync_vae_device(vae: Any, target_device: Union[torch.device, str], dtype: to
 
 
 def sanitize_audio_prompt(visual_prompt: str) -> str:
-    """Strips visual-only adjectives and appends acoustic enhancers."""
+    """Strips visual-only adjectives and appends high-value acoustic descriptors."""
     visual_junk = [
         r"4k", r"8k", r"cinematic", r"photorealistic", r"hyperrealistic", r"overexposed",
         r"underexposed", r"lighting", r"golden hour", r"bokeh", r"sharp focus", r"close up",
-        r"wide angle", r"ultra detailed", r"masterpiece", r"aspect ratio", r"unreal engine"
+        r"wide angle", r"ultra detailed", r"masterpiece", r"aspect ratio", r"unreal engine",
+        r"still frame", r"subtitles", r"artwork", r"painting"
     ]
     cleaned = visual_prompt
     for pattern in visual_junk:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return f"clear environmental sound of {cleaned}, ambient recording, realistic high fidelity audio"
+    return f"realistic Foley sound effect of {cleaned}, crisp sound, studio quality field recording"
 
 
-class WanAudioEngine:
-    """Robust Audio synthesis engine with explicit GPT2LMHeadModel patch and fallbacks."""
+class FoleyCrafterAudioEngine:
+    """
+    State-of-the-Art Video-to-Audio (V2A) Engine.
+    Uses FoleyCrafter for temporal video-frame conditioning, with fallback to AudioLDM.
+    """
 
     def __init__(self, device: torch.device):
         self.device = device
+        self.engine_type: Optional[str] = None
         self.pipe: Any = None
         self._load_failed: bool = False
 
     def _lazy_load(self):
-        if self.pipe is None and not self._load_failed:
-            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if self.pipe is not None or self._load_failed:
+            return
 
-            # -----------------------------------------------------------------
-            # Primary: AudioLDM-2 with explicit GPT2LMHeadModel injection
-            # -----------------------------------------------------------------
-            try:
-                logger.info("Initializing AudioLDM-2 ('cvssp/audioldm2') with GPT2LMHeadModel patch...")
-                
-                # Explicitly instantiate GPT2LMHeadModel to bypass checkpoint config bug
-                lm = GPT2LMHeadModel.from_pretrained(
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        # ---------------------------------------------------------------------
+        # Primary: FoleyCrafter Video-to-Audio (V2A) Engine (Dynamically Loaded)
+        # ---------------------------------------------------------------------
+        try:
+            logger.info("Checking for FoleyCrafter V2A installation...")
+            fc_module = importlib.import_module("foleycrafter.pipelines.dymctrl_pipeline")
+            DymctrlPipeline = getattr(fc_module, "DymctrlPipeline")
+
+            logger.info("Initializing FoleyCrafter ('ymq22/FoleyCrafter')...")
+            self.pipe = DymctrlPipeline.from_pretrained(
+                "ymq22/FoleyCrafter",
+                torch_dtype=torch_dtype,
+            ).to(self.device)
+
+            self.engine_type = "foleycrafter"
+            logger.info("FoleyCrafter V2A successfully loaded on GPU.")
+            return
+        except ImportError:
+            logger.warning(
+                "FoleyCrafter not installed. Run 'pip install foleycrafter' to enable native visual-to-audio sync. "
+                "Engaging hardened AudioLDM fallback..."
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize FoleyCrafter: {e}. Falling back to AudioLDM...")
+
+        # ---------------------------------------------------------------------
+        # Fallback 1: AudioLDM-2 with GPT2LMHeadModel patch & DPM-Solver++
+        # ---------------------------------------------------------------------
+        try:
+            logger.info("Initializing AudioLDM-2 fallback ('cvssp/audioldm2')...")
+            lm = GPT2LMHeadModel.from_pretrained(
+                "cvssp/audioldm2",
+                subfolder="language_model",
+                torch_dtype=torch_dtype,
+            )
+
+            if AudioLDM2Pipeline is not None:
+                self.pipe = AudioLDM2Pipeline.from_pretrained(
                     "cvssp/audioldm2",
-                    subfolder="language_model",
+                    language_model=lm,
                     torch_dtype=torch_dtype,
                 )
-
-                if AudioLDM2Pipeline is not None:
-                    self.pipe = AudioLDM2Pipeline.from_pretrained(
-                        "cvssp/audioldm2",
-                        language_model=lm,
-                        torch_dtype=torch_dtype,
-                    )
-                else:
-                    raise ImportError("AudioLDM2Pipeline not exported in diffusers.")
-
                 if DPMSolverMultistepScheduler is not None:
-                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
-
+                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                        self.pipe.scheduler.config,
+                        algorithm_type="sde-dpmsolver++",
+                        use_karras_sigmas=True,
+                    )
                 self.pipe = self.pipe.to(self.device)
-                logger.info("AudioLDM-2 successfully loaded on GPU.")
+                self.engine_type = "audioldm2"
+                logger.info("AudioLDM-2 fallback successfully loaded on GPU.")
                 return
-            except Exception as e:
-                logger.warning(f"AudioLDM-2 failed to load: {e}. Activating fallback to AudioLDM-Medium...")
+        except Exception as e:
+            logger.warning(f"AudioLDM-2 fallback failed: {e}. Trying AudioLDM-Medium...")
 
-            # -----------------------------------------------------------------
-            # Fallback: AudioLDM-Medium (CLAP-based, 100% stable across all versions)
-            # -----------------------------------------------------------------
-            try:
-                if AudioLDMPipeline is None:
-                    raise ImportError("AudioLDMPipeline not found in diffusers.")
-
-                logger.info("Loading fallback model: 'cvssp/audioldm-m-full'...")
+        # ---------------------------------------------------------------------
+        # Fallback 2: AudioLDM-Medium (CLAP-based, rock solid stability)
+        # ---------------------------------------------------------------------
+        try:
+            if AudioLDMPipeline is not None:
+                logger.info("Loading baseline fallback: 'cvssp/audioldm-m-full'...")
                 self.pipe = AudioLDMPipeline.from_pretrained(
                     "cvssp/audioldm-m-full",
                     torch_dtype=torch_dtype,
                 )
                 if DPMSolverMultistepScheduler is not None:
-                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
-                    
+                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                        self.pipe.scheduler.config,
+                        algorithm_type="sde-dpmsolver++",
+                    )
                 self.pipe = self.pipe.to(self.device)
-                logger.info("AudioLDM-Medium successfully loaded on GPU.")
+                self.engine_type = "audioldm"
+                logger.info("AudioLDM-Medium fallback successfully loaded on GPU.")
                 return
-            except Exception as ex:
-                logger.error(f"All audio models failed to load: {ex}")
-                self._load_failed = True
-                self.pipe = None
+        except Exception as ex:
+            logger.error(f"All audio models failed to load: {ex}")
+            self._load_failed = True
+            self.pipe = None
+
+    def _post_process_audio(self, raw_audio: Any, sample_rate: int, target_duration: float) -> np.ndarray:
+        """
+        Studio DSP Post-Processing Chain:
+        1. 40Hz Butterworth high-pass filter (strips DC sub-bass rumble/vocoder hiss).
+        2. Accurate sample-level duration cropping.
+        3. 50ms Cosine Windowing (eliminates boundary clicks/pops).
+        4. Peak Normalization to -1.0 dBFS (prevents digital clipping/distortion).
+        """
+        # Convert tensor or list to float32 numpy array
+        if isinstance(raw_audio, torch.Tensor):
+            audio = raw_audio.detach().cpu().float().numpy()
+        else:
+            audio = np.asarray(raw_audio, dtype=np.float32)
+
+        # 1. High-Pass Filter (< 40 Hz)
+        sos = signal.butter(4, 40, "hp", fs=sample_rate, output="sos")
+        filt_result = signal.sosfilt(sos, audio)
+        audio_filtered = filt_result[0] if isinstance(filt_result, tuple) else filt_result
+        audio = np.asarray(audio_filtered, dtype=np.float32)
+
+        # 2. Precise Sample Truncation / Padding
+        target_samples = int(target_duration * sample_rate)
+        if len(audio) > target_samples:
+            audio = audio[:target_samples]
+        elif len(audio) < target_samples:
+            audio = np.pad(audio, (0, target_samples - len(audio)))
+
+        # 3. 50ms Cosine Edge Windowing
+        fade_len = int(0.05 * sample_rate)
+        if len(audio) > 2 * fade_len:
+            fade_in = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fade_len)))
+            fade_out = 0.5 * (1 + np.cos(np.linspace(0, np.pi, fade_len)))
+            audio[:fade_len] *= fade_in
+            audio[-fade_len:] *= fade_out
+
+        # 4. Peak Normalization (-1.0 dBFS ceiling)
+        max_val = float(np.max(np.abs(audio)))
+        if max_val > 1e-5:
+            target_peak = 10.0 ** (-1.0 / 20.0)  # ~0.891
+            audio = (audio / max_val) * target_peak
+
+        return audio
 
     def generate_sound(
         self,
+        video_path: str,
         audio_prompt: str,
         duration_sec: float,
         output_wav_path: str,
         audio_neg_prompt: str = DEFAULT_AUDIO_NEG_PROMPT,
     ) -> bool:
         self._lazy_load()
-        if self.pipe is None or self._load_failed:
-            logger.warning("Audio engine unavailable. Skipping sound synthesis.")
+        if self.pipe is None or self._load_failed or self.engine_type is None:
+            logger.warning("No audio synthesis engine available. Skipping sound generation.")
             return False
 
         try:
-            logger.info(f"Synthesizing audio ({duration_sec:.1f}s) for prompt: '{audio_prompt}'")
+            engine_name = (self.engine_type or "UNKNOWN").upper()
+            logger.info(f"Generating audio using [{engine_name}] for duration: {duration_sec:.2f}s")
+            
+            # Move pipe to GPU for generation if it was offloaded
+            if hasattr(self.pipe, "to"):
+                self.pipe.to(self.device)
 
-            result = self.pipe(
-                prompt=audio_prompt,
-                negative_prompt=audio_neg_prompt,
-                num_inference_steps=25,
-                guidance_scale=3.5,
-                audio_length_in_s=max(1.5, duration_sec),
-            )
-
-            audio = result.audios[0] if hasattr(result, "audios") else result[0][0]
-
-            # Detect native vocoder sampling rate (defaults to 16000 Hz)
             sample_rate = 16000
-            if hasattr(self.pipe, "vocoder") and hasattr(self.pipe.vocoder, "config"):
-                sample_rate = getattr(self.pipe.vocoder.config, "sampling_rate", 16000)
 
-            # Convert to 16-bit PCM WAV
-            audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+            if self.engine_type == "foleycrafter":
+                # FoleyCrafter performs true video-to-audio cross-attention conditioning
+                result = self.pipe(
+                    prompt=audio_prompt,
+                    negative_prompt=audio_neg_prompt,
+                    video_path=video_path,
+                    num_inference_steps=35,
+                    guidance_scale=7.5,
+                )
+                raw_audio = result.audios[0] if hasattr(result, "audios") else result[0]
+                if hasattr(self.pipe, "vocoder") and hasattr(self.pipe.vocoder, "config"):
+                    sample_rate = getattr(self.pipe.vocoder.config, "sampling_rate", 16000)
+
+            else:
+                # Never generate under 5.0s on AudioLDM to avoid vocoder phase breakdown
+                native_gen_duration = max(5.0, duration_sec)
+                result = self.pipe(
+                    prompt=audio_prompt,
+                    negative_prompt=audio_neg_prompt,
+                    num_inference_steps=40,
+                    guidance_scale=5.0,
+                    audio_length_in_s=native_gen_duration,
+                )
+                raw_audio = result.audios[0] if hasattr(result, "audios") else result[0][0]
+                if hasattr(self.pipe, "vocoder") and hasattr(self.pipe.vocoder, "config"):
+                    sample_rate = getattr(self.pipe.vocoder.config, "sampling_rate", 16000)
+
+            # Apply studio DSP chain
+            processed_audio = self._post_process_audio(raw_audio, sample_rate, duration_sec)
+
+            # Save 16-bit PCM WAV
+            audio_int16 = (processed_audio * 32767).clip(-32768, 32767).astype(np.int16)
             wavfile.write(output_wav_path, rate=sample_rate, data=audio_int16)
             logger.info(f"Audio synthesized successfully -> {output_wav_path}")
+
+            # Offload audio pipe back to CPU to keep VRAM free for Wan2.1
+            if hasattr(self.pipe, "to"):
+                self.pipe.to("cpu")
+            KaggleMemoryManager.flush()
+
             return True
+
         except Exception as e:
-            logger.error(f"Audio synthesis failed: {e}")
+            logger.error(f"Audio generation failed: {e}", exc_info=True)
+            if hasattr(self.pipe, "to"):
+                self.pipe.to("cpu")
+            KaggleMemoryManager.flush()
             return False
 
 
@@ -256,7 +366,7 @@ def mux_audio_video(video_path: str, audio_path: str, output_path: str) -> str:
             "-shortest",
             output_path
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         logger.info(f"Audio muxing complete: {output_path}")
         return output_path
     except subprocess.CalledProcessError as e:
@@ -273,7 +383,7 @@ class WanGradioPipeline:
     def __init__(self, container: WanModelContainer):
         self.c = container
         self.device = torch.device(self.c.device) if isinstance(self.c.device, str) else self.c.device
-        self.audio_engine = WanAudioEngine(self.device)
+        self.audio_engine = FoleyCrafterAudioEngine(self.device)
 
         if torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
@@ -404,7 +514,7 @@ class WanGradioPipeline:
             arg_uncond["clip_fea"] = clip_fea
 
         # ---------------------------------------------------------------------
-        # 4. DiT Sampling Loop (Kept on GPU throughout the loop)
+        # 4. DiT Sampling Loop
         # ---------------------------------------------------------------------
         logger.info(f"Loading DiT backbone ({self.dtype}) to GPU for denoising...")
         cast(torch.nn.Module, self.c.dit).to(device=self.device, dtype=self.dtype)
@@ -433,10 +543,9 @@ class WanGradioPipeline:
         KaggleMemoryManager.report_vram("DiT Offloaded")
 
         # ---------------------------------------------------------------------
-        # 5. VAE Latent Decode (All VAE tensors synchronized to GPU in FP32)
+        # 5. VAE Latent Decode (FP32 Enforced to avoid black-frame NaNs)
         # ---------------------------------------------------------------------
         logger.info("Loading VAE to GPU for temporal decoding in FP32...")
-        
         sync_vae_device(self.c.vae, self.device, dtype=torch.float32)
 
         with torch.amp.autocast("cuda", enabled=False):
@@ -451,12 +560,19 @@ class WanGradioPipeline:
         self._render_mp4(video, silent_video_path, fps=16)
 
         # ---------------------------------------------------------------------
-        # 6. AudioLDM-2 Sound Synthesis & Multiplexing
+        # 6. Video-to-Audio (V2A) Foley Synthesis & Multiplexing
         # ---------------------------------------------------------------------
         if enable_audio:
             duration = frame_num / 16.0
             wav_path = f"wan_audio_{timestamp}.wav"
-            audio_success = self.audio_engine.generate_sound(audio_prompt, duration, wav_path)
+
+            # Pass silent video path so FoleyCrafter can extract motion features
+            audio_success = self.audio_engine.generate_sound(
+                video_path=silent_video_path,
+                audio_prompt=audio_prompt,
+                duration_sec=duration,
+                output_wav_path=wav_path,
+            )
 
             if audio_success and os.path.exists(wav_path):
                 final_video_path = f"wan_video_with_audio_{timestamp}.mp4"
@@ -558,9 +674,9 @@ def build_app() -> gr.Blocks:
         gr.HTML(custom_css)
         gr.Markdown(
             """
-            # Wan2.1: Unified Video Studio with Audio (Kaggle Optimized)
+            # Wan2.1: Unified Video Studio with FoleyCrafter V2A
             Generate high-definition video using **Wan2.1 Continuous Flow-Matching DiT**, paired with 
-            **AudioLDM-2** acoustic synthesis for high-fidelity Foley sound effects.
+            **FoleyCrafter Video-to-Audio (V2A)** conditioning for visual synchronization.
             """
         )
 
@@ -569,10 +685,10 @@ def build_app() -> gr.Blocks:
                 label="Model Size",
                 choices=["1.3B", "14B"],
                 value="1.3B",
-                info="1.3B is strictly recommended for Kaggle T4 (16GB VRAM).",
+                info="1.3B is recommended for Kaggle T4 (16GB VRAM).",
             )
             load_status = gr.Textbox(label="System Status", value="Ready to initialize", interactive=False)
-            init_btn = gr.Button("Initialize / Switch Model", variant="secondary")
+            init_btn: Any = gr.Button("Initialize / Switch Model", variant="secondary")
 
         init_btn.click(fn=init_pipeline, inputs=[scale_dropdown], outputs=[load_status])
 
@@ -589,7 +705,7 @@ def build_app() -> gr.Blocks:
                         t2v_audio_prompt = gr.Textbox(
                             label="Audio / Sound Effect Prompt",
                             value=DEFAULT_T2V_AUDIO_PROMPT,
-                            info="Describe acoustic sounds (e.g., wind, eagle cry, water waves) rather than visual descriptors.",
+                            info="Describe acoustic Foley sounds. Leave empty to auto-derive from video prompt.",
                             lines=2,
                         )
                         t2v_neg_prompt = gr.Textbox(
@@ -611,9 +727,9 @@ def build_app() -> gr.Blocks:
                                 info="33 frames (~2 sec) renders in ~2-3 minutes.",
                             )
                         t2v_audio = gr.Checkbox(
-                            label="Generate Synchronized Audio",
+                            label="Generate Synchronized Video-to-Audio",
                             value=True,
-                            info="Synthesizes high-fidelity Foley sound matching the audio prompt.",
+                            info="Synthesizes motion-synchronized Foley sound via FoleyCrafter.",
                         )
                         with gr.Accordion("Advanced Sampling Parameters", open=False):
                             t2v_steps = gr.Slider(label="Sampling Steps", minimum=15, maximum=50, value=20, step=1)
@@ -621,10 +737,10 @@ def build_app() -> gr.Blocks:
                             t2v_shift = gr.Slider(label="Flow Shift Factor", minimum=1.0, maximum=8.0, value=3.0, step=0.5)
                             t2v_seed = gr.Number(label="Seed (-1 for random)", value=-1)
 
-                        t2v_btn = gr.Button("Generate Video with Audio", variant="primary", elem_classes=["generate-btn"])
+                        t2v_btn: Any = gr.Button("Generate Video with Audio", variant="primary", elem_classes=["generate-btn"])
 
                     with gr.Column(scale=5):
-                        t2v_output = gr.Video(label="Rendered Video (with Audio)", autoplay=True)
+                        t2v_output = gr.Video(label="Rendered Video (Synchronized Audio)", autoplay=True)
 
                 t2v_btn.click(
                     fn=run_t2v,
@@ -645,7 +761,7 @@ def build_app() -> gr.Blocks:
                         i2v_audio_prompt = gr.Textbox(
                             label="Audio / Sound Effect Prompt",
                             value=DEFAULT_I2V_AUDIO_PROMPT,
-                            info="Describe the sounds you expect to hear in this scene.",
+                            info="Describe the acoustic sounds you expect to hear in this scene.",
                             lines=2,
                         )
                         i2v_neg_prompt = gr.Textbox(label="Negative Prompt", value=DEFAULT_NEG_PROMPT_EN, lines=2)
@@ -653,9 +769,9 @@ def build_app() -> gr.Blocks:
                             i2v_res = gr.Dropdown(label="Resolution", choices=["832x480", "480x832"], value="832x480")
                             i2v_frames = gr.Dropdown(label="Frames", choices=[17, 33, 49, 81], value=33)
                         i2v_audio = gr.Checkbox(
-                            label="Generate Synchronized Audio",
+                            label="Generate Synchronized Video-to-Audio",
                             value=True,
-                            info="Synthesizes high-fidelity soundscapes.",
+                            info="Synthesizes motion-synchronized Foley soundscapes.",
                         )
                         with gr.Accordion("Advanced Parameters", open=False):
                             i2v_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=20, step=1)
@@ -663,10 +779,10 @@ def build_app() -> gr.Blocks:
                             i2v_shift = gr.Slider(label="Shift Factor", minimum=1.0, maximum=6.0, value=3.0, step=0.5)
                             i2v_seed = gr.Number(label="Seed", value=-1)
 
-                        i2v_btn = gr.Button("Animate Image with Audio", variant="primary", elem_classes=["generate-btn"])
+                        i2v_btn: Any = gr.Button("Animate Image with Audio", variant="primary", elem_classes=["generate-btn"])
 
                     with gr.Column(scale=5):
-                        i2v_output = gr.Video(label="Animated Output (with Audio)", autoplay=True)
+                        i2v_output = gr.Video(label="Animated Output (Synchronized Audio)", autoplay=True)
 
                 i2v_btn.click(
                     fn=run_i2v,
@@ -679,4 +795,7 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_app()
-    app.queue(max_size=3).launch(share=True, server_port=7860)
+    try:
+        app.queue(max_size=3).launch(share=True, server_port=7860)
+    except TypeError:
+        app.queue().launch(share=True, server_port=7860)
