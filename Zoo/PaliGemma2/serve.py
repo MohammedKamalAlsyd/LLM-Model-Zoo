@@ -118,7 +118,7 @@ def generate(
     model: PaliGemma2ForConditionalGeneration,
     preprocessor: PaliGemma2Preprocessor,
     postprocessor: PaliGemma2Postprocessor,
-    image: Image.Image,
+    image: Optional[Image.Image],
     prompt: str,
     max_tokens: int = 120,
     temp: float = 0.0,
@@ -194,16 +194,17 @@ def main():
     default_img_path = download_if_url(default_cfg["image"])
 
     def run_inference(image, prompt, max_new, temp):
-        if not image:
-            return "Please provide or select an image.", None
-        # Support string URLs or local filepaths
-        if isinstance(image, str):
-            image_path = download_if_url(image)
-            if image_path is None:
-                return "Unable to resolve the image path.", None
-            image = Image.open(image_path)
+        if not image and not prompt.strip():
+            return "Please provide an image or enter a text prompt.", None
 
-        prompt = prompt or "caption en"
+        # Convert image string URL or local path to PIL Image
+        if isinstance(image, str) and image.strip():
+            image_path = download_if_url(image)
+            image = Image.open(image_path) if image_path else None
+        elif not isinstance(image, Image.Image):
+            image = None
+
+        prompt = prompt or ("caption en" if image is not None else "Hello!")
         try:
             return generate(model, preprocessor, postprocessor, image, prompt, int(max_new), float(temp))
         except Exception as e:
