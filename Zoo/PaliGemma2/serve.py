@@ -1,12 +1,12 @@
-"""Gradio Web Server for PaliGemma 2 with interactive task examples.
+"""Gradio Web Server for PaliGemma 2 with on-the-fly preset loading.
 
 Supports Captioning, VQA, Object Detection (<loc####>), and Segmentation (<seg###>).
 """
 
 import os
 import sys
+import tempfile
 import urllib.request
-from pathlib import Path
 from typing import Optional, Tuple
 import gradio as gr
 from PIL import Image
@@ -25,34 +25,71 @@ from Zoo.PaliGemma2.processing.PaliGemma2Postprocessor import PaliGemma2Postproc
 from Zoo.Common.KV_Cache import KVCache
 from Zoo.Common.model_loader import load_hf_model_weights
 
-# Recommended: 10B mix checkpoint for accurate multi-task instruction following
 HF_REPO = "google/paligemma2-10b-mix-448"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
 
-# Path to cached demo images
-EXAMPLES_DIR = Path(__file__).parent / "assets" / "examples"
-EXAMPLE_IMAGES = {
-    "animals.jpg": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats_and_dogs.jpg",
-    "street.png": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/coco_sample.png",
+# On-the-fly task configuration with reliable public COCO reference samples
+PRESET_CONFIG = {
+    "VQA - Two Cats": {
+        "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "prompt": "answer en What animals are lying on the couch?",
+        "max_tokens": 64,
+        "temperature": 0.0,
+    },
+    "Caption - Two Cats": {
+        "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "prompt": "caption en",
+        "max_tokens": 64,
+        "temperature": 0.0,
+    },
+    "Object Detection - Cats": {
+        "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "prompt": "detect cat ; couch ; remote",
+        "max_tokens": 128,
+        "temperature": 0.0,
+    },
+    "Segmentation - Cats": {
+        "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "prompt": "segment cat",
+        "max_tokens": 128,
+        "temperature": 0.0,
+    },
+    "Object Detection - Living Room": {
+        "image": "http://images.cocodataset.org/val2017/000000000139.jpg",
+        "prompt": "detect chair ; dining table ; bottle",
+        "max_tokens": 128,
+        "temperature": 0.0,
+    },
+    "Detailed Description - Living Room": {
+        "image": "http://images.cocodataset.org/val2017/000000000139.jpg",
+        "prompt": "describe en",
+        "max_tokens": 128,
+        "temperature": 0.0,
+    },
 }
 
 
-def ensure_example_assets() -> None:
-    """Downloads lightweight sample images if not already present."""
-    EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    for filename, url in EXAMPLE_IMAGES.items():
-        filepath = EXAMPLES_DIR / filename
-        if not filepath.exists():
-            try:
-                print(f"Downloading sample image: {filename}...")
-                urllib.request.urlretrieve(url, filepath)
-            except Exception as e:
-                print(f"Notice: Could not download {filename}: {e}")
+def download_if_url(image_path: Optional[str]) -> Optional[str]:
+    """Downloads remote image URLs to a local temporary cache on the fly."""
+    if not image_path:
+        return None
+    if isinstance(image_path, str) and image_path.startswith(("http://", "https://")):
+        cache_dir = os.path.join(tempfile.gettempdir(), "paligemma2_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        local_filename = os.path.join(cache_dir, os.path.basename(image_path.split("?")[0]))
+        if not os.path.exists(local_filename):
+            print(f"Downloading sample image on the fly: {image_path}...")
+            # Custom User-Agent header prevents 403 Forbidden errors
+            req = urllib.request.Request(image_path, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as response, open(local_filename, "wb") as out_file:
+                out_file.write(response.read())
+        return local_filename
+    return image_path
 
 
 def get_model_and_pipeline():
-    """Initializes model, preprocessor, and postprocessor."""
+    """Initializes PaliGemma 2 model and processor with downloaded weights."""
     config = PaliGemma2Config()
     model = PaliGemma2ForConditionalGeneration(config)
 
@@ -82,7 +119,7 @@ def generate(
     max_tokens: int = 120,
     temp: float = 0.0,
 ) -> Tuple[str, Optional[Image.Image]]:
-    """Runs generation and delegates coordinate parsing/rendering to postprocessor."""
+    """Performs multimodal autoregressive generation and post-processes outputs."""
     inputs = preprocessor(text=prompt, image=image, return_tensors="pt")
     input_ids = inputs["input_ids"].to(DEVICE)
     pixel_values = inputs.get("pixel_values")
@@ -93,7 +130,7 @@ def generate(
     kv_cache = KVCache()
     generated_ids = []
 
-    # 1. Prefill Step
+    # 1. Prefill step
     outputs = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -103,7 +140,7 @@ def generate(
     next_logits = outputs["logits"][:, -1, :]
     eos_ids = model.config.eos_token_ids
 
-    # 2. Decode Loop
+    # 2. Decode loop
     for _ in range(max_tokens):
         if temp > 0.0:
             probs = torch.softmax(next_logits / temp, dim=-1)
@@ -131,13 +168,35 @@ def generate(
     return clean_text, annotated_image
 
 
+def on_preset_change(preset_name: str):
+    """Automatically swaps image on the fly, prompt, and sliders when preset changes."""
+    cfg = PRESET_CONFIG.get(preset_name, {})
+    resolved_img_path = download_if_url(cfg.get("image", ""))
+    return (
+        cfg.get("prompt", ""),
+        resolved_img_path,
+        cfg.get("max_tokens", 120),
+        cfg.get("temperature", 0.0),
+    )
+
+
 def main():
-    ensure_example_assets()
     model, preprocessor, postprocessor = get_model_and_pipeline()
+
+    default_preset = "VQA - Two Cats"
+    default_cfg = PRESET_CONFIG[default_preset]
+    default_img_path = download_if_url(default_cfg["image"])
 
     def run_inference(image, prompt, max_new, temp):
         if not image:
-            return "Please provide an image.", None
+            return "Please provide or select an image.", None
+        # Support string URLs or local filepaths
+        if isinstance(image, str):
+            image_path = download_if_url(image)
+            if image_path is None:
+                return "Unable to resolve the image path.", None
+            image = Image.open(image_path)
+
         prompt = prompt or "caption en"
         try:
             return generate(model, preprocessor, postprocessor, image, prompt, int(max_new), float(temp))
@@ -147,56 +206,66 @@ def main():
     with gr.Blocks(title="PaliGemma 2") as app:
         gr.Markdown(f"## PaliGemma 2 — `{HF_REPO}` ({DEVICE.upper()})")
         gr.Markdown(
-            "Select an example below or upload your own image to test **Captioning**, **VQA**, "
-            "**Object Detection**, and **Segmentation**."
+            "Select a preset from the dropdown to load an image and task on the fly, "
+            "or upload your own custom image."
         )
 
         with gr.Row():
+            # Left Column: Inputs
             with gr.Column():
-                input_img = gr.Image(type="pil", label="Input Image")
+                preset_dropdown = gr.Dropdown(
+                    choices=list(PRESET_CONFIG.keys()),
+                    value=default_preset,
+                    label="Task Presets (Auto-loads image & prompt on the fly)"
+                )
+
+                input_img = gr.Image(
+                    type="pil",
+                    value=default_img_path,
+                    label="Input Image (Upload or select preset)"
+                )
+
                 prompt_input = gr.Textbox(
                     label="Prompt",
-                    value="caption en",
+                    value=default_cfg["prompt"],
                     placeholder="e.g. 'caption en', 'answer en <question>', 'detect <label>', 'segment <label>'",
                 )
-                with gr.Row():
-                    tokens_slider = gr.Slider(10, 500, 120, step=1, label="Max Tokens")
-                    temp_slider = gr.Slider(0.0, 1.0, 0.0, step=0.1, label="Temperature")
-                btn = gr.Button("Submit", variant="primary")
 
+                with gr.Row():
+                    tokens_slider = gr.Slider(
+                        10, 500,
+                        value=default_cfg["max_tokens"],
+                        step=1,
+                        label="Max Tokens"
+                    )
+                    temp_slider = gr.Slider(
+                        0.0, 1.0,
+                        value=default_cfg["temperature"],
+                        step=0.1,
+                        label="Temperature"
+                    )
+
+                btn = gr.Button("Generate", variant="primary")
+
+            # Right Column: Outputs
             with gr.Column():
-                output_text = gr.Textbox(label="Generated Text")
+                output_text = gr.Textbox(label="Generated Text", lines=4)
                 output_img = gr.Image(type="pil", label="Visual Annotations (Detection / Segmentation)")
 
-        btn.click( # type: ignore
+        # On Preset Change: Load sample image and prompt on the fly
+        preset_dropdown.change( # type:ignore
+            fn=on_preset_change,
+            inputs=[preset_dropdown],
+            outputs=[prompt_input, input_img, tokens_slider, temp_slider],
+            show_progress="hidden",
+        )
+
+        # Inference Trigger
+        btn.click( # type:ignore
             run_inference,
             inputs=[input_img, prompt_input, tokens_slider, temp_slider],
             outputs=[output_text, output_img],
         )
-
-        # Example configurations representing each major task
-        animals_path = str(EXAMPLES_DIR / "animals.jpg")
-        street_path = str(EXAMPLES_DIR / "street.png")
-
-        candidate_examples = [
-            # [Image, Prompt, Max Tokens, Temp]
-            [animals_path, "caption en", 64, 0.0],
-            [animals_path, "answer en What animals are sitting together?", 64, 0.0],
-            [animals_path, "detect cat ; dog", 128, 0.0],
-            [animals_path, "segment dog", 128, 0.0],
-            [street_path, "describe en", 128, 0.0],
-            [street_path, "detect person ; car", 128, 0.0],
-        ]
-
-        valid_examples = [ex for ex in candidate_examples if os.path.exists(ex[0])]
-        if valid_examples:
-            gr.Examples(
-                examples=valid_examples,
-                inputs=[input_img, prompt_input, tokens_slider, temp_slider],
-                outputs=[output_text, output_img],
-                fn=run_inference,
-                cache_examples=False,
-            )
 
     app.launch(server_name="0.0.0.0", share=True)
 
