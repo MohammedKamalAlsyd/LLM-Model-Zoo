@@ -40,7 +40,9 @@ class SigLipVisionEmbeddings(nn.Module):
         patches = self.patch_embedding(pixel_values.to(dtype=target_dtype)).flatten(2).transpose(1, 2)
 
         if h != self.cfg.image_size or w != self.cfg.image_size:
-            pos_emb = interpolate_2d_pos_embed(patches, h, w, self.patch_size)
+            pos_emb = interpolate_2d_pos_embed(
+                self.position_embedding.weight, h, w, self.patch_size
+            )
         else:
             pos_emb = self.position_embedding(self.positions)
 

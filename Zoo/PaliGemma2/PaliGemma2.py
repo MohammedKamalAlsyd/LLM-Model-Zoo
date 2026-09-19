@@ -4,11 +4,12 @@ from typing import Optional
 import torch
 from torch import nn
 
-from configs import PaliGemma2Config
+from Zoo.PaliGemma2.configs import PaliGemma2Config
 from Zoo.PaliGemma2.modules.SigLip import SigLipVisionModel
 from Zoo.PaliGemma2.modules.Gemma2 import Gemma2ForCausalLM
 from Zoo.Common.KV_Cache import KVCache
 from Zoo.Common.vision_utils import replace_image_tokens
+from Zoo.Common.attention_utils import create_causal_mask
 
 
 class PaliGemmaMultiModalProjector(nn.Module):
@@ -71,23 +72,34 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             vis_features = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
             projected = self.multi_modal_projector(vis_features)
 
-        inputs_embeds = replace_image_tokens(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            image_features=projected,
-            image_token_id=self.config.image_token_index,
-        )
+            inputs_embeds = replace_image_tokens(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=projected,
+                image_token_id=self.config.image_token_index,
+            )
 
         # Cache lengths and total sequence length
         cache_len = kv_cache.num_items() if kv_cache is not None else 0
         total_len = cache_len + seq_len
 
-        # Position IDs start at 1, NOT 0:
-        pos_ids = (torch.arange(cache_len, total_len, device=input_ids.device, dtype=torch.long) + 1).unsqueeze(0).expand(b, -1)
-        causal_mask = torch.zeros(b, 1, seq_len, total_len, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-        if attention_mask is not None and attention_mask.shape[-1] == total_len:
-            pad_mask = (attention_mask == 0).view(b, 1, 1, total_len)
-            causal_mask = causal_mask.masked_fill(pad_mask, float("-inf"))
+        pos_ids = torch.arange(
+            cache_len, total_len, device=input_ids.device, dtype=torch.long
+        ).unsqueeze(0).expand(b, -1)
+
+        # 3. Proper Causal & Padding Masking
+        causal_mask = None
+        if seq_len > 1 or cache_len > 0:
+            causal_mask = create_causal_mask(
+                seq_len=seq_len,
+                past_length=cache_len,
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                sliding_window=self.config.text_config.sliding_window,
+            )
+            if attention_mask is not None:
+                pad_mask = (1.0 - attention_mask[:, None, None, :].to(inputs_embeds.dtype)) * torch.finfo(inputs_embeds.dtype).min
+                causal_mask = causal_mask + pad_mask
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
