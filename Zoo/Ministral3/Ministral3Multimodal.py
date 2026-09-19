@@ -79,10 +79,12 @@ class Mistral3ForConditionalGeneration(nn.Module):
             projected_features = self.multi_modal_projector(raw_vision_features, image_sizes=image_sizes)
 
             # Scatter into embeddings
-            inputs_embeds = self.replace_image_tokens(
+            assert inputs_embeds is not None
+            inputs_embeds = replace_image_tokens(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 image_features=projected_features,
+                image_token_id=self.config.image_token_index,
             )
 
         # 2. Run language model backbone

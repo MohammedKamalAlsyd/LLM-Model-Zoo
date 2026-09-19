@@ -1,9 +1,13 @@
-"""Interactive Gradio Web Server for Ministral-3 Multimodal."""
+"""Interactive Gradio Web Server for Ministral-3 Multimodal.
+
+Supports both multimodal (Image + Text) and pure text-only conversations
+with autoregressive KV-cached decoding.
+"""
 
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 import torch
 import gradio as gr
 from transformers import AutoProcessor
@@ -63,36 +67,55 @@ def generate(
     max_tokens: int = 256,
     temperature: float = 0.7,
 ) -> str:
-    """Runs vision prefill followed by autoregressive token generation."""
-    if image is None:
-        return "Please upload an image."
+    """Runs generation supporting both Text-Only and Multimodal (Image + Text) prompts."""
+    if not prompt.strip() and image is None:
+        return "Please enter a prompt or upload an image."
 
-    # Format using Mistral chat template
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+    # 1. Dynamically structure conversation messages
+    if image is not None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+    else:
+        # Text-only conversation
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
 
-    formatted_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(images=image, text=formatted_text, return_tensors="pt")
+    formatted_text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # 2. Tokenize and preprocess (conditionally processing image if present)
+    if image is not None:
+        inputs = processor(images=image, text=formatted_text, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
+        image_sizes = inputs.get("image_sizes", None)
+        if image_sizes is not None:
+            image_sizes = image_sizes.to(DEVICE)
+    else:
+        inputs = processor(text=formatted_text, return_tensors="pt")
+        pixel_values = None
+        image_sizes = None
 
     input_ids = inputs["input_ids"].to(DEVICE)
-    pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
-    image_sizes = inputs.get("image_sizes", None)
-    if image_sizes is not None:
-        image_sizes = image_sizes.to(DEVICE)
-
     attention_mask = inputs.get("attention_mask", None)
     if attention_mask is not None:
         attention_mask = attention_mask.to(DEVICE)
 
     # =========================================================================
-    # 1. Prefill Phase (Vision + Text)
+    # 3. Prefill Phase (Vision is bypassed automatically if pixel_values is None)
     # =========================================================================
     kv_cache = KVCache()
     outputs = model(
@@ -109,14 +132,14 @@ def generate(
     eos_token_id = processor.tokenizer.eos_token_id
 
     # =========================================================================
-    # 2. Decode Phase (Token-by-Token Autoregressive Loop)
+    # 4. Decode Phase (Token-by-Token Autoregressive Loop)
     # =========================================================================
     for _ in range(max_tokens):
         if temperature > 0.0:
             probs = torch.softmax(next_token_logits / temperature, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
         else:
-            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
         token_id = next_token.item()
         if token_id == eos_token_id:
@@ -124,7 +147,7 @@ def generate(
 
         generated_tokens.append(token_id)
 
-        # Decode step: bypass vision by passing pixel_values=None
+        # Autoregressive step: bypass vision computation
         outputs = model(
             input_ids=next_token,
             pixel_values=None,
@@ -141,39 +164,44 @@ def generate(
 # Gradio Interface
 # =============================================================================
 
-def build_ui():
+def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Ministral-3 Zoo") as demo:
         gr.Markdown(
             f"""
             # 🦁 Ministral-3 Multimodal (3B)
             **Clean-Room PyTorch Implementation** running on **{DEVICE.upper()}** ({DTYPE}).
-            - Native 2D Axial RoPE Vision Encoder
-            - Spatial Block Patch Merger
-            - YaRN RoPE & LLaMA-4 Scaled GQA Decoder
+            - **Multimodal & Text-Only**: Upload an image to analyze it, or leave empty to chat directly.
+            - **Vision Encoder**: Native 2D Axial RoPE Pixtral Vision Tower
+            - **Projector**: Spatial 2x2 Patch Merger + MLP
+            - **Language Backbone**: YaRN RoPE & LLaMA-4 Scaled GQA Decoder
             """
         )
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_image = gr.Image(type="pil", label="Input Image")
+                input_image = gr.Image(type="pil", label="Input Image (Optional)")
                 prompt_input = gr.Textbox(
                     label="User Prompt",
-                    placeholder="Ask something about the image...",
-                    value="Describe this image in detail.",
+                    placeholder="Ask a question or describe an image...",
+                    value="Hello! What can you do?",
                     lines=3,
                 )
 
                 with gr.Accordion("Generation Parameters", open=False):
-                    max_tokens_slider = gr.Slider(16, 1024, value=256, step=16, label="Max New Tokens")
-                    temp_slider = gr.Slider(0.0, 1.2, value=0.7, step=0.05, label="Temperature")
+                    max_tokens_slider = gr.Slider(
+                        minimum=16, maximum=1024, value=256, step=16, label="Max New Tokens"
+                    )
+                    temp_slider = gr.Slider(
+                        minimum=0.0, maximum=1.2, value=0.7, step=0.05, label="Temperature"
+                    )
 
-                submit_btn = gr.Button("Generate Response", variant="primary")
+                submit_btn: Any = gr.Button("Generate Response", variant="primary")
 
                 gr.Examples(
                     examples=[
                         ["Describe this image in detail."],
                         ["Transcribe any text visible in this image."],
-                        ["What are the main objects and colors present?"],
+                        ["Explain the difference between supervised and unsupervised learning."],
                     ],
                     inputs=[prompt_input],
                 )
@@ -192,4 +220,4 @@ def build_ui():
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch(server_name="0.0.0.0", port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
