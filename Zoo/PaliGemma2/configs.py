@@ -15,13 +15,13 @@ class SigLipVisionConfig:
     num_attention_heads: int = 16
     num_hidden_layers: int = 27
     patch_size: int = 14
-    projection_dim: int = 2304
+    projection_dim: int = 3584
     num_channels: int = 3
-    image_size: int = 224
+    image_size: int = 448
     layer_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
-    num_positions: int = 256
-    num_image_tokens: int = 256
+    num_positions: int = 1024
+    num_image_tokens: int = 1024
     vision_use_head: bool = False
 
     @classmethod
@@ -36,11 +36,11 @@ class SigLipVisionConfig:
 class Gemma2Config:
     """Configuration for the Gemma 2 autoregressive language model."""
     vocab_size: int = 257216
-    hidden_size: int = 2304
-    intermediate_size: int = 9216
-    num_attention_heads: int = 8
-    num_key_value_heads: int = 4
-    num_hidden_layers: int = 26
+    hidden_size: int = 3584
+    intermediate_size: int = 14336
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
+    num_hidden_layers: int = 42
     sliding_window: int = 4096
     pad_token_id: int = 0
     eos_token_id: Union[int, List[int], Tuple[int, ...]] = (1, 107)
@@ -58,7 +58,6 @@ class Gemma2Config:
         """Instantiates a Gemma2Config from a dictionary."""
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_dict = {k: v for k, v in config_dict.items() if k in valid_keys}
-        # Handle single vs list eos_token_id
         if "eos_token_id" in filtered_dict and isinstance(filtered_dict["eos_token_id"], list):
             filtered_dict["eos_token_id"] = tuple(filtered_dict["eos_token_id"])
         return cls(**filtered_dict)
@@ -69,7 +68,7 @@ class PaliGemma2Config:
     """Root configuration for PaliGemma 2 conditional generation."""
     model_type: str = "paligemma"
     image_token_index: int = 257152
-    projection_dim: int = 2304
+    projection_dim: int = 3584
     vision_config: SigLipVisionConfig = field(default_factory=SigLipVisionConfig)
     text_config: Gemma2Config = field(default_factory=Gemma2Config)
 
@@ -97,7 +96,7 @@ class PaliGemma2Config:
         return cls(
             model_type=config_dict.get("model_type", "paligemma"),
             image_token_index=config_dict.get("image_token_index", 257152),
-            projection_dim=config_dict.get("projection_dim", 2304),
+            projection_dim=config_dict.get("projection_dim", 3584),
             vision_config=vision_cfg,
             text_config=text_cfg,
         )
@@ -113,8 +112,8 @@ class PaliGemma2Config:
 @dataclass
 class PaliGemma2ProcessorConfig:
     """Configuration for image preprocessing and tokenizer special tokens."""
-    image_size: int = 224
-    image_seq_length: int = 256
+    image_size: int = 448
+    image_seq_length: int = 1024
     image_token: str = "<image>"
     num_location_tokens: int = 1024
     num_segmentation_tokens: int = 128
@@ -134,9 +133,8 @@ class PaliGemma2ProcessorConfig:
         """Constructs a PaliGemma2ProcessorConfig adapting HF dictionary formats."""
         cfg_dict = dict(config_dict)
 
-        # Map nested size dict {"height": 224, "width": 224} -> image_size
         if "size" in cfg_dict and isinstance(cfg_dict["size"], dict):
-            cfg_dict["image_size"] = cfg_dict["size"].get("height", 224)
+            cfg_dict["image_size"] = cfg_dict["size"].get("height", 448)
 
         if "image_mean" in cfg_dict and isinstance(cfg_dict["image_mean"], list):
             cfg_dict["image_mean"] = tuple(cfg_dict["image_mean"])
