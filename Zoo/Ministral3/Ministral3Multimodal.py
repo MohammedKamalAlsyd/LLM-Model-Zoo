@@ -13,6 +13,7 @@ from Zoo.Ministral3.modules.Ministral3 import Ministral3ForCausalLM
 from Zoo.Ministral3.modules.Mistral3MultiModalProjector import Mistral3MultiModalProjector
 from Zoo.Ministral3.modules.PixtralVision import PixtralVisionModel
 from Zoo.Common.KV_Cache import KVCache
+from Zoo.Common.vision_utils import replace_image_tokens
 
 
 class Mistral3ForConditionalGeneration(nn.Module):
@@ -39,35 +40,6 @@ class Mistral3ForConditionalGeneration(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.model.embed_tokens
 
-    def _replace_image_tokens(
-        self,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        image_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """Injects projected visual tokens into placeholder token slots.
-
-        Args:
-            input_ids: Tensor of shape (batch, seq_len).
-            inputs_embeds: Tensor of shape (batch, seq_len, hidden_size).
-            image_features: Projected tokens of shape (total_merged_tokens, hidden_size).
-
-        Returns:
-            Tensor with visual embeddings scattered into placeholder positions.
-        """
-        image_mask = (input_ids == self.config.image_token_index)
-        num_placeholders = int(image_mask.sum().item())
-        num_features = image_features.shape[0]
-
-        if num_placeholders != num_features:
-            raise ValueError(
-                f"Token count mismatch: found {num_placeholders} image token placeholders, "
-                f"but projector yielded {num_features} merged features."
-            )
-
-        expanded_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        features_typed = image_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype).contiguous()
-        return inputs_embeds.masked_scatter(expanded_mask, features_typed)
 
     def forward(
         self,
@@ -107,7 +79,7 @@ class Mistral3ForConditionalGeneration(nn.Module):
             projected_features = self.multi_modal_projector(raw_vision_features, image_sizes=image_sizes)
 
             # Scatter into embeddings
-            inputs_embeds = self._replace_image_tokens(
+            inputs_embeds = self.replace_image_tokens(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 image_features=projected_features,

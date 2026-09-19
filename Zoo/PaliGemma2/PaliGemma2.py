@@ -8,6 +8,7 @@ from configs import PaliGemma2Config
 from Zoo.PaliGemma2.modules.SigLip import SigLipVisionModel
 from Zoo.PaliGemma2.modules.Gemma2 import Gemma2ForCausalLM
 from Zoo.Common.KV_Cache import KVCache
+from Zoo.Common.vision_utils import replace_image_tokens
 
 
 class PaliGemmaMultiModalProjector(nn.Module):
@@ -70,8 +71,12 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             vis_features = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
             projected = self.multi_modal_projector(vis_features)
 
-            mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-            inputs_embeds = inputs_embeds.masked_scatter(mask, projected.view(-1, inputs_embeds.shape[-1]))
+        inputs_embeds = replace_image_tokens(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=projected,
+            image_token_id=self.config.image_token_index,
+        )
 
         # Cache lengths and total sequence length
         cache_len = kv_cache.num_items() if kv_cache is not None else 0

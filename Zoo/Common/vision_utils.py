@@ -77,3 +77,60 @@ def generate_block_attention_mask(
             start = end
 
     return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
+
+
+def replace_image_tokens(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    image_features: torch.Tensor,
+    image_token_id: int,
+) -> torch.Tensor:
+    """Universally injects visual features into placeholder token slots.
+
+    Works seamlessly across PaliGemma 2, Ministral 3, LLaVA, and Pixtral.
+    Handles arbitrary batch sizes, variable image resolutions, and ensures
+    exact dtype and device alignment before scattering.
+
+    Args:
+        input_ids: Tensor of token IDs of shape (batch_size, seq_len).
+        inputs_embeds: Full sequence token embeddings of shape (batch_size, seq_len, hidden_size).
+        image_features: Projected vision features of shape (total_tokens, hidden_size)
+                        or (batch_size, num_patches, hidden_size).
+        image_token_id: Integer ID representing the image placeholder token (e.g., 10 or 257152).
+
+    Returns:
+        Tensor with vision embeddings scattered into image token positions,
+        matching the shape and dtype of `inputs_embeds`.
+
+    Raises:
+        ValueError: If the number of placeholder tokens in `input_ids` does not
+                    match the total number of visual tokens in `image_features`.
+    """
+    # 1. Locate placeholder positions
+    image_mask = (input_ids == image_token_id)
+    num_placeholders = int(image_mask.sum().item())
+
+    # 2. Flatten all leading dimensions of image_features (supports 2D or 3D)
+    hidden_size = inputs_embeds.shape[-1]
+    flat_features = image_features.reshape(-1, hidden_size)
+    num_features = flat_features.shape[0]
+
+    # 3. Strict token count validation
+    if num_placeholders != num_features:
+        raise ValueError(
+            f"Multimodal token count mismatch! "
+            f"Found {num_placeholders} placeholder tokens in 'input_ids' (ID={image_token_id}), "
+            f"but received {num_features} visual features from vision projector."
+        )
+
+    # 4. Expand mask to full embedding dimensionality (batch_size, seq_len, hidden_size)
+    expanded_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+
+    # 5. Type and device safety alignment
+    features_aligned = flat_features.to(
+        device=inputs_embeds.device,
+        dtype=inputs_embeds.dtype,
+    ).contiguous()
+
+    # 6. Scatter into embedding tensor
+    return inputs_embeds.masked_scatter(expanded_mask, features_aligned)
