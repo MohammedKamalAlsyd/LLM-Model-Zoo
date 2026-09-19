@@ -1,4 +1,4 @@
-"""Lightweight, optimized PaliGemma 2 processor."""
+"""Preprocessing module for PaliGemma 2 input images and text prompts."""
 
 from typing import Dict, List, Optional, Union
 import numpy as np
@@ -8,16 +8,24 @@ import torch
 from configs import PaliGemma2ProcessorConfig
 
 
-class PaliGemma2Processor:
+class PaliGemma2Preprocessor:
+    """Handles image transformation pipeline and multimodal prompt framing."""
+
     def __init__(self, tokenizer, config: Optional[PaliGemma2ProcessorConfig] = None) -> None:
+        """Initializes preprocessor with tokenizer and configuration.
+
+        Args:
+            tokenizer: Hugging Face tokenizer instance (e.g. AutoTokenizer).
+            config: PaliGemma2ProcessorConfig containing preprocessing hyperparams.
+        """
         self.config = config or PaliGemma2ProcessorConfig()
         self.tokenizer = tokenizer
-        
-        # Precompute mean and std tensors of shape (3, 1, 1) once for fast broadcasting
+
+        # Precompute mean and standard deviation tensors for broadcasting
         self.mean = torch.tensor(self.config.image_mean, dtype=torch.bfloat16).view(3, 1, 1)
         self.std = torch.tensor(self.config.image_std, dtype=torch.bfloat16).view(3, 1, 1)
 
-        # Add multimodal special tokens if not already present
+        # Register multimodal special tokens if missing
         tokens_to_add = [self.config.image_token]
         tokens_to_add += [f"<loc{i:04d}>" for i in range(self.config.num_location_tokens)]
         tokens_to_add += [f"<seg{i:03d}>" for i in range(self.config.num_segmentation_tokens)]
@@ -28,24 +36,38 @@ class PaliGemma2Processor:
         self.tokenizer.add_eos_token = False
 
     def process_image(self, image: Image.Image) -> torch.Tensor:
-        """Resizes (Bicubic: 3), rescales, and normalizes using config-defined mean and std."""
+        """Applies configured RGB conversion, resize, rescale, and normalization.
+
+        Args:
+            image: Source PIL Image.
+
+        Returns:
+            torch.Tensor of shape (3, H, W) in bfloat16.
+        """
         if not isinstance(image, Image.Image):
             raise TypeError(f"Expected PIL Image, got {type(image)}")
 
-        # Resample=3 is BICUBIC from preprocessor_config.json
-        resized = image.convert("RGB").resize(
-            (self.config.image_size, self.config.image_size),
-            resample=Image.Resampling.BICUBIC
-        )
+        # 1. Color mode conversion
+        if self.config.do_convert_rgb and image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # 2. Resize
+        if self.config.do_resize:
+            image = image.resize(
+                (self.config.image_size, self.config.image_size),
+                resample=Image.Resampling(self.config.resample),
+            )
 
         # (H, W, C) -> (C, H, W) in bfloat16
-        tensor = torch.from_numpy(np.array(resized)).permute(2, 0, 1).to(torch.bfloat16)
+        tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).to(torch.bfloat16)
 
-        # 1. Rescale (typically * 1/255.0 to [0, 1])
-        tensor = tensor * self.config.rescale_factor
+        # 3. Rescale
+        if self.config.do_rescale:
+            tensor = tensor * self.config.rescale_factor
 
-        # 2. Dynamic normalize using configured mean and std
-        tensor = (tensor - self.mean) / self.std
+        # 4. Normalize
+        if self.config.do_normalize:
+            tensor = (tensor - self.mean) / self.std
 
         return tensor
 
@@ -55,14 +77,23 @@ class PaliGemma2Processor:
         image: Optional[Image.Image] = None,
         return_tensors: str = "pt",
     ) -> Dict[str, torch.Tensor]:
+        """Prepares multimodal batch with repeated image tokens and prompt.
+
+        Args:
+            text: Text prompt string or single-item list of strings.
+            image: Optional PIL Image input.
+            return_tensors: Tensor format for tokenizer output (default: 'pt').
+
+        Returns:
+            Dictionary containing 'input_ids', 'attention_mask', and optionally 'pixel_values'.
+        """
         if isinstance(text, list):
             text = text[0]
 
         pixel_values = None
         if image is not None:
-            # (1, 3, H, W)
             pixel_values = self.process_image(image).unsqueeze(0)
-            # PaliGemma prefix format: <image>*256<bos>prompt\n
+            # PaliGemma standard prefix: 256 <image> tokens + <bos> + prompt + newline
             prompt = f"{self.config.image_token * self.config.image_seq_length}{self.tokenizer.bos_token}{text}\n"
         else:
             prompt = text

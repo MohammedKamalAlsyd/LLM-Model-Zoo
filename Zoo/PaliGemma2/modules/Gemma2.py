@@ -11,6 +11,8 @@ from Zoo.Common.RoPE import apply_rotary_pos_emb
 
 
 class Gemma2RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization with Gemma 2 offset scaling (1 + weight)."""
+
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
@@ -18,11 +20,13 @@ class Gemma2RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         normed = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        # Gemma2 offset scaling: (1 + weight)
+        # Gemma 2 offset scaling: (1 + weight)
         return (normed * (1.0 + self.weight.float())).type_as(x)
 
 
 class Gemma2MLP(nn.Module):
+    """Gated feed-forward network using approximate GeLU."""
+
     def __init__(self, cfg: Gemma2Config) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
@@ -34,6 +38,8 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2RotaryEmbedding(nn.Module):
+    """Calculates Rotary Positional Embeddings (RoPE) frequencies."""
+
     def __init__(self, cfg: Gemma2Config) -> None:
         super().__init__()
         dim = cfg.head_dim
@@ -48,6 +54,8 @@ class Gemma2RotaryEmbedding(nn.Module):
 
 
 class Gemma2Attention(nn.Module):
+    """Grouped Query Attention (GQA) with logit softcapping and corrected scaling."""
+
     def __init__(self, cfg: Gemma2Config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -55,7 +63,9 @@ class Gemma2Attention(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.kv_groups = self.num_heads // self.num_kv_heads
-        self.scaling = cfg.query_pre_attn_scalar ** -0.5
+
+        scalar = cfg.query_pre_attn_scalar if cfg.query_pre_attn_scalar is not None else float(self.head_dim)
+        self.scaling = scalar ** -0.5
         self.softcap = cfg.attn_logit_softcapping
 
         self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=cfg.attention_bias)
@@ -90,6 +100,7 @@ class Gemma2Attention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
         if self.softcap is not None:
             scores = torch.tanh(scores / self.softcap) * self.softcap
+
         if attention_mask is not None:
             scores = scores + attention_mask
 
@@ -99,10 +110,13 @@ class Gemma2Attention(nn.Module):
 
 
 class Gemma2DecoderLayer(nn.Module):
+    """Gemma 2 block featuring 4 sandwich LayerNorms."""
+
     def __init__(self, cfg: Gemma2Config, layer_idx: int) -> None:
         super().__init__()
         self.self_attn = Gemma2Attention(cfg, layer_idx)
         self.mlp = Gemma2MLP(cfg)
+
         # 4 Sandwich LayerNorms required by Gemma 2
         self.input_layernorm = Gemma2RMSNorm(cfg.hidden_size)
         self.post_attention_layernorm = Gemma2RMSNorm(cfg.hidden_size)
@@ -127,11 +141,24 @@ class Gemma2DecoderLayer(nn.Module):
         return x + mlp_out
 
 
+class Gemma2TextScaledWordEmbedding(nn.Embedding):
+    """Embedding module that scales representations by sqrt(hidden_size)."""
+
+    def __init__(self, vocab_size: int, hidden_size: int, padding_idx: Optional[int] = None) -> None:
+        super().__init__(vocab_size, hidden_size, padding_idx=padding_idx)
+        self.embed_scale = hidden_size ** 0.5
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().forward(input_ids) * self.embed_scale
+
+
 class Gemma2Model(nn.Module):
+    """Transformer decoder backbone for Gemma 2."""
+
     def __init__(self, cfg: Gemma2Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, padding_idx=cfg.pad_token_id)
+        self.embed_tokens = Gemma2TextScaledWordEmbedding(cfg.vocab_size, cfg.hidden_size, padding_idx=cfg.pad_token_id)
         self.layers = nn.ModuleList([Gemma2DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = Gemma2RMSNorm(cfg.hidden_size)
         self.rotary_emb = Gemma2RotaryEmbedding(cfg)
@@ -143,8 +170,7 @@ class Gemma2Model(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> torch.Tensor:
-        # Normalizer scaling factor
-        hidden_states = inputs_embeds * (self.cfg.hidden_size ** 0.5)
+        hidden_states = inputs_embeds
         rotary_emb = self.rotary_emb(hidden_states, position_ids)
 
         for layer in self.layers:
@@ -154,6 +180,8 @@ class Gemma2Model(nn.Module):
 
 
 class Gemma2ForCausalLM(nn.Module):
+    """Gemma 2 language model with language modeling head and final logit softcapping."""
+
     def __init__(self, cfg: Gemma2Config) -> None:
         super().__init__()
         self.cfg = cfg
@@ -161,6 +189,7 @@ class Gemma2ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
     def tie_weights(self) -> None:
+        """Ties weights between token embeddings and the LM head."""
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(

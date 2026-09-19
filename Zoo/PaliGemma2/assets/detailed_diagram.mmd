@@ -1,0 +1,117 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+    classDef cache fill:#e0f2f1,stroke:#00897b,stroke-width:2px;
+
+    %% -------------------------------------------------------------
+    %% STAGE 1: INPUT PREPARATION
+    %% -------------------------------------------------------------
+    subgraph S1 [Detailed Stage 1: Input Preprocessing]
+        direction TB
+        RawImg([Input Image]) --> P_Proc[Resize, Rescale 1/255, Normalize]:::op
+        P_Proc --> PixVal[pixel_values: B x 3 x H x W]:::tensor
+
+        RawPrompt([User Prompt]) --> P_Tok[PaliGemma Tokenizer]:::op
+        P_Tok --> InpIDs[input_ids: B x S with 256 or 1024 image tokens]:::tensor
+        P_Tok --> Attn2D[attention_mask: B x S]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 2: SIGLIP VISION ENCODER
+    %% -------------------------------------------------------------
+    subgraph S2 [Detailed Stage 2: SigLIP Vision Tower]
+        direction TB
+        PixVal --> ConvPatch[Conv2d Patch Embedding: stride=14, k=14]:::op
+        ConvPatch --> FlatPatch[Flatten & Transpose: B x N_patches x 1152]:::tensor
+        
+        FlatPatch --> PosInterp{Input H,W == Config?}:::op
+        PosInterp -- Yes --> AddStaticPos[Add Static Positional Embeddings]:::op
+        PosInterp -- No --> BicubicPos[2D Bicubic Pos Interpolation]:::op
+        BicubicPos --> AddInterpPos[Add Interpolated Embeddings]:::op
+
+        AddStaticPos --> VisEncLayers[SigLIP Transformer: 27 Blocks]:::attn
+        AddInterpPos --> VisEncLayers
+        
+        VisEncLayers --> PostLN[LayerNorm eps=1e-6]:::norm
+        PostLN --> VisTokens[vis_features: B x N_patches x 1152]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 3: MULTIMODAL PROJECTION & EMBEDDING FUSION
+    %% -------------------------------------------------------------
+    subgraph S3 [Detailed Stage 3: Projection & Fusion]
+        direction TB
+        VisTokens --> LinProj[Linear Layer: 1152 -> text_dim]:::op
+        LinProj --> ProjVis[projected: B x N_patches x D_text]:::tensor
+
+        InpIDs --> WordEmbed[Gemma2TextScaledWordEmbedding: Embedding x sqrt D]:::op
+        WordEmbed --> TxtEmbeds[inputs_embeds: B x S x D_text]:::tensor
+
+        ProjVis & InpIDs --> MaskScatter[masked_scatter at image_token_index]:::op
+        TxtEmbeds --> MaskScatter
+        MaskScatter --> FusedEmbeds[Fused inputs_embeds: B x S x D_text]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 4: GEMMA 2 AUTOREGRESSIVE BACKBONE
+    %% -------------------------------------------------------------
+    subgraph S4 [Detailed Stage 4: Gemma 2 Language Model]
+        direction TB
+        FusedEmbeds --> DecBlock[Gemma 2 Decoder: 26 or 42 Layers]
+
+        subgraph LayerDetail [Inside Each Decoder Block]
+            direction TB
+            Res1((+)) --> InLN[1. input_layernorm: RMSNorm 1+w]:::norm
+            InLN --> AttnBlock[GQA Attention: Scaling = 256^-0.5]:::attn
+            
+            subgraph AttnInternals [Attention Core]
+                AttnBlock --> RoPE[0-Indexed Float32 RoPE]:::op
+                RoPE --> Softcap1[Attn Logit Softcapping: 50.0 * tanh S/50]:::op
+                Softcap1 --> Causal4D[Unified 4D Causal + Pad Mask]:::op
+                Causal4D --> KVCacheOp[(KVCache Update)]:::cache
+            end
+
+            AttnInternals --> PostAttnLN[2. post_attention_layernorm: RMSNorm 1+w]:::norm
+            PostAttnLN --> Res1
+            Res1 --> Res2((+))
+            Res2 --> PreFFNLN[3. pre_feedforward_layernorm: RMSNorm 1+w]:::norm
+            PreFFNLN --> SwiGLU[SwiGLU MLP: gate * gelu_tanh * up -> down]:::op
+            SwiGLU --> PostFFNLN[4. post_feedforward_layernorm: RMSNorm 1+w]:::norm
+            PostFFNLN --> Res2
+        end
+
+        DecBlock --> FinalRMS[Final RMSNorm: 1+w]:::norm
+        FinalRMS --> LMHead[lm_head: D_text -> Vocab]:::op
+        LMHead --> FinalSoftcap[Final Softcapping: 30.0 * tanh L/30]:::op
+        FinalSoftcap --> Logits[logits: B x S x Vocab]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 5: OUTPUT EXTRACTION & VISUALIZATION
+    %% -------------------------------------------------------------
+    subgraph S5 [Detailed Stage 5: Output Decoding & Rendering]
+        direction TB
+        Logits --> Sample[Sampling / Greedy Argmax]:::op
+        Sample --> EOSCheck{Token in eos_token_ids 1, 107?}:::op
+
+        EOSCheck -- No --> AppendCache[Append to KVCache & Repeat Decode]:::op
+        AppendCache -.-> DecBlock
+
+        EOSCheck -- Yes --> Detok[Detokenizer]:::op
+        Detok --> RawString[Decoded String]:::tensor
+
+        RawString --> BranchCoord{Contains loc#### tokens?}:::op
+        BranchCoord -- Yes --> LocParser[Parse ymin, xmin, ymax, xmax]:::op
+        LocParser --> DrawBoxes[Draw Labeled Bounding Boxes on Image]:::op
+        DrawBoxes --> OutVisImg([Annotated PIL Image])
+
+        BranchCoord -- No --> TextOut([Clean Text Output])
+    end
+
+    %% Cross-Stage Wiring
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5

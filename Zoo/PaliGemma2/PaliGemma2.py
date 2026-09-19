@@ -1,4 +1,4 @@
-"""PaliGemma 2 Multimodal Generation Model."""
+"""PaliGemma 2 Multimodal Conditional Generation Model."""
 
 from typing import Optional
 import torch
@@ -11,7 +11,8 @@ from Zoo.Common.KV_Cache import KVCache
 
 
 class PaliGemmaMultiModalProjector(nn.Module):
-    """Explicitly typed projector that preserves 'multi_modal_projector.linear.*' keys."""
+    """Linear projector aligning vision representation dimension with language embedding space."""
+
     def __init__(self, vision_dim: int, text_dim: int) -> None:
         super().__init__()
         self.linear = nn.Linear(vision_dim, text_dim, bias=True)
@@ -21,6 +22,8 @@ class PaliGemmaMultiModalProjector(nn.Module):
 
 
 class PaliGemma2ForConditionalGeneration(nn.Module):
+    """Full PaliGemma 2 architecture unifying SigLIP and Gemma 2."""
+
     def __init__(self, config: Optional[PaliGemma2Config] = None) -> None:
         super().__init__()
         self.config = config or PaliGemma2Config()
@@ -38,6 +41,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         self.language_model = Gemma2ForCausalLM(self.config.text_config)
 
     def tie_weights(self) -> None:
+        """Ties LM head weights with word embeddings."""
         self.language_model.tie_weights()
 
     def forward(
@@ -46,40 +50,57 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         kv_cache: Optional[KVCache] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> dict:
+        """Forward pass for multimodal prefill and autoregressive decode.
+
+        Args:
+            input_ids: (Batch, Seq_Len) token IDs.
+            kv_cache: KVCache instance for caching past key/values.
+            pixel_values: Optional (Batch, 3, H, W) normalized image tensor.
+            attention_mask: Optional 2D binary attention mask (1 for valid, 0 for pad).
+
+        Returns:
+            Dict containing output logits: {"logits": (Batch, Seq_Len, Vocab_Size)}.
+        """
         b, seq_len = input_ids.shape
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Prefill visual tokens
         if pixel_values is not None:
             vis_features = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
-            projected = self.multi_modal_projector.linear(vis_features)
-            
-            # Normalization scale required by Gemma
-            projected = projected / (self.config.text_config.hidden_size ** 0.5)
+            projected = self.multi_modal_projector(vis_features)
 
-            # Scatter visual embeddings where input_ids == image_token_index
+            # Scatter projected visual tokens where input_ids == image_token_index
             mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
             inputs_embeds = inputs_embeds.masked_scatter(mask, projected.view(-1, inputs_embeds.shape[-1]))
 
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-
-        # Unified position IDs and causal mask calculation
-        cache_len = kv_cache.num_items() if kv_cache else 0
+        # Cache lengths and total sequence length
+        cache_len = kv_cache.num_items() if kv_cache is not None else 0
         total_len = cache_len + seq_len
 
-        # Causal mask (0.0 for attend, -inf for masked)
+        # Strictly 0-indexed position IDs
+        if attention_mask is not None and attention_mask.shape[-1] == total_len:
+            pos_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)[:, -seq_len:]
+        else:
+            pos_ids = torch.arange(cache_len, total_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(b, -1)
+
+        # Construct 4D causal attention mask (0.0 for attend, -inf for masked)
         causal_mask = torch.zeros(b, 1, seq_len, total_len, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         if seq_len > 1:
-            causal_triu = torch.triu(torch.full((seq_len, total_len), float("-inf"), device=inputs_embeds.device), diagonal=cache_len + 1)
+            causal_triu = torch.triu(
+                torch.full((seq_len, total_len), float("-inf"), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
+                diagonal=cache_len + 1,
+            )
             causal_mask = causal_mask + causal_triu
 
-        pos_ids = attention_mask.cumsum(-1)[:, -seq_len:]
+        # Apply padding mask if provided
+        if attention_mask is not None and attention_mask.shape[-1] == total_len:
+            pad_mask = (attention_mask == 0).view(b, 1, 1, total_len)
+            causal_mask = causal_mask.masked_fill(pad_mask, float("-inf"))
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
-            attention_mask=causal_mask,
             position_ids=pos_ids,
+            attention_mask=causal_mask,
             past_key_values=kv_cache,
         )

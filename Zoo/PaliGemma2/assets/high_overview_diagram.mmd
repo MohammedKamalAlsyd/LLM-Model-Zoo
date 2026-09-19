@@ -1,0 +1,39 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef visionStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef connectStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef lmStyle fill:#ede7f6,stroke:#4527a0,stroke-width:2px;
+    classDef outputStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Stage_Inputs [Stage 1: Multimodal Inputs]
+        Img[Raw Input Image]:::inputStyle
+        Txt[Text Prompt]:::inputStyle
+    end
+
+    subgraph Stage_Vision [Stage 2: Vision Tower]
+        SigLip[SigLIP Vision Tower]:::visionStyle
+    end
+
+    subgraph Stage_Projector [Stage 3: Multimodal Neck]
+        Proj[Linear Projector]:::connectStyle
+    end
+
+    subgraph Stage_Language [Stage 4: Language Backbone]
+        Gemma[Gemma 2 Decoder]:::lmStyle
+        KVCache[(KV Cache)]:::lmStyle
+    end
+
+    subgraph Stage_Outputs [Stage 5: Postprocessing & Multimodal Output]
+        OutText[Text Prediction / VQA]:::outputStyle
+        OutBBox[Bounding Boxes <loc####>]:::outputStyle
+        OutSeg[Segmentation Tokens <seg###>]:::outputStyle
+    end
+
+    Img -->|Resize / Normalize| SigLip
+    SigLip -->|Patch Tokens| Proj
+    Proj -->|Visual Embeddings| Gemma
+    Txt -->|Token Embeddings| Gemma
+    Gemma <-->|Read / Write| KVCache
+    Gemma -->|Generated Tokens| OutText
+    Gemma -->|Generated Tokens| OutBBox
+    Gemma -->|Generated Tokens| OutSeg
