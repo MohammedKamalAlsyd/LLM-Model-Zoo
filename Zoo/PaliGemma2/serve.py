@@ -1,7 +1,12 @@
-"""Gradio Web Server for PaliGemma 2 with modular Preprocessing & Postprocessing."""
+"""Gradio Web Server for PaliGemma 2 with interactive task examples.
+
+Supports Captioning, VQA, Object Detection (<loc####>), and Segmentation (<seg###>).
+"""
 
 import os
 import sys
+import urllib.request
+from pathlib import Path
 from typing import Optional, Tuple
 import gradio as gr
 from PIL import Image
@@ -20,13 +25,34 @@ from Zoo.PaliGemma2.processing.PaliGemma2Postprocessor import PaliGemma2Postproc
 from Zoo.Common.KV_Cache import KVCache
 from Zoo.Common.model_loader import load_hf_model_weights
 
-HF_REPO = "google/paligemma2-3b-pt-224"
+# Recommended: 10B mix checkpoint for accurate multi-task instruction following
+HF_REPO = "google/paligemma2-10b-mix-448"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
 
+# Path to cached demo images
+EXAMPLES_DIR = Path(__file__).parent / "assets" / "examples"
+EXAMPLE_IMAGES = {
+    "animals.jpg": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats_and_dogs.jpg",
+    "street.png": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/coco_sample.png",
+}
+
+
+def ensure_example_assets() -> None:
+    """Downloads lightweight sample images if not already present."""
+    EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    for filename, url in EXAMPLE_IMAGES.items():
+        filepath = EXAMPLES_DIR / filename
+        if not filepath.exists():
+            try:
+                print(f"Downloading sample image: {filename}...")
+                urllib.request.urlretrieve(url, filepath)
+            except Exception as e:
+                print(f"Notice: Could not download {filename}: {e}")
+
 
 def get_model_and_pipeline():
-    """Downloads weights and initializes the model, preprocessor, and postprocessor."""
+    """Initializes model, preprocessor, and postprocessor."""
     config = PaliGemma2Config()
     model = PaliGemma2ForConditionalGeneration(config)
 
@@ -37,6 +63,7 @@ def get_model_and_pipeline():
         device=DEVICE,
         dtype=DTYPE,
     )
+    # Tie LM head to word embeddings (resolves missing lm_head.weight key)
     model.tie_weights()
 
     tokenizer = AutoTokenizer.from_pretrained(cache_dir, padding_side="right")
@@ -105,22 +132,23 @@ def generate(
 
 
 def main():
+    ensure_example_assets()
     model, preprocessor, postprocessor = get_model_and_pipeline()
 
     def run_inference(image, prompt, max_new, temp):
         if not image:
-            return "Please upload an image.", None
-        prompt = prompt or "describe this image"
+            return "Please provide an image.", None
+        prompt = prompt or "caption en"
         try:
             return generate(model, preprocessor, postprocessor, image, prompt, int(max_new), float(temp))
         except Exception as e:
             return f"Error: {e}", None
 
     with gr.Blocks(title="PaliGemma 2") as app:
-        gr.Markdown(f"## PaliGemma 2 (3B) — {DEVICE.upper()}")
+        gr.Markdown(f"## PaliGemma 2 — `{HF_REPO}` ({DEVICE.upper()})")
         gr.Markdown(
-            "Supports standard **VQA / Captioning** as well as **Object Detection** "
-            "(e.g., prompt: `detect person ; dog ; car`)."
+            "Select an example below or upload your own image to test **Captioning**, **VQA**, "
+            "**Object Detection**, and **Segmentation**."
         )
 
         with gr.Row():
@@ -128,23 +156,47 @@ def main():
                 input_img = gr.Image(type="pil", label="Input Image")
                 prompt_input = gr.Textbox(
                     label="Prompt",
-                    value="describe this image",
-                    placeholder="e.g. 'describe this image' or 'detect dog ; cat'",
+                    value="caption en",
+                    placeholder="e.g. 'caption en', 'answer en <question>', 'detect <label>', 'segment <label>'",
                 )
                 with gr.Row():
-                    tokens_slider = gr.Slider(10, 500, 100, step=1, label="Max Tokens")
+                    tokens_slider = gr.Slider(10, 500, 120, step=1, label="Max Tokens")
                     temp_slider = gr.Slider(0.0, 1.0, 0.0, step=0.1, label="Temperature")
                 btn = gr.Button("Submit", variant="primary")
 
             with gr.Column():
                 output_text = gr.Textbox(label="Generated Text")
-                output_img = gr.Image(type="pil", label="Detected Objects")
+                output_img = gr.Image(type="pil", label="Visual Annotations (Detection / Segmentation)")
 
         btn.click( # type: ignore
             run_inference,
             inputs=[input_img, prompt_input, tokens_slider, temp_slider],
             outputs=[output_text, output_img],
         )
+
+        # Example configurations representing each major task
+        animals_path = str(EXAMPLES_DIR / "animals.jpg")
+        street_path = str(EXAMPLES_DIR / "street.png")
+
+        candidate_examples = [
+            # [Image, Prompt, Max Tokens, Temp]
+            [animals_path, "caption en", 64, 0.0],
+            [animals_path, "answer en What animals are sitting together?", 64, 0.0],
+            [animals_path, "detect cat ; dog", 128, 0.0],
+            [animals_path, "segment dog", 128, 0.0],
+            [street_path, "describe en", 128, 0.0],
+            [street_path, "detect person ; car", 128, 0.0],
+        ]
+
+        valid_examples = [ex for ex in candidate_examples if os.path.exists(ex[0])]
+        if valid_examples:
+            gr.Examples(
+                examples=valid_examples,
+                inputs=[input_img, prompt_input, tokens_slider, temp_slider],
+                outputs=[output_text, output_img],
+                fn=run_inference,
+                cache_examples=False,
+            )
 
     app.launch(server_name="0.0.0.0", share=True)
 
