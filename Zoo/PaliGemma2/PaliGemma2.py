@@ -67,7 +67,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         b, seq_len = input_ids.shape
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # 1. Fuse Image Features (Matches official masked_scatter)
+        # 1. Fuse Image Features (guarded strictly to prefill stage)
         if pixel_values is not None:
             vis_features = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
             projected = self.multi_modal_projector(vis_features)
@@ -79,27 +79,26 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
                 image_token_id=self.config.image_token_index,
             )
 
-        # Cache lengths and total sequence length
+        # 2. Sequence geometry and cache
         cache_len = kv_cache.num_items() if kv_cache is not None else 0
         total_len = cache_len + seq_len
 
+        # 0-indexed position IDs for Gemma 2 RoPE
         pos_ids = torch.arange(
             cache_len, total_len, device=input_ids.device, dtype=torch.long
         ).unsqueeze(0).expand(b, -1)
 
         # 3. Proper Causal & Padding Masking
-        causal_mask = None
-        if seq_len > 1 or cache_len > 0:
-            causal_mask = create_causal_mask(
-                seq_len=seq_len,
-                past_length=cache_len,
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                sliding_window=self.config.text_config.sliding_window,
-            )
-            if attention_mask is not None:
-                pad_mask = (1.0 - attention_mask[:, None, None, :].to(inputs_embeds.dtype)) * torch.finfo(inputs_embeds.dtype).min
-                causal_mask = causal_mask + pad_mask
+        causal_mask = create_causal_mask(
+            seq_len=seq_len,
+            past_length=cache_len,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            sliding_window=self.config.text_config.sliding_window,
+        )
+        if attention_mask is not None and attention_mask.shape[-1] == total_len:
+            pad_mask = (attention_mask == 0).view(b, 1, 1, total_len)
+            causal_mask = causal_mask.masked_fill(pad_mask, float("-inf"))
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
