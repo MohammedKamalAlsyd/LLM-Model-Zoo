@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 import torch.nn.functional as F
 
@@ -34,3 +36,44 @@ def interpolate_2d_pos_embed(
         align_corners=False,
     )
     return pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+
+def generate_block_attention_mask(
+    patch_counts: List[int],
+    device: torch.device,
+    as_boolean: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Constructs a block-diagonal attention mask for variable-sized image sequences.
+
+    Ensures patches from Image A attend exclusively to Image A, preventing cross-image leakage.
+
+    Args:
+        patch_counts: List containing the number of patches per image.
+        device: Target execution device.
+        as_boolean: If True, returns a boolean mask (True=attend, False=mask) for SDPA.
+                    If False, returns an additive float mask (0.0=attend, -inf=mask).
+        dtype: Floating point precision used when as_boolean=False.
+
+    Returns:
+        Tensor of shape (1, 1, total_tokens, total_tokens).
+    """
+    total_tokens = sum(patch_counts)
+
+    if as_boolean:
+        # True = allow attention, False = disallow attention (SDPA native convention)
+        mask = torch.zeros((total_tokens, total_tokens), dtype=torch.bool, device=device)
+        start = 0
+        for count in patch_counts:
+            end = start + count
+            mask[start:end, start:end] = True
+            start = end
+    else:
+        neg_inf = torch.finfo(dtype).min
+        mask = torch.full((total_tokens, total_tokens), fill_value=neg_inf, dtype=dtype, device=device)
+        start = 0
+        for count in patch_counts:
+            end = start + count
+            mask[start:end, start:end] = 0.0
+            start = end
+
+    return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
