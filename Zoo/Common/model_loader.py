@@ -4,6 +4,7 @@ auto-dtype detection, and global strict key enforcement.
 """
 
 import gc
+import json
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -48,6 +49,7 @@ def load_hf_model_weights(
     model: torch.nn.Module,
     repo_id: str,
     allow_patterns: Optional[List[str]] = None,
+    ignore_patterns: Optional[List[str]] = None,
     strict: bool = True,
     device: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
@@ -69,17 +71,33 @@ def load_hf_model_weights(
 
     if allow_patterns is None:
         allow_patterns = ["*.safetensors", "*.pt", "*.bin", "*.json"]
+    if ignore_patterns is None:
+        # Exclude Mistral's raw single-file consolidated weights to save 50% download/disk
+        ignore_patterns = ["*consolidated*.safetensors", "consolidated.safetensors"]
 
     print(f"Fetching weights for '{repo_id}' from Hugging Face Cache...")
     cache_dir = Path(
         snapshot_download(
             repo_id=repo_id,
             allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
             token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
         )
     )
 
-    safetensors_files = sorted(list(cache_dir.glob("*.safetensors")))
+    # 1. Determine exact safetensors shard files to load
+    index_file = cache_dir / "model.safetensors.index.json"
+    if index_file.exists():
+        with open(index_file, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        shard_names = sorted(list(set(index_data.get("weight_map", {}).values())))
+        safetensors_files = [cache_dir / name for name in shard_names if (cache_dir / name).exists()]
+    else:
+        # Fallback globbing, strictly ignoring consolidated weights
+        safetensors_files = sorted(
+            [p for p in cache_dir.glob("*.safetensors") if "consolidated" not in p.name.lower()]
+        )
+
     pt_files = sorted(list(cache_dir.glob("*.pt"))) + sorted(list(cache_dir.glob("*.bin")))
 
     # Convert model parameters to target dtype first
@@ -92,7 +110,7 @@ def load_hf_model_weights(
 
     print(f"Loading weights (Target: {resolved_device}, {resolved_dtype}, strict={strict})...")
 
-    # 1. Safetensors streaming: process one shard at a time to prevent RAM spikes
+    # 2. Safetensors streaming: process one shard at a time
     if safetensors_files:
         for idx, shard_file in enumerate(safetensors_files):
             print(f"  Streaming shard {idx + 1}/{len(safetensors_files)}: {shard_file.name}...")
@@ -105,13 +123,12 @@ def load_hf_model_weights(
             converted_shard = {k: v.to(dtype=resolved_dtype) for k, v in shard_dict.items()}
             del shard_dict
 
-            # strict=False is required per-shard; global strictness is checked below
             model.load_state_dict(converted_shard, strict=False)
 
             del converted_shard
             gc.collect()
 
-    # 2. PyTorch binary fallback
+    # 3. PyTorch binary fallback
     elif pt_files:
         for idx, shard_file in enumerate(pt_files):
             print(f"  Loading binary checkpoint: {shard_file.name}...")
@@ -131,15 +148,18 @@ def load_hf_model_weights(
             del converted
             gc.collect()
     else:
-        raise FileNotFoundError(f"No checkpoint files found in {cache_dir}")
+        raise FileNotFoundError(f"No valid checkpoint shards found in {cache_dir}")
 
-    # Automatically tie weights if model supports it (resolves deduplicated lm_head.weight)
+    # 4. Automatically tie weights if model supports it (resolves omitted lm_head.weight)
     if hasattr(model, "tie_weights"):
         tie_weights_fn = getattr(model, "tie_weights", None)
         if callable(tie_weights_fn):
             tie_weights_fn()
+            # Remove tied keys from missing_keys since they are now bound to embed_tokens
+            missing_keys.discard("language_model.lm_head.weight")
+            missing_keys.discard("lm_head.weight")
 
-    # Enforce global strictness across all shards
+    # 5. Enforce global strictness across all shards
     if strict:
         error_msgs = []
         if unexpected_keys:
