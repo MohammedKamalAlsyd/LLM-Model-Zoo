@@ -22,6 +22,7 @@ from Zoo.PaliGemma2.configs import PaliGemma2Config
 from Zoo.PaliGemma2.PaliGemma2 import PaliGemma2ForConditionalGeneration
 from Zoo.PaliGemma2.processing.PaliGemma2Preprocessor import PaliGemma2Preprocessor
 from Zoo.PaliGemma2.processing.PaliGemma2Postprocessor import PaliGemma2Postprocessor
+from Zoo.PaliGemma2.modules.MaskDecoder import load_mask_decoder
 from Zoo.Common.KV_Cache import KVCache
 from Zoo.Common.model_loader import load_hf_model_weights
 
@@ -105,7 +106,10 @@ def get_model_and_pipeline():
 
     tokenizer = AutoTokenizer.from_pretrained(cache_dir, padding_side="right")
     preprocessor = PaliGemma2Preprocessor(tokenizer)
-    postprocessor = PaliGemma2Postprocessor(tokenizer)
+    
+    # Load UViM mask decoder for instance segmentation
+    mask_decoder = load_mask_decoder(device=DEVICE)
+    postprocessor = PaliGemma2Postprocessor(tokenizer, mask_decoder=mask_decoder)
     return model, preprocessor, postprocessor
 
 
@@ -138,7 +142,9 @@ def generate(
         kv_cache=kv_cache,
     )
     next_logits = outputs["logits"][:, -1, :]
-    eos_ids = model.config.eos_token_ids
+    
+    # Stop on EOS (1), End-of-turn (107), or Newline tokens (\n: 108 and 13)
+    eos_ids = set(model.config.eos_token_ids) | {108, 13}
 
     # 2. Decode loop
     for _ in range(max_tokens):
