@@ -88,7 +88,7 @@ class PaliGemma2Preprocessor:
         if image is not None:
             pixel_values = self.process_image(image).unsqueeze(0)
             # PaliGemma standard prefix: 256 <image> tokens + <bos> + prompt + newline
-            prompt = f"{self.tokenizer.bos_token}{self.config.image_token * self.config.image_seq_length}{text}\n"
+            prompt = f"{self.config.image_token * self.config.image_seq_length}{self.tokenizer.bos_token}{text}\n"
         else:
             prompt = text
 
