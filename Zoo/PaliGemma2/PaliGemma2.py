@@ -88,14 +88,13 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             cache_len, total_len, device=input_ids.device, dtype=torch.long
         ).unsqueeze(0).expand(b, -1)
 
-        # 3. Proper Causal & Padding Masking
-        causal_mask = create_causal_mask(
-            seq_len=seq_len,
-            past_length=cache_len,
+        # 3. Proper Prefix-Bidirectional Attention Masking
+        causal_mask = torch.zeros(
+            (b, 1, seq_len, total_len),
             dtype=inputs_embeds.dtype,
             device=inputs_embeds.device,
-            sliding_window=self.config.text_config.sliding_window,
         )
+
         if attention_mask is not None and attention_mask.shape[-1] == total_len:
             pad_mask = (attention_mask == 0).view(b, 1, 1, total_len)
             causal_mask = causal_mask.masked_fill(pad_mask, float("-inf"))
