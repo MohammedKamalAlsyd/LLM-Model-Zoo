@@ -65,12 +65,11 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         b, seq_len = input_ids.shape
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Prefill visual tokens
+        # 1. Fuse Image Features (Matches official masked_scatter)
         if pixel_values is not None:
             vis_features = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
             projected = self.multi_modal_projector(vis_features)
 
-            # Scatter projected visual tokens where input_ids == image_token_index
             mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
             inputs_embeds = inputs_embeds.masked_scatter(mask, projected.view(-1, inputs_embeds.shape[-1]))
 
@@ -78,22 +77,9 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         cache_len = kv_cache.num_items() if kv_cache is not None else 0
         total_len = cache_len + seq_len
 
-        # Strictly 0-indexed position IDs
-        if attention_mask is not None and attention_mask.shape[-1] == total_len:
-            pos_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)[:, -seq_len:]
-        else:
-            pos_ids = torch.arange(cache_len, total_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(b, -1)
-
-        # Construct 4D causal attention mask (0.0 for attend, -inf for masked)
+        # Position IDs start at 1, NOT 0:
+        pos_ids = (torch.arange(cache_len, total_len, device=input_ids.device, dtype=torch.long) + 1).unsqueeze(0).expand(b, -1)
         causal_mask = torch.zeros(b, 1, seq_len, total_len, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-        if seq_len > 1:
-            causal_triu = torch.triu(
-                torch.full((seq_len, total_len), float("-inf"), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
-                diagonal=cache_len + 1,
-            )
-            causal_mask = causal_mask + causal_triu
-
-        # Apply padding mask if provided
         if attention_mask is not None and attention_mask.shape[-1] == total_len:
             pad_mask = (attention_mask == 0).view(b, 1, 1, total_len)
             causal_mask = causal_mask.masked_fill(pad_mask, float("-inf"))

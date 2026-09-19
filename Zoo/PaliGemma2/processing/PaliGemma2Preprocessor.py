@@ -25,12 +25,6 @@ class PaliGemma2Preprocessor:
         self.mean = torch.tensor(self.config.image_mean, dtype=torch.bfloat16).view(3, 1, 1)
         self.std = torch.tensor(self.config.image_std, dtype=torch.bfloat16).view(3, 1, 1)
 
-        # Register multimodal special tokens if missing
-        tokens_to_add = [self.config.image_token]
-        tokens_to_add += [f"<loc{i:04d}>" for i in range(self.config.num_location_tokens)]
-        tokens_to_add += [f"<seg{i:03d}>" for i in range(self.config.num_segmentation_tokens)]
-        self.tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.config.image_token)
         self.tokenizer.add_bos_token = False
         self.tokenizer.add_eos_token = False
@@ -94,7 +88,7 @@ class PaliGemma2Preprocessor:
         if image is not None:
             pixel_values = self.process_image(image).unsqueeze(0)
             # PaliGemma standard prefix: 256 <image> tokens + <bos> + prompt + newline
-            prompt = f"{self.config.image_token * self.config.image_seq_length}{self.tokenizer.bos_token}{text}\n"
+            prompt = f"{self.tokenizer.bos_token}{self.config.image_token * self.config.image_seq_length}{text}\n"
         else:
             prompt = text
 
