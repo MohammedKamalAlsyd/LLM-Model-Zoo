@@ -52,7 +52,7 @@ PRESET_CONFIG = {
     },
     "Segmentation - Cats": {
         "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
-        "prompt": "segment cat",
+        "prompt": "segment cat on the left",
         "max_tokens": 128,
         "temperature": 0.0,
     },
