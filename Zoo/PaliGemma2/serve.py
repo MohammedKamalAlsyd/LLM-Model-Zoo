@@ -25,7 +25,7 @@ from Zoo.PaliGemma2.processing.PaliGemma2Postprocessor import PaliGemma2Postproc
 from Zoo.Common.KV_Cache import KVCache
 from Zoo.Common.model_loader import load_hf_model_weights
 
-HF_REPO = "google/paligemma2-10b-mix-448"
+HF_REPO = "google/paligemma2-3b-mix-224"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
 
