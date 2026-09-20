@@ -63,33 +63,39 @@ class Mistral3PatchMerger(nn.Module):
             Tensor of shape (total_merged_patches, vision_hidden).
         """
         patch_grid_sizes = [
-            (int(size[0].item()) // self.patch_size, int(size[1].item()) // self.patch_size)
+            (int(size[0]) // self.patch_size, int(size[1]) // self.patch_size)
             for size in image_sizes
         ]
         tokens_per_image = [h * w for h, w in patch_grid_sizes]
         embed_dim = image_features.shape[-1]
         m = self.spatial_merge_size
 
-        merged_blocks: List[torch.Tensor] = []
+        merged_blocks = []
 
         # Process each image independently based on its original 2D grid
         for img_tokens, (hp, wp) in zip(image_features.split(tokens_per_image), patch_grid_sizes):
             # Reshape to 2D patch grid: (hp, wp, embed_dim)
-            grid = img_tokens.view(hp, wp, embed_dim)
-
-            # Group into non-overlapping spatial blocks of (m x m)
-            # (hp // m, m, wp // m, m, embed_dim) -> (hp // m, wp // m, m, m, embed_dim)
-            h_merged = hp // m
-            w_merged = wp // m
-            grid = grid.view(h_merged, m, w_merged, m, embed_dim).permute(0, 2, 1, 3, 4).contiguous()
-
-            # Flatten each (m x m) patch neighborhood while keeping embed_dim contiguous
-            grid = grid.view(h_merged * w_merged, m * m * embed_dim)
+            image_grid = img_tokens.view(hp, wp, embed_dim)
+            
+            # Move channel/embed dim to front and add batch dim for unfold: (1, embed_dim, hp, wp)
+            image_grid = image_grid.permute(2, 0, 1).unsqueeze(0)
+            
+            # Use unfold to extract non-overlapping blocks of size spatial_merge_size
+            grid = torch.nn.functional.unfold(
+                image_grid,
+                kernel_size=m,
+                stride=m,
+            )
+            
+            # grid shape -> (1, embed_dim * m^2, N_windows)
+            # Reshape to (N_windows, embed_dim * m^2) 
+            grid = grid.view(embed_dim * m**2, -1).t()
             merged_blocks.append(grid)
 
         # Concatenate across all images in batch and project
         merged_tensor = torch.cat(merged_blocks, dim=0)
         return self.merging_layer(merged_tensor)
+
 
 
 class Mistral3MultiModalProjector(nn.Module):
