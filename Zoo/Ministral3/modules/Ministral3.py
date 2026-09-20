@@ -89,8 +89,8 @@ class Ministral3RotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         freqs = position_ids.unsqueeze(-1).float() @ self.inv_freq[None, None, :].float()
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = (emb.cos() * self.attention_scaling).to(dtype=x.dtype)
-        sin = (emb.sin() * self.attention_scaling).to(dtype=x.dtype)
+        cos = (emb.cos()).to(dtype=x.dtype)
+        sin = (emb.sin()).to(dtype=x.dtype)
         return cos, sin
 
 

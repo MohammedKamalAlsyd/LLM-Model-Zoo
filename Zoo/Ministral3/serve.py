@@ -1,18 +1,25 @@
 """Interactive Gradio Web Server for Ministral-3 Multimodal.
 
-Supports both multimodal (Image + Text) and pure text-only conversations
-with autoregressive KV-cached decoding.
+Supports on-the-fly preset loading, visual QA, landmark identification,
+exhaustive scene description, OCR transcription, and pure text reasoning.
 """
 
 import os
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
-from typing import Any, Optional, Tuple
-import torch
-import gradio as gr
-from transformers import AutoProcessor
+from typing import Any, Dict, Optional, Tuple, Union
 
-# Setup pathing to allow absolute imports from 'Zoo'
+import gradio as gr
+from PIL import Image
+import torch
+from transformers import AutoProcessor
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Setup pathing to allow absolute imports from repository root
 current_path = Path(__file__).resolve()
 root_node = next(p for p in current_path.parents if (p / "Zoo").exists())
 if str(root_node) not in sys.path:
@@ -23,94 +30,159 @@ from Zoo.Common.model_loader import auto_detect_device_and_dtype, load_hf_model_
 from Zoo.Ministral3.configs import Ministral3MultimodalConfig
 from Zoo.Ministral3.Ministral3Multimodal import Mistral3ForConditionalGeneration
 
-# --- Constants & Configuration ---
+# --- Constants & Global Configuration ---
 HF_REPO = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
 CONFIG_FILE = Path(__file__).parent / "config.json"
+DEVICE, DTYPE = auto_detect_device_and_dtype()
+
+# Reliable public reference images (Wikimedia Commons and COCO val2017)
+PRESET_CONFIG = {
+    "Landmark - Great Pyramid of Giza": {
+        "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e3/Kheops-Pyramid.jpg/640px-Kheops-Pyramid.jpg",
+        "prompt": "Identify this landmark and describe its architectural and visual features in detail.",
+        "max_tokens": 256,
+        "temperature": 0.1,
+    },
+    "VQA - Two Sleeping Cats": {
+        "image": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "prompt": "What animals are visible on the couch, and what electronic accessories are lying nearby?",
+        "max_tokens": 128,
+        "temperature": 0.1,
+    },
+    "Detailed Scene - Living Room": {
+        "image": "http://images.cocodataset.org/val2017/000000000139.jpg",
+        "prompt": "Provide a comprehensive, high-precision description of this room, its furniture, and ambient lighting.",
+        "max_tokens": 256,
+        "temperature": 0.1,
+    },
+    "OCR & Scene Understanding - Street Clock": {
+        "image": "http://images.cocodataset.org/val2017/000000000285.jpg",
+        "prompt": "Describe what is shown in this outdoor street scene, noting any prominent structures or time displays.",
+        "max_tokens": 160,
+        "temperature": 0.1,
+    },
+    "Visual Reasoning - Kitchen Appliances": {
+        "image": "http://images.cocodataset.org/val2017/000000000632.jpg",
+        "prompt": "Analyze the state of this kitchen. What appliances are visible, and does the countertop appear occupied?",
+        "max_tokens": 160,
+        "temperature": 0.1,
+    },
+    "Pure Text - Technical Architecture": {
+        "image": None,
+        "prompt": "Explain the architectural difference between Grouped-Query Attention (GQA) and Multi-Head Attention (MHA). Why does GQA save memory?",
+        "max_tokens": 256,
+        "temperature": 0.2,
+    },
+}
 
 
-def load_model_and_processor() -> Tuple[Mistral3ForConditionalGeneration, Any, str, torch.dtype]:
-    """Loads model configuration, streams safetensors shards, and initializes processor."""
-    device, dtype = auto_detect_device_and_dtype()
-    print(f"Initializing Ministral-3 Multimodal on {device.upper()} in {dtype}...")
+def download_if_url(image_path: Optional[str]) -> Optional[str]:
+    """Downloads remote image URLs to a local temporary cache on the fly."""
+    if not image_path:
+        return None
+    if isinstance(image_path, str) and image_path.startswith(("http://", "https://")):
+        cache_dir = os.path.join(tempfile.gettempdir(), "ministral3_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        local_filename = os.path.join(cache_dir, os.path.basename(image_path.split("?")[0]))
+        if not os.path.exists(local_filename):
+            print(f"Downloading sample image on the fly: {image_path}...")
+            # Custom User-Agent prevents 403 Forbidden errors from Wikimedia/COCO
+            req = urllib.request.Request(image_path, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=15) as response, open(local_filename, "wb") as out_file:
+                out_file.write(response.read())
+        return local_filename
+    return image_path
 
-    # Load configuration
+
+def load_model_and_processor() -> Tuple[Mistral3ForConditionalGeneration, Any]:
+    """Initializes Ministral-3 model configuration, weights, and processor."""
+    print(f"Initializing Ministral-3 Multimodal on {DEVICE.upper()} in {DTYPE}...")
+
     if CONFIG_FILE.exists():
         config = Ministral3MultimodalConfig.from_json_file(CONFIG_FILE)
     else:
-        # Fallback to defaults matching 3B checkpoint
         config = Ministral3MultimodalConfig()
 
     model = Mistral3ForConditionalGeneration(config)
 
-    # Universal shard-by-shard streaming loader with global strict key verification
+    # Universal shard streaming loader matching checkpoints 1:1
     load_hf_model_weights(
         model=model,
         repo_id=HF_REPO,
         strict=True,
-        device=device,
-        dtype=dtype,
+        device=DEVICE,
+        dtype=DTYPE,
     )
 
-    print("Loading Hugging Face AutoProcessor...")
+    print("Loading AutoProcessor...")
     processor = AutoProcessor.from_pretrained(HF_REPO)
-    return model, processor, device, dtype
+    return model, processor
 
 
-# Initialize globally
-model, processor, DEVICE, DTYPE = load_model_and_processor()
+# Initialize model and processor globally
+MODEL, PROCESSOR = load_model_and_processor()
 
 
 @torch.no_grad()
 def generate(
-    image: Any,
+    model: Mistral3ForConditionalGeneration,
+    processor: Any,
+    image: Optional[Image.Image],
     prompt: str,
-    max_tokens: int = 512,
-    temperature: float = 0.2,
-    repetition_penalty: float = 1.15,
+    max_tokens: int = 256,
+    temperature: float = 0.1,
+    repetition_penalty: float = 1.0,  # Default 1.0 avoids phonetic token degeneration
 ) -> str:
-    """Runs generation supporting both Text-Only and Multimodal prompts."""
+    """Runs conditioned autoregressive inference supporting text and image-text inputs."""
     if not prompt.strip() and image is None:
-        return "Please enter a prompt or upload an image."
+        return "Please provide an image or enter a text prompt."
 
-    # 1. System Prompt prevents the model from falling back to text-only RLHF disclaimers
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": (
-                "You are an advanced multimodal AI assistant. You can see, analyze, "
-                "and describe images directly and with high precision."
-            ),
-        }
-    ]
-
+    # 1. Structure message format aligned with HF multimodal chat templates
     if image is not None:
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        })
-    else:
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-            ],
-        })
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        # Modern processor handles both visual features and token grid simultaneously
+        try:
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                add_generation_prompt=True,
+            )
+        except Exception:
+            # Fallback for processor variants requiring explicit string formatting
+            formatted_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = processor(images=image, text=formatted_text, return_tensors="pt")
 
-    formatted_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+        pixel_values = inputs.get("pixel_values", None)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(DEVICE, dtype=DTYPE)
 
-    # 2. Tokenize and preprocess
-    if image is not None:
-        inputs = processor(images=image, text=formatted_text, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
         image_sizes = inputs.get("image_sizes", None)
-        if image_sizes is not None:
+        if image_sizes is not None and isinstance(image_sizes, torch.Tensor):
             image_sizes = image_sizes.to(DEVICE)
     else:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        formatted_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         inputs = processor(text=formatted_text, return_tensors="pt")
         pixel_values = None
         image_sizes = None
@@ -121,7 +193,7 @@ def generate(
         attention_mask = attention_mask.to(DEVICE)
 
     # =========================================================================
-    # 3. Prefill Phase
+    # 2. Prefill Phase
     # =========================================================================
     kv_cache = KVCache()
     outputs = model(
@@ -135,13 +207,18 @@ def generate(
 
     next_token_logits = outputs["logits"][:, -1, :]
     generated_tokens = []
+    
+    # Extract model EOS and stop identifiers
     eos_token_id = processor.tokenizer.eos_token_id
+    stop_token_ids = {eos_token_id}
+    if hasattr(model.config, "text_config") and hasattr(model.config.text_config, "eos_token_id"):
+        stop_token_ids.add(model.config.text_config.eos_token_id)
 
     # =========================================================================
-    # 4. Decode Phase with Repetition Penalty
+    # 3. Autoregressive Decode Phase
     # =========================================================================
     for _ in range(max_tokens):
-        # Apply repetition penalty to prevent punctuation stuttering
+        # Repetition penalty applied across unique previously generated tokens
         if repetition_penalty != 1.0 and generated_tokens:
             for prev_token in set(generated_tokens):
                 if next_token_logits[0, prev_token] < 0:
@@ -156,11 +233,12 @@ def generate(
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
         token_id = next_token.item()
-        if token_id == eos_token_id:
+        if token_id in stop_token_ids:
             break
 
         generated_tokens.append(token_id)
 
+        # Autoregressive forward step bypasses vision tower
         outputs = model(
             input_ids=next_token,
             pixel_values=None,
@@ -170,67 +248,124 @@ def generate(
         )
         next_token_logits = outputs["logits"][:, -1, :]
 
-    return processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    return processor.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-# =============================================================================
-# Gradio Interface
-# =============================================================================
+def on_preset_change(preset_name: str) -> Tuple[str, Optional[str], int, float]:
+    """Swaps prompt, image preview, and sampling parameters when a preset is selected."""
+    cfg = PRESET_CONFIG.get(preset_name, {})
+    resolved_img_path = download_if_url(cfg.get("image", None))
+    return (
+        cfg.get("prompt", ""),
+        resolved_img_path,
+        cfg.get("max_tokens", 256),
+        cfg.get("temperature", 0.1),
+    )
 
-def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Ministral-3 Zoo") as demo:
+
+def main():
+    default_preset = "Landmark - Great Pyramid of Giza"
+    default_cfg = PRESET_CONFIG[default_preset]
+    default_img_path = download_if_url(default_cfg["image"])
+
+    def run_inference(image_input: Any, prompt_text: str, max_new_tokens: int, temp: float) -> str:
+        if not image_input and not prompt_text.strip():
+            return "Please enter a prompt or upload an image."
+
+        # Support string URLs, local paths, or direct PIL objects
+        if isinstance(image_input, str) and image_input.strip():
+            resolved = download_if_url(image_input)
+            img = Image.open(resolved).convert("RGB") if resolved else None
+        elif isinstance(image_input, Image.Image):
+            img = image_input.convert("RGB")
+        else:
+            img = None
+
+        prompt_text = prompt_text or ("Describe this image in detail." if img is not None else "Hello!")
+        try:
+            return generate(
+                model=MODEL,
+                processor=PROCESSOR,
+                image=img,
+                prompt=prompt_text,
+                max_tokens=int(max_new_tokens),
+                temperature=float(temp),
+            )
+        except Exception as e:
+            return f"Error during generation: {e}"
+
+    with gr.Blocks(title="Ministral-3 Multimodal") as app:
         gr.Markdown(
             f"""
-            # 🦁 Ministral-3 Multimodal (3B)
-            **Clean-Room PyTorch Implementation** running on **{DEVICE.upper()}** ({DTYPE}).
-            - **Multimodal & Text-Only**: Upload an image to analyze it, or leave empty to chat directly.
-            - **Vision Encoder**: Native 2D Axial RoPE Pixtral Vision Tower
-            - **Projector**: Spatial 2x2 Patch Merger + MLP
-            - **Language Backbone**: YaRN RoPE & LLaMA-4 Scaled GQA Decoder
+            # 🦁 Ministral-3 Multimodal — `{HF_REPO}` ({DEVICE.upper()})
+            **Clean-Room PyTorch Implementation** running in **{DTYPE}**.
+            - **Vision Encoder**: Native 2D Axial RoPE Pixtral Vision Tower ($14 \\times 14$ patches).
+            - **Projector**: Spatial $2 \\times 2$ Patch Merger + Projection MLP.
+            - **Language Backbone**: Ministral-3 (3B) with YaRN RoPE & LLaMA-4 Attn Query Scaling.
             """
         )
 
         with gr.Row():
+            # Left Column: Inputs
             with gr.Column(scale=1):
-                input_image = gr.Image(type="pil", label="Input Image (Optional)")
+                preset_dropdown = gr.Dropdown(
+                    choices=list(PRESET_CONFIG.keys()),
+                    value=default_preset,
+                    label="Task Presets (Auto-loads sample image & prompt on the fly)",
+                )
+
+                input_img = gr.Image(
+                    type="pil",
+                    value=default_img_path,
+                    label="Input Image (Upload or select from presets)",
+                )
+
                 prompt_input = gr.Textbox(
                     label="User Prompt",
-                    placeholder="Ask a question or describe an image...",
-                    value="Hello! What can you do?",
+                    value=default_cfg["prompt"],
+                    placeholder="Enter a prompt or question about the image...",
                     lines=3,
                 )
 
-                with gr.Accordion("Generation Parameters", open=False):
-                    max_tokens_slider = gr.Slider(
-                        minimum=16, maximum=1024, value=256, step=16, label="Max New Tokens"
+                with gr.Row():
+                    tokens_slider = gr.Slider(
+                        minimum=16,
+                        maximum=1024,
+                        value=default_cfg["max_tokens"],
+                        step=16,
+                        label="Max Tokens",
                     )
                     temp_slider = gr.Slider(
-                        minimum=0.0, maximum=1.2, value=0.1, step=0.05, label="Temperature"
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=default_cfg["temperature"],
+                        step=0.05,
+                        label="Temperature",
                     )
 
-                submit_btn: Any = gr.Button("Generate Response", variant="primary")
+                submit_btn = gr.Button("Generate Response", variant="primary")
 
-                gr.Examples(
-                    examples=[
-                        ["Describe this image in detail."],
-                        ["Transcribe any text visible in this image."],
-                        ["Explain the difference between supervised and unsupervised learning."],
-                    ],
-                    inputs=[prompt_input],
-                )
-
+            # Right Column: Outputs
             with gr.Column(scale=1):
-                output_text = gr.Textbox(label="Model Output", lines=12)
+                output_text = gr.Textbox(label="Model Output", lines=15)
 
+        # On Preset Change: Dynamically update image, prompt, and sliders
+        preset_dropdown.change(
+            fn=on_preset_change,
+            inputs=[preset_dropdown],
+            outputs=[prompt_input, input_img, tokens_slider, temp_slider],
+            show_progress="hidden",
+        )
+
+        # Run Inference
         submit_btn.click(
-            fn=generate,
-            inputs=[input_image, prompt_input, max_tokens_slider, temp_slider],
+            fn=run_inference,
+            inputs=[input_img, prompt_input, tokens_slider, temp_slider],
             outputs=[output_text],
         )
 
-    return demo
+    app.launch(server_name="0.0.0.0", server_port=7860, share=True)
 
 
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    main()
