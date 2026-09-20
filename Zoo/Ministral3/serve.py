@@ -35,10 +35,11 @@ HF_REPO = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 DEVICE, DTYPE = auto_detect_device_and_dtype()
 
-# Reliable public reference images (Wikimedia Commons and COCO val2017)
+# Reliable public reference images (Wikimedia standard 960px bucket and COCO val2017)
 PRESET_CONFIG = {
     "Landmark - Great Pyramid of Giza": {
-        "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e3/Kheops-Pyramid.jpg/640px-Kheops-Pyramid.jpg",
+        # Wikimedia requires strict thumbnail bucket sizes (960px is an allowed size)
+        "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e3/Kheops-Pyramid.jpg/960px-Kheops-Pyramid.jpg",
         "prompt": "Identify this landmark and describe its architectural and visual features in detail.",
         "max_tokens": 256,
         "temperature": 0.1,
@@ -77,20 +78,36 @@ PRESET_CONFIG = {
 
 
 def download_if_url(image_path: Optional[str]) -> Optional[str]:
-    """Downloads remote image URLs to a local temporary cache on the fly."""
+    """Downloads remote image URLs to a local temporary cache on the fly with failure resilience."""
     if not image_path:
         return None
     if isinstance(image_path, str) and image_path.startswith(("http://", "https://")):
         cache_dir = os.path.join(tempfile.gettempdir(), "ministral3_cache")
         os.makedirs(cache_dir, exist_ok=True)
         local_filename = os.path.join(cache_dir, os.path.basename(image_path.split("?")[0]))
-        if not os.path.exists(local_filename):
-            print(f"Downloading sample image on the fly: {image_path}...")
-            # Custom User-Agent prevents 403 Forbidden errors from Wikimedia/COCO
-            req = urllib.request.Request(image_path, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+        # Return cached image if already present
+        if os.path.exists(local_filename) and os.path.getsize(local_filename) > 0:
+            return local_filename
+
+        print(f"Downloading sample image on the fly: {image_path}...")
+        try:
+            # Policy-compliant User-Agent prevents 400/403 errors from Wikimedia/COCO
+            headers = {
+                "User-Agent": "LLMModelZoo/1.0 (https://github.com/ModelZoo; contact@modelzoo.org) Python-urllib"
+            }
+            req = urllib.request.Request(image_path, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as response, open(local_filename, "wb") as out_file:
                 out_file.write(response.read())
-        return local_filename
+            return local_filename
+        except Exception as e:
+            print(f"Warning: Could not download preset image from {image_path}: {e}")
+            if os.path.exists(local_filename):
+                try:
+                    os.remove(local_filename)
+                except OSError:
+                    pass
+            return None
     return image_path
 
 
@@ -131,7 +148,7 @@ def generate(
     prompt: str,
     max_tokens: int = 256,
     temperature: float = 0.1,
-    repetition_penalty: float = 1.0,  # Default 1.0 avoids phonetic token degeneration
+    repetition_penalty: float = 1.0,  # 1.0 prevents synthetic word degradation
 ) -> str:
     """Runs conditioned autoregressive inference supporting text and image-text inputs."""
     if not prompt.strip() and image is None:
@@ -148,7 +165,6 @@ def generate(
                 ],
             }
         ]
-        # Modern processor handles both visual features and token grid simultaneously
         try:
             inputs = processor.apply_chat_template(
                 messages,
@@ -158,7 +174,6 @@ def generate(
                 add_generation_prompt=True,
             )
         except Exception:
-            # Fallback for processor variants requiring explicit string formatting
             formatted_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -207,8 +222,8 @@ def generate(
 
     next_token_logits = outputs["logits"][:, -1, :]
     generated_tokens = []
-    
-    # Extract model EOS and stop identifiers
+
+    # Identify stop tokens
     eos_token_id = processor.tokenizer.eos_token_id
     stop_token_ids = {eos_token_id}
     if hasattr(model.config, "text_config") and hasattr(model.config.text_config, "eos_token_id"):
@@ -218,7 +233,6 @@ def generate(
     # 3. Autoregressive Decode Phase
     # =========================================================================
     for _ in range(max_tokens):
-        # Repetition penalty applied across unique previously generated tokens
         if repetition_penalty != 1.0 and generated_tokens:
             for prev_token in set(generated_tokens):
                 if next_token_logits[0, prev_token] < 0:
@@ -272,7 +286,6 @@ def main():
         if not image_input and not prompt_text.strip():
             return "Please enter a prompt or upload an image."
 
-        # Support string URLs, local paths, or direct PIL objects
         if isinstance(image_input, str) and image_input.strip():
             resolved = download_if_url(image_input)
             img = Image.open(resolved).convert("RGB") if resolved else None
@@ -350,7 +363,7 @@ def main():
                 output_text = gr.Textbox(label="Model Output", lines=15)
 
         # On Preset Change: Dynamically update image, prompt, and sliders
-        preset_dropdown.change(
+        preset_dropdown.change( # type:ignore
             fn=on_preset_change,
             inputs=[preset_dropdown],
             outputs=[prompt_input, input_img, tokens_slider, temp_slider],
@@ -358,7 +371,7 @@ def main():
         )
 
         # Run Inference
-        submit_btn.click(
+        submit_btn.click( # type:ignore
             fn=run_inference,
             inputs=[input_img, prompt_input, tokens_slider, temp_slider],
             outputs=[output_text],
