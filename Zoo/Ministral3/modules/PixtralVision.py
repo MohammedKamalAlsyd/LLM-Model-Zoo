@@ -45,8 +45,9 @@ class PixtralVisionRotaryEmbedding(nn.Module):
         freqs_w = pos_ids[:, 1:2].float() * self.inv_freq[half_dim:][None, :].float()  # (seq_len, 16)
         
         # Combine spatial frequencies and duplicate for full head_dim
-        freq_hw = torch.cat([freqs_h, freqs_w], dim=-1)                                 # (seq_len, 32)
-        emb = torch.cat([freq_hw, freq_hw], dim=-1)                                     # (seq_len, 64)
+        emb_h = torch.cat([freqs_h, freqs_h], dim=-1)  # 32 dims for height
+        emb_w = torch.cat([freqs_w, freqs_w], dim=-1)  # 32 dims for width
+        emb = torch.cat([emb_h, emb_w], dim=-1)        # 64 dims total: [H, H, W, W]
         
         return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
 

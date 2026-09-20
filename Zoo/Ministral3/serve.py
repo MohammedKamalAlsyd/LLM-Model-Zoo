@@ -205,7 +205,7 @@ def build_ui() -> gr.Blocks:
                         minimum=16, maximum=1024, value=256, step=16, label="Max New Tokens"
                     )
                     temp_slider = gr.Slider(
-                        minimum=0.0, maximum=1.2, value=0.7, step=0.05, label="Temperature"
+                        minimum=0.0, maximum=1.2, value=0.1, step=0.05, label="Temperature"
                     )
 
                 submit_btn: Any = gr.Button("Generate Response", variant="primary")
