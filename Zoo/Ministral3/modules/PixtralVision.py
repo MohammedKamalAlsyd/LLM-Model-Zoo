@@ -26,13 +26,14 @@ class PixtralRMSNorm(nn.Module):
 
 
 class PixtralVisionRotaryEmbedding(nn.Module):
-    """2D Continuous Axial Rotary Position Embedding."""
+    """2D Continuous Axial Rotary Position Embedding matching official H-W-H-W layout."""
     inv_freq: torch.Tensor
 
     def __init__(self, config: PixtralVisionConfig) -> None:
         super().__init__()
         dim = config.head_dim
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # inv_freq_2d: [inv_freq[0::2], inv_freq[1::2]]
         self.register_buffer("inv_freq", torch.cat([inv_freq[0::2], inv_freq[1::2]]), persistent=False)
 
     def forward(self, x: torch.Tensor, pos_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -44,10 +45,9 @@ class PixtralVisionRotaryEmbedding(nn.Module):
         freqs_h = pos_ids[:, 0:1].float() * self.inv_freq[:half_dim][None, :].float()  # (seq_len, 16)
         freqs_w = pos_ids[:, 1:2].float() * self.inv_freq[half_dim:][None, :].float()  # (seq_len, 16)
         
-        # Combine spatial frequencies and duplicate for full head_dim
-        emb_h = torch.cat([freqs_h, freqs_h], dim=-1)  # 32 dims for height
-        emb_w = torch.cat([freqs_w, freqs_w], dim=-1)  # 32 dims for width
-        emb = torch.cat([emb_h, emb_w], dim=-1)        # 64 dims total: [H, H, W, W]
+        # Interleave as [H, W] -> length 32
+        freq_hw = torch.cat([freqs_h, freqs_w], dim=-1)
+        emb = torch.cat([freq_hw, freq_hw], dim=-1)
         
         return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
 

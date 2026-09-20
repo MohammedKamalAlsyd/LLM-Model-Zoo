@@ -160,24 +160,17 @@ def generate(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image},
+                    {"type": "image"},
                     {"type": "text", "text": prompt},
                 ],
             }
         ]
-        try:
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-                add_generation_prompt=True,
-            )
-        except Exception:
-            formatted_text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = processor(images=image, text=formatted_text, return_tensors="pt")
+        # 1. Format the chat prompt string with image placeholder tokens
+        formatted_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        # 2. Pass BOTH text and PIL image to the processor to create pixel_values
+        inputs = processor(text=formatted_text, images=image, return_tensors="pt")
 
         pixel_values = inputs.get("pixel_values", None)
         if pixel_values is not None:
