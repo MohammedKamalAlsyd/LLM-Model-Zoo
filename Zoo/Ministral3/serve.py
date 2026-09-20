@@ -64,40 +64,46 @@ model, processor, DEVICE, DTYPE = load_model_and_processor()
 def generate(
     image: Any,
     prompt: str,
-    max_tokens: int = 256,
-    temperature: float = 0.7,
+    max_tokens: int = 512,
+    temperature: float = 0.2,
+    repetition_penalty: float = 1.15,
 ) -> str:
-    """Runs generation supporting both Text-Only and Multimodal (Image + Text) prompts."""
+    """Runs generation supporting both Text-Only and Multimodal prompts."""
     if not prompt.strip() and image is None:
         return "Please enter a prompt or upload an image."
 
-    # 1. Dynamically structure conversation messages
+    # 1. System Prompt prevents the model from falling back to text-only RLHF disclaimers
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "You are an advanced multimodal AI assistant. You can see, analyze, "
+                "and describe images directly and with high precision."
+            ),
+        }
+    ]
+
     if image is not None:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        })
     else:
-        # Text-only conversation
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+            ],
+        })
 
     formatted_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    # 2. Tokenize and preprocess (conditionally processing image if present)
+    # 2. Tokenize and preprocess
     if image is not None:
         inputs = processor(images=image, text=formatted_text, return_tensors="pt")
         pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
@@ -115,7 +121,7 @@ def generate(
         attention_mask = attention_mask.to(DEVICE)
 
     # =========================================================================
-    # 3. Prefill Phase (Vision is bypassed automatically if pixel_values is None)
+    # 3. Prefill Phase
     # =========================================================================
     kv_cache = KVCache()
     outputs = model(
@@ -124,7 +130,7 @@ def generate(
         image_sizes=image_sizes,
         attention_mask=attention_mask,
         past_key_values=kv_cache,
-        logits_to_keep=1,  # Memory optimization: only compute logits for last token
+        logits_to_keep=1,
     )
 
     next_token_logits = outputs["logits"][:, -1, :]
@@ -132,9 +138,17 @@ def generate(
     eos_token_id = processor.tokenizer.eos_token_id
 
     # =========================================================================
-    # 4. Decode Phase (Token-by-Token Autoregressive Loop)
+    # 4. Decode Phase with Repetition Penalty
     # =========================================================================
     for _ in range(max_tokens):
+        # Apply repetition penalty to prevent punctuation stuttering
+        if repetition_penalty != 1.0 and generated_tokens:
+            for prev_token in set(generated_tokens):
+                if next_token_logits[0, prev_token] < 0:
+                    next_token_logits[0, prev_token] *= repetition_penalty
+                else:
+                    next_token_logits[0, prev_token] /= repetition_penalty
+
         if temperature > 0.0:
             probs = torch.softmax(next_token_logits / temperature, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
@@ -147,7 +161,6 @@ def generate(
 
         generated_tokens.append(token_id)
 
-        # Autoregressive step: bypass vision computation
         outputs = model(
             input_ids=next_token,
             pixel_values=None,
