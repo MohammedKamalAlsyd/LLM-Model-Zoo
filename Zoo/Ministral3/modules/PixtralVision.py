@@ -37,10 +37,17 @@ class PixtralVisionRotaryEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor, pos_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates (cos, sin) tensors for 2D spatial coordinates pos_ids: (seq_len, 2)."""
-        freqs = pos_ids.float() @ self.inv_freq[None, ...].float()  # (seq_len, 2, dim // 2)
-        chunks = freqs.chunk(2, dim=-1)
-        freq_hw = torch.cat([chunks[0][:, 0], chunks[1][:, 1]], dim=-1)  # (seq_len, dim // 2)
-        emb = torch.cat([freq_hw, freq_hw], dim=-1)                       # (seq_len, dim)
+        # pos_ids[:, 0:1] is height (h), pos_ids[:, 1:2] is width (w)
+        half_dim = self.inv_freq.shape[0] // 2
+        
+        # Element-wise broadcasting for height and width axes
+        freqs_h = pos_ids[:, 0:1].float() * self.inv_freq[:half_dim][None, :].float()  # (seq_len, 16)
+        freqs_w = pos_ids[:, 1:2].float() * self.inv_freq[half_dim:][None, :].float()  # (seq_len, 16)
+        
+        # Combine spatial frequencies and duplicate for full head_dim
+        freq_hw = torch.cat([freqs_h, freqs_w], dim=-1)                                 # (seq_len, 32)
+        emb = torch.cat([freq_hw, freq_hw], dim=-1)                                     # (seq_len, 64)
+        
         return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
 
 
