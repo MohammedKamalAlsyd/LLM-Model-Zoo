@@ -1,0 +1,118 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+    classDef cache fill:#e0f2f1,stroke:#00897b,stroke-width:2px;
+
+    %% -------------------------------------------------------------
+    %% STAGE 1: INPUT PREPARATION
+    %% -------------------------------------------------------------
+    subgraph S1 [Detailed Stage 1: Multimodal Inputs]
+        direction TB
+        RawImg([Input Image/Video: T x H x W]) --> CalcGrid[Compute grid_thw metadata]:::op
+        CalcGrid --> PixVal[pixel_values: Flattened Patches]:::tensor
+        CalcGrid --> GridTHW[grid_thw: T, H, W]:::tensor
+
+        RawPrompt([User Prompt]) --> ChatTempl[AutoProcessor Chat Template]:::op
+        ChatTempl --> InpIDs[input_ids: Placeholder ID 151655]:::tensor
+        ChatTempl --> MMTypes[mm_token_type_ids: 0=Text, 1=Multimodal]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 2: VISION TOWER & DEEPSTACK
+    %% -------------------------------------------------------------
+    subgraph S2 [Detailed Stage 2: Vision Tower & DeepStack Taps]
+        direction TB
+        PixVal --> Conv3D[Conv3d: temporal=2, patch=16, 3 -> 1024]:::op
+        Conv3D --> PatchEmbed[patch_embeds: N_patches x 1024]:::tensor
+
+        GridTHW --> Bilinear[Bilinear Interpolation Taps & Weights]:::op
+        Bilinear --> AddPos[Add 2D Positional Embeddings]:::op
+        PatchEmbed --> AddPos
+
+        GridTHW --> PosIDs[get_vision_position_ids: Spatial Major Order]:::op
+        PosIDs --> VisRoPE[2D Axial VisionRoPE]:::op
+
+        AddPos --> VisBlocks[Vision Blocks: 24 Layers]:::attn
+        VisRoPE --> VisBlocks
+
+        VisBlocks -.->|"Layer 5"| Tap5[DeepStack Merger 1: PostShuffle Norm]:::op
+        VisBlocks -.->|"Layer 11"| Tap11[DeepStack Merger 2: PostShuffle Norm]:::op
+        VisBlocks -.->|"Layer 17"| Tap17[DeepStack Merger 3: PostShuffle Norm]:::op
+
+        VisBlocks -->|"Final Layer (23)"| FinalMerger[Spatial Patch Merger: 2x2 -> 2560]:::op
+        FinalMerger --> VisualTokens[image_embeds: N_tokens x 2560]:::tensor
+
+        Tap5 & Tap11 & Tap17 --> DStackFeats[deepstack_features: List of 3 Tensors]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 3: FUSION & 3D M-ROPE COORDINATES
+    %% -------------------------------------------------------------
+    subgraph S3 [Detailed Stage 3: Embedding Fusion & M-RoPE]
+        direction TB
+        InpIDs --> WordEmbed[nn.Embedding: 151936 -> 2560]:::op
+        WordEmbed --> TxtEmbeds[inputs_embeds: B x S x 2560]:::tensor
+
+        VisualTokens & InpIDs --> Scatter[replace_image_tokens at ID 151655]:::op
+        TxtEmbeds --> Scatter
+        Scatter --> FusedEmbeds[Fused inputs_embeds: B x S x 2560]:::tensor
+
+        InpIDs & MMTypes & GridTHW --> M_RoPE_Coords[build_3d_position_ids: T, H, W]:::op
+        M_RoPE_Coords --> Pos3D[position_ids: 3 x B x S]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 4: QWEN3 LANGUAGE BACKBONE
+    %% -------------------------------------------------------------
+    subgraph S4 [Detailed Stage 4: Qwen3 Language Model]
+        direction TB
+        FusedEmbeds --> DecBlock[Qwen3 Decoder: 36 Layers]
+
+        subgraph BlockDetail [Inside Each Decoder Block]
+            direction TB
+            Res1((+)) --> InLN[RMSNorm: FP32 eps=1e-6]:::norm
+            InLN --> AttnBlock[GQA: 32 Q-Heads, 8 KV-Heads]:::attn
+
+            subgraph AttnInternals [Attention Core]
+                AttnBlock --> PerHeadNorm[Per-Head RMSNorm on Q and K]:::norm
+                PerHeadNorm --> M_RoPE[3D M-RoPE: sections 24, 20, 20]:::op
+                M_RoPE --> KVCacheOp[(KVCache Update)]:::cache
+                KVCacheOp --> SDPA[PyTorch Fused SDPA Attention]:::attn
+            end
+
+            AttnInternals --> Res1
+            Res1 --> Res2((+))
+            Res2 --> MidLN[Post-Attention RMSNorm: FP32]:::norm
+            MidLN --> SwiGLU[SwiGLU MLP: 2560 -> 9728 -> 2560]:::op
+            SwiGLU --> Res2
+        end
+
+        DStackFeats -.->|"Additive Inject at Layers 0, 1, 2"| DecBlock
+        DecBlock --> FinalRMS[Final RMSNorm: FP32]:::norm
+        FinalRMS --> SliceTail{Prefill Stage?}:::op
+        SliceTail -- Yes: logits_to_keep=1 --> FastSlice[Slice tail token: B x 1 x 2560]:::tensor
+        SliceTail -- No: Decode --> FastSlice
+        FastSlice --> LMHead[lm_head: Tied Weights 2560 -> 151936]:::op
+        LMHead --> Logits[Next Token Logits: B x 1 x 151936]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 5: DECODE & DETOKENIZE
+    %% -------------------------------------------------------------
+    subgraph S5 [Detailed Stage 5: Autoregressive Loop]
+        direction TB
+        Logits --> Sample[Sampling / Greedy Argmax]:::op
+        Sample --> EOSCheck{Token in EOS 151645?}:::op
+        EOSCheck -- No --> CacheAppend[Single-token decode step]:::op
+        CacheAppend -.-> DecBlock
+        EOSCheck -- Yes --> Detok[Detokenizer]:::op
+        Detok --> FinalText([Generated Text Response])
+    end
+
+    %% Cross-Stage Wiring
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5

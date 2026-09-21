@@ -101,16 +101,17 @@ PaliGemma 2 uses specialized prompt prefixes for downstream tasks:
 
 ---
 
-## ⚖️ PaliGemma 2 vs. Ministral-3 Comparison
+## ⚖️ Architectural Triad Comparison
 
-| Capability                | PaliGemma 2                             | Ministral-3 Multimodal                                              |
-| :------------------------ | :-------------------------------------- | :------------------------------------------------------------------ |
-| **Image Resolution**      | Fixed $224 \times 224$ (Resized/Padded) | **Native Dynamic Aspect Ratio** (Up to $1540\text{px}$)             |
-| **Spatial Compression**   | None ($1$ patch = $1$ LLM token)        | **$2 \times 2$ Spatial Patch Merger** ($4\times$ token compression) |
-| **Vision Position**       | Learned 1D/2D table + Bicubic Interp    | **2D Continuous Axial RoPE** ($[H, W, H, W]$)                       |
-| **Context Length**        | 4,096 tokens                            | **262,144 tokens (YaRN)**                                           |
-| **Instance Segmentation** | **Supported** (UViM VQ-VAE Decoder)     | **Not Supported** (Language-focused)                                |
-| **Pure Text Queries**     | Poor (Requires image prefix)            | **Supported** (Full general LLM capability)                         |
+| Feature               | PaliGemma 2              | Ministral-3 Multimodal          | Qwen3-VL                                     |
+| :-------------------- | :----------------------- | :------------------------------ | :------------------------------------------- |
+| **Vision Resolution** | Fixed $224 \times 224$   | Native Dynamic Aspect Ratio     | **Native Dynamic Spatio-Temporal**           |
+| **Patch Method**      | 2D Conv ($14 \times 14$) | 2D Conv ($14 \times 14$)        | **3D Conv ($2 \times 16 \times 16$)**        |
+| **Positional System** | 2D Bicubic Interp        | 2D Continuous Axial RoPE        | **2D Bilinear Table + 3D M-RoPE**            |
+| **Feature Fusion**    | Single Linear Projector  | $2 \times 2$ Patch Merger + MLP | **$2 \times 2$ Merger + DeepStack (3 Taps)** |
+| **Attention Norm**    | Sandwich RMSNorm         | Standard Pre-LN                 | **Per-Head RMSNorm (Q & K)**                 |
+| **Segmentation**      | **Supported** (UViM VAE) | Not Supported                   | Not Supported (Bounding Boxes only)          |
+| **Video Input**       | Single Image Only        | Single Image Only               | **Supported (Temporal Patches)**             |
 
 ---
 

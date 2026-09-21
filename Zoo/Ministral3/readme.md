@@ -62,18 +62,21 @@ graph TD
 ## ⚡ Architectural Deep Dive
 
 ### 1. Pixtral Dynamic-Resolution Vision Tower (`modules/PixtralVision.py`)
+
 - **Native Resolution**: Images are partitioned into variable grids without aspect ratio distortion:
   $$h_p = \lfloor H / 14 \rfloor, \quad w_p = \lfloor W / 14 \rfloor$$
 - **2D Continuous Axial RoPE**: Rotary frequencies are calculated separately for $y$ and $x$ coordinates and interleaved into an $[H, W, H, W]$ layout, preserving 2D spatial relationships regardless of resolution.
 - **Block-Diagonal Attention**: Multi-image batches are packed into a single sequence and isolated via boolean block-diagonal masks, preventing cross-image attention leakage without padding compute.
 
 ### 2. Spatial 2×2 Patch Merger & Projector (`modules/Mistral3MultiModalProjector.py`)
+
 - **4× Spatial Downsampling**: Groups adjacent $2 \times 2$ patch neighborhoods via `torch.nn.functional.unfold(kernel_size=2, stride=2)`:
   $$(N, 1024) \xrightarrow{\text{Unfold}} (N/4, 4096) \xrightarrow{\text{Linear}} (N/4, 1024)$$
 - **Sequence Compression**: Compresses token count by **$75\%$**, enabling processing of ultra-high-resolution images without exhausting LLM context limits.
 - **2-Layer MLP Projector**: Projects features through $1024 \to 3072 \to \text{GELU} \to 3072$.
 
 ### 3. Ministral-3 Language Backbone (`modules/Ministral3.py`)
+
 - **Standard Pre-LN Blocks**: 26 layers using standard Pre-Norm residual connections:
   $$x = x + \text{Attn}(\text{RMSNorm}(x)), \quad x = x + \text{MLP}(\text{RMSNorm}(x))$$
 - **YaRN RoPE (262k Tokens)**: Merges interpolation and extrapolation across frequency bands:
@@ -86,22 +89,24 @@ graph TD
 
 ---
 
-## ⚖️ PaliGemma 2 vs. Ministral-3 Comparison
+## ⚖️ Architectural Triad Comparison
 
-| Capability | PaliGemma 2 | Ministral-3 Multimodal |
-| :--- | :--- | :--- |
-| **Image Resolution** | Fixed $224 \times 224$ (Resized/Padded) | **Native Dynamic Aspect Ratio** (Up to $1540\text{px}$) |
-| **Spatial Compression**| None ($1$ patch = $1$ LLM token) | **$2 \times 2$ Spatial Patch Merger** ($4\times$ token compression) |
-| **Vision Position** | Learned 1D/2D table + Bicubic Interp | **2D Continuous Axial RoPE** ($[H, W, H, W]$) |
-| **Context Length** | 4,096 tokens | **262,144 tokens (YaRN)** |
-| **Instance Segmentation**| **Supported** (UViM VQ-VAE Decoder) | **Not Supported** (Language-focused) |
-| **Pure Text Queries** | Poor (Requires image prefix) | **Supported** (Full general LLM capability) |
+| Feature               | PaliGemma 2              | Ministral-3 Multimodal          | Qwen3-VL                                     |
+| :-------------------- | :----------------------- | :------------------------------ | :------------------------------------------- |
+| **Vision Resolution** | Fixed $224 \times 224$   | Native Dynamic Aspect Ratio     | **Native Dynamic Spatio-Temporal**           |
+| **Patch Method**      | 2D Conv ($14 \times 14$) | 2D Conv ($14 \times 14$)        | **3D Conv ($2 \times 16 \times 16$)**        |
+| **Positional System** | 2D Bicubic Interp        | 2D Continuous Axial RoPE        | **2D Bilinear Table + 3D M-RoPE**            |
+| **Feature Fusion**    | Single Linear Projector  | $2 \times 2$ Patch Merger + MLP | **$2 \times 2$ Merger + DeepStack (3 Taps)** |
+| **Attention Norm**    | Sandwich RMSNorm         | Standard Pre-LN                 | **Per-Head RMSNorm (Q & K)**                 |
+| **Segmentation**      | **Supported** (UViM VAE) | Not Supported                   | Not Supported (Bounding Boxes only)          |
+| **Video Input**       | Single Image Only        | Single Image Only               | **Supported (Temporal Patches)**             |
 
 ---
 
 ## 🚀 Quickstart
 
 ### Launch the Unified Studio
+
 ```bash
 python Zoo/serve_multimodal.py
 ```
