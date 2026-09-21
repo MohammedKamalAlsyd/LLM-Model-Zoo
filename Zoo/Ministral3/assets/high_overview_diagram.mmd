@@ -1,0 +1,41 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef visionStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef connectStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef lmStyle fill:#ede7f6,stroke:#4527a0,stroke-width:2px;
+    classDef outputStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Stage_Inputs [Stage 1: Multimodal Inputs]
+        Img[Raw Input Image<br/>Native Aspect Ratio / No Padding]:::inputStyle
+        Txt[Chat / User Prompt<br/>Formatted via Chat Template]:::inputStyle
+    end
+
+    subgraph Stage_Vision [Stage 2: Vision Tower]
+        Pixtral[Pixtral Vision Tower<br/>2D Continuous Axial RoPE]:::visionStyle
+    end
+
+    subgraph Stage_Projector [Stage 3: Multimodal Neck]
+        Merger[2x2 Spatial Patch Merger<br/>4x Sequence Compression]:::connectStyle
+        Proj[2-Layer MLP Projector<br/>1024 -> 3072 -> 3072]:::connectStyle
+    end
+
+    subgraph Stage_Language [Stage 4: Language Backbone]
+        Ministral[Ministral-3 Causal LM<br/>YaRN RoPE 256k & LLaMA-4 Q-Scaling]:::lmStyle
+        KVCache[(KV Cache)]:::lmStyle
+    end
+
+    subgraph Stage_Outputs [Stage 5: Multimodal Output]
+        OutVQA[Visual QA / Reasoning]:::outputStyle
+        OutOCR[Dense OCR & Document Reading]:::outputStyle
+        OutScene[Detailed Scene & Landmark Analysis]:::outputStyle
+    end
+
+    Img -->|Patch Slicing 14x14| Pixtral
+    Pixtral -->|Raw Patches: N x 1024| Merger
+    Merger -->|Downsampled: N/4 x 1024| Proj
+    Proj -->|Visual Tokens: N/4 x 3072| Ministral
+    Txt -->|Token Embeddings: S x 3072| Ministral
+    Ministral <-->|Read / Write| KVCache
+    Ministral -->|Autoregressive Generation| OutVQA
+    Ministral -->|Autoregressive Generation| OutOCR
+    Ministral -->|Autoregressive Generation| OutScene

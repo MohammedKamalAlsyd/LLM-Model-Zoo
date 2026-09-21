@@ -1,0 +1,131 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+    classDef cache fill:#e0f2f1,stroke:#00897b,stroke-width:2px;
+
+    %% -------------------------------------------------------------
+    %% STAGE 1: MULTIMODAL INPUT & TOKEN PREPARATION
+    %% -------------------------------------------------------------
+    subgraph S1 [Detailed Stage 1: Input Preprocessing & Chat Templating]
+        direction TB
+        RawImg([Input Image: Native H x W]) --> ImgMeta[Derive hp=H//14, wp=W//14]:::op
+        ImgMeta --> PixVal[pixel_values: B x 3 x H x W]:::tensor
+        ImgMeta --> ImgSizes[image_sizes: B x 2]:::tensor
+
+        RawPrompt([User Prompt]) --> ChatTempl[AutoProcessor Chat Template]:::op
+        ChatTempl --> InpIDs[input_ids: B x S with ID 10 placeholders]:::tensor
+        ChatTempl --> AttnMask[attention_mask: B x S]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 2: PIXTRAL VISION ENCODER
+    %% -------------------------------------------------------------
+    subgraph S2 [Detailed Stage 2: Pixtral Vision Tower]
+        direction TB
+        PixVal --> ConvPatch[Conv2d Patch: k=14, stride=14, bias=False]:::op
+        ConvPatch --> FlatPatch[Extract non-padded patches: N_patches x 1024]:::tensor
+        
+        ImgSizes --> MeshGrid[torch.meshgrid 2D Patch Coordinates]:::op
+        MeshGrid --> Coords[coords_list: N_patches x 2]:::tensor
+
+        FlatPatch --> LNPre[PixtralRMSNorm: FP32 eps=1e-5]:::norm
+        Coords & LNPre --> AxialRoPE[2D Continuous Axial RoPE: H-W-H-W Layout]:::op
+
+        AxialRoPE --> BlockMask[generate_block_attention_mask: Block Diagonal]:::op
+        BlockMask --> VisEncLayers[Pixtral Transformer: 24 Blocks]:::attn
+
+        subgraph PixtralBlockDetail [Inside Each Pixtral Layer]
+            direction TB
+            P_Res1((+)) --> P_LN1[PixtralRMSNorm eps=1e-5]:::norm
+            P_LN1 --> P_Attn[SDPA Attention: 16 Heads, dim=64]:::attn
+            P_Attn --> P_Res1
+            P_Res1 --> P_Res2((+))
+            P_Res2 --> P_LN2[PixtralRMSNorm eps=1e-5]:::norm
+            P_LN2 --> P_SwiGLU[SwiGLU MLP: 1024 -> 4096 -> 1024]:::op
+            P_SwiGLU --> P_Res2
+        end
+
+        VisEncLayers --> RawVisTokens[raw_vision_features: N_patches x 1024]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 3: 2x2 PATCH MERGING & PROJECTION
+    %% -------------------------------------------------------------
+    subgraph S3 [Detailed Stage 3: Spatial Merging & Fusion]
+        direction TB
+        RawVisTokens --> PreProjNorm[Mistral3RMSNorm: FP32 eps=1e-5]:::norm
+        PreProjNorm --> Unfold2x2[Unfold 2x2 Spatial Blocks: Stride 2]:::op
+        Unfold2x2 --> MergedFlat[Flatten neighborhoods: N/4 x 4096]:::tensor
+        MergedFlat --> MergeLin[Linear Reduction: 4096 -> 1024]:::op
+        MergeLin --> ProjLin1[Linear 1: 1024 -> 3072]:::op
+        ProjLin1 --> ProjAct[GELU Activation]:::op
+        ProjAct --> ProjLin2[Linear 2: 3072 -> 3072]:::op
+        ProjLin2 --> ProjectedVis[projected_features: N/4 x 3072]:::tensor
+
+        InpIDs --> WordEmbed[nn.Embedding: 131072 -> 3072]:::op
+        WordEmbed --> TxtEmbeds[inputs_embeds: B x S x 3072]:::tensor
+
+        ProjectedVis & InpIDs --> ReplaceTokens[replace_image_tokens at ID 10]:::op
+        TxtEmbeds --> ReplaceTokens
+        ReplaceTokens --> FusedEmbeds[Fused inputs_embeds: B x S x 3072]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 4: MINISTRAL-3 LANGUAGE BACKBONE
+    %% -------------------------------------------------------------
+    subgraph S4 [Detailed Stage 4: Ministral-3 Language Model]
+        direction TB
+        FusedEmbeds --> DecBlock[Ministral-3 Decoder: 26 Layers]
+
+        subgraph LMBlockDetail [Inside Each Decoder Block]
+            direction TB
+            LM_Res1((+)) --> LM_InLN[1. input_layernorm: RMSNorm FP32]:::norm
+            LM_InLN --> LM_Attn[GQA: 32 Q-Heads, 8 KV-Heads]:::attn
+
+            subgraph LMAttnInternals [Attention Core]
+                LM_Attn --> YaRN[YaRN RoPE: 16x Context Extension, theta=1e6]:::op
+                YaRN --> Llama4Scale[LLaMA-4 Query Scaling: 1 + beta * log bucket]:::op
+                Llama4Scale --> RepeatKV[repeat_kv: Expand KV 4x]:::op
+                RepeatKV --> LM_SDPA[PyTorch Fused SDPA Attention]:::attn
+                LM_SDPA --> KVCacheOp[(KVCache Update)]:::cache
+            end
+
+            LMAttnInternals --> LM_OProj[o_proj: 3072 -> 3072]:::op
+            LM_OProj --> LM_Res1
+            LM_Res1 --> LM_Res2((+))
+            LM_Res2 --> LM_PostLN[2. post_attention_layernorm: RMSNorm FP32]:::norm
+            LM_PostLN --> LM_SwiGLU[SwiGLU MLP: 3072 -> 9216 -> 3072]:::op
+            LM_SwiGLU --> LM_Res2
+        end
+
+        DecBlock --> FinalRMS[Final Ministral3RMSNorm: FP32]:::norm
+        FinalRMS --> TailSlice{Prefill Stage?}:::op
+        TailSlice -- Yes: logits_to_keep=1 --> FastSlice[Slice hidden_states: B x 1 x 3072]:::tensor
+        TailSlice -- No: Decode --> FastSlice
+        FastSlice --> LMHead[lm_head: Tied Weights 3072 -> 131072]:::op
+        LMHead --> Logits[Next Token Logits: B x 1 x 131072]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 5: DECODING & AUTOREGRESSIVE GENERATION
+    %% -------------------------------------------------------------
+    subgraph S5 [Detailed Stage 5: Autoregressive Decode Loop]
+        direction TB
+        Logits --> RepPen[Apply Repetition Penalty]:::op
+        RepPen --> Sampling[Greedy Argmax / Temp Multinomial]:::op
+        Sampling --> StopCheck{Token in EOS 2?}:::op
+
+        StopCheck -- No --> CacheAppend[Single-token step: pixel_values=None]:::op
+        CacheAppend -.-> DecBlock
+
+        StopCheck -- Yes --> Detok[Tokenizer Detokenize]:::op
+        Detok --> FinalText([Generated Text Response])
+    end
+
+    %% Cross-Stage Wiring
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5
