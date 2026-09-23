@@ -1,17 +1,20 @@
-import torch
-from PIL import Image
-import gradio as gr
+"""Interactive Gradio Web Studio for CLIP Zero-Shot Classification."""
+
 from typing import Optional
+import gradio as gr
+from PIL import Image
+import torch
+import numpy as np
 
-from Zoo.CLIP.utils.model_loader import load_clip_from_hf
-from Zoo.CLIP.SubModels.CLIPProcessor import CLIPProcessor
 from Zoo.CLIP.CLIP import CLIPModel
-
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
+from Zoo.CLIP.processing.CLIPProcessor import CLIPProcessor
+from Zoo.Common.model_loader import auto_detect_device_and_dtype, load_hf_model_weights
 
 GLOBAL_MODEL: Optional[CLIPModel] = None
 GLOBAL_PROCESSOR: Optional[CLIPProcessor] = None
+RESOLVED_DEVICE: str = "cpu"
+
+REPO_ID = "openai/clip-vit-base-patch32"
 
 EXAMPLES = [
     [
@@ -29,84 +32,77 @@ EXAMPLES = [
 ]
 
 
-def initialize_app():
-    global GLOBAL_MODEL, GLOBAL_PROCESSOR
+def initialize_app() -> None:
+    """Initializes models using the common streaming loader."""
+    global GLOBAL_MODEL, GLOBAL_PROCESSOR, RESOLVED_DEVICE
 
-    print("Loading Model and Processor...")
-    GLOBAL_MODEL = load_clip_from_hf(device=device)
-    GLOBAL_PROCESSOR = CLIPProcessor()
-    print("Ready!")
+    RESOLVED_DEVICE, target_dtype = auto_detect_device_and_dtype()
+    print(f"Initializing CLIP on {RESOLVED_DEVICE.upper()} in {target_dtype}...")
+
+    GLOBAL_MODEL = CLIPModel()
+    load_hf_model_weights(
+        model=GLOBAL_MODEL,
+        repo_id=REPO_ID,
+        allow_patterns=["*.safetensors", "*.bin"],
+        strict=True,
+        device=RESOLVED_DEVICE,
+        dtype=target_dtype,
+    )
+    GLOBAL_PROCESSOR = CLIPProcessor(tokenizer_id=REPO_ID)
+    print("✓ Model and processor initialized successfully.")
 
 
-def predict(image: Image.Image, classes_text: str):
+def predict(image: Optional[Image.Image], classes_text: str):
+    """Inference endpoint executing zero-shot classification."""
     if GLOBAL_MODEL is None or GLOBAL_PROCESSOR is None:
         raise RuntimeError("Model or processor was not properly initialized.")
 
     if image is None:
         return {"Error: Please upload an image": 1.0}
 
-    if not classes_text.strip():
+    classes = [c.strip() for c in classes_text.split(",") if c.strip()]
+    if not classes:
         return {"Error: Please enter at least one class": 1.0}
 
-    image = image.convert("RGB")
-    classes = [c.strip() for c in classes_text.split(",") if c.strip()]
-
-    pixel_values = GLOBAL_PROCESSOR.process_image(image, device)
-    input_ids = GLOBAL_PROCESSOR.process_text(classes, device)
+    batch = GLOBAL_PROCESSOR(text=classes, images=image)
+    pixel_values = batch["pixel_values"].to(RESOLVED_DEVICE, dtype=next(GLOBAL_MODEL.parameters()).dtype)
+    input_ids = batch["input_ids"].to(RESOLVED_DEVICE)
 
     with torch.no_grad():
-        logits_per_image, _ = GLOBAL_MODEL(input_ids, pixel_values)
-        probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
+        outputs = GLOBAL_MODEL(input_ids=input_ids, pixel_values=pixel_values)
+        probs = outputs["logits_per_image"].softmax(dim=-1).squeeze(0).float().cpu().numpy()
 
-    return dict(
-        sorted(
-            {classes[i]: float(probs[i]) for i in range(len(classes))}.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-    )
+    return {classes[i]: float(probs[i]) for i in np.argsort(-probs)}
 
 
-def load_example(index):
-    return EXAMPLES[index]
-
-
-def launch_ui():
+def launch_ui() -> None:
     initialize_app()
 
-    with gr.Blocks(title="CLIP Zero-Shot Classifier") as demo:
+    with gr.Blocks(title="CLIP Zero-Shot Studio") as demo:
         gr.Markdown(
-            f"# 🔍 CLIP Zero-Shot Image Classification (From Scratch)\n"
-            f"Running natively on **{device.upper()}**."
-        )
-        gr.Markdown(
-            "Upload any image and type any categories you can think of. "
-            "CLIP calculates the similarity between the image and the text!"
+            f"# 🔍 CLIP Zero-Shot Image Classification\n"
+            f"Dual-Tower Metric Architecture running on **{RESOLVED_DEVICE.upper()}**."
         )
 
         with gr.Row():
             with gr.Column():
-                input_image = gr.Image(type="pil", label="Upload Image")
-
+                input_image = gr.Image(type="pil", label="Input Image")
                 input_classes = gr.Textbox(
-                    label="Categories (Comma-Separated)",
-                    placeholder="e.g., a photo of a dog, a photo of a cat...",
+                    label="Candidate Categories (Comma-Separated)",
                     value=EXAMPLES[0][1],
                 )
-
                 submit_btn = gr.Button("Classify Image", variant="primary")
 
             with gr.Column():
-                output_label = gr.Label(label="AI Predictions (Probabilities)")
+                output_label = gr.Label(label="Classification Probabilities")
 
-        gr.Markdown("### Examples")
-
-        with gr.Row():
-            for i, (_, classes) in enumerate(EXAMPLES):
-                gr.Button(f"Example {i + 1}").click(
-                    fn=lambda i=i: load_example(i),
-                    outputs=[input_image, input_classes],
-                )
+        gr.Examples(
+            examples=EXAMPLES,
+            inputs=[input_image, input_classes],
+            outputs=output_label,
+            fn=predict,
+            cache_examples=False,
+        )
 
         submit_btn.click(
             fn=predict,
@@ -114,7 +110,7 @@ def launch_ui():
             outputs=output_label,
         )
 
-    demo.launch(server_name="0.0.0.0", share=False)
+    demo.launch(server_name="0.0.0.0", share=True)
 
 
 if __name__ == "__main__":

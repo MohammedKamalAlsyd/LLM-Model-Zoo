@@ -1,0 +1,32 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef visionStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef textStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef metricStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Inputs [Stage 1: Multimodal Inputs]
+        Img[Raw Input Image]:::inputStyle
+        Txt[Candidate Text Labels]:::inputStyle
+    end
+
+    subgraph VisionTower [Stage 2: Vision Tower]
+        Patch[Patch Conv32 + CLS]:::visionStyle
+        ViT[Vision Transformer Encoder]:::visionStyle
+        VProj[Visual Linear Projector]:::visionStyle
+    end
+
+    subgraph TextTower [Stage 3: Text Tower]
+        Tok[BPE Tokenizer & Embeddings]:::textStyle
+        TextTr[Text Transformer Encoder]:::textStyle
+        TProj[Text Linear Projector]:::textStyle
+    end
+
+    subgraph Metric [Stage 4: Metric Space]
+        Norm[L2 Normalization]:::metricStyle
+        Sim[Cosine Dot Product * exp scale]:::metricStyle
+        Probs[Softmax Class Distribution]:::metricStyle
+    end
+
+    Img --> Patch --> ViT --> VProj --> Norm
+    Txt --> Tok --> TextTr --> TProj --> Norm
+    Norm --> Sim --> Probs

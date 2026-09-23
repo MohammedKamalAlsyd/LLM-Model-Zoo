@@ -1,0 +1,37 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+
+    subgraph V_Stage [Vision Encoding]
+        Pix[pixel_values: B x 3 x 224 x 224]:::tensor --> Conv[Conv2d: k=32, s=32]:::op
+        Conv --> Flat[Flatten + Concat CLS: B x 50 x 768]:::tensor
+        Flat --> PosV[+ Learned Pos Embeddings]:::op
+        PosV --> PreLN_V[LayerNorm eps=1e-5]:::norm
+        PreLN_V --> EncV[12x ViT Encoder Layers]:::attn
+        EncV --> PostLN_V[LayerNorm eps=1e-5]:::norm
+        PostLN_V --> ClsIdx[Extract Index 0 CLS]:::op
+        ClsIdx --> VProj[Linear: 768 -> 512]:::op
+        VProj --> VNorm[L2 Norm]:::op
+        VNorm --> VEmb[image_embeds: B_img x 512]:::tensor
+    end
+
+    subgraph T_Stage [Text Encoding]
+        IDs[input_ids: B x 77]:::tensor --> TokEmb[Token + Pos Embeddings]:::op
+        TokEmb --> EncT[12x Causal Transformer Layers]:::attn
+        EncT --> PostLN_T[LayerNorm eps=1e-5]:::norm
+        PostLN_T --> ArgmaxIdx[Extract EOS via argmax]:::op
+        ArgmaxIdx --> TProj[Linear: 512 -> 512]:::op
+        TProj --> TNorm[L2 Norm]:::op
+        TNorm --> TEmb[text_embeds: B_txt x 512]:::tensor
+    end
+
+    subgraph M_Stage [Similarity Calculation]
+        VEmb & TEmb --> MatMul[MatMul: V x T^T]:::op
+        Scale[logit_scale.exp]:::op --> ScaleMult[Multiply Scale]:::op
+        MatMul --> ScaleMult
+        ScaleMult --> Logits[logits_per_image: B_img x B_txt]:::tensor
+        Logits --> Softmax[Softmax dim=-1]:::op
+        Softmax --> OutProbs[Zero-Shot Class Probabilities]:::tensor
+    end
