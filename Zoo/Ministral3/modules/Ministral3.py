@@ -1,6 +1,5 @@
 """Ministral-3 Language Model with YaRN RoPE, LLaMA-4 Query Scaling, and GQA SDPA."""
 
-import math
 from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -13,6 +12,9 @@ from Zoo.Common.attention_utils import (
     create_causal_mask,
     get_llama_4_attn_scale,
     repeat_kv,
+)
+from Zoo.Common.RoPE import (
+    compute_rope_parameters
 )
 
 
@@ -44,47 +46,12 @@ class Ministral3RotaryEmbedding(nn.Module):
     def __init__(self, config: Ministral3TextConfig) -> None:
         super().__init__()
         self.config = config
-        inv_freq, self.attention_scaling = self._compute_yarn_parameters(config)
+        inv_freq, self.attention_scaling = compute_rope_parameters(
+            head_dim=config.head_dim,
+            base=float(config.rope_parameters.get("rope_theta", 1000000.0)),
+            rope_parameters=config.rope_parameters,
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @staticmethod
-    def _compute_yarn_parameters(config: Ministral3TextConfig) -> Tuple[torch.Tensor, float]:
-        dim = config.head_dim
-        base = float(config.rope_parameters.get("rope_theta", 1000000.0))
-        pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        inv_freq_extrapolation = 1.0 / pos_freqs
-
-        if config.rope_parameters.get("rope_type") != "yarn":
-            return inv_freq_extrapolation, 1.0
-
-        factor = float(config.rope_parameters.get("factor", 16.0))
-        orig_max_pos = float(config.rope_parameters.get("original_max_position_embeddings", 16384))
-        beta_fast = float(config.rope_parameters.get("beta_fast", 32.0))
-        beta_slow = float(config.rope_parameters.get("beta_slow", 1.0))
-        mscale = float(config.rope_parameters.get("mscale", 1.0))
-        mscale_all_dim = float(config.rope_parameters.get("mscale_all_dim", 1.0))
-
-        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
-
-        def find_dim(rotations: float) -> float:
-            return (dim * math.log(orig_max_pos / (rotations * 2 * math.pi))) / (2 * math.log(base))
-
-        low_bound = max(find_dim(beta_fast), 0.0)
-        high_bound = min(find_dim(beta_slow), float(dim // 2 - 1))
-
-        dim_indices = torch.arange(dim // 2, dtype=torch.float32)
-        if high_bound == low_bound:
-            high_bound += 0.001
-        ramp = torch.clamp((dim_indices - low_bound) / (high_bound - low_bound), 0.0, 1.0)
-
-        # High freq -> extrapolate (standard); Low freq -> interpolate (scaled)
-        inv_freq = inv_freq_extrapolation * (1.0 - ramp) + inv_freq_interpolation * ramp
-
-        def get_mscale(scale: float, coeff: float) -> float:
-            return 0.1 * coeff * math.log(scale) + 1.0 if scale > 1.0 else 1.0
-
-        attn_scaling = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
-        return inv_freq, attn_scaling
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         freqs = position_ids.unsqueeze(-1).float() @ self.inv_freq[None, None, :].float()
@@ -241,7 +208,7 @@ class Ministral3Model(nn.Module):
 
         assert inputs_embeds is not None
 
-        batch_size, seq_len, _ = inputs_embeds.shape
+        _ , seq_len, _ = inputs_embeds.shape
         past_len = past_key_values.num_items() if past_key_values is not None else 0
 
         if position_ids is None:

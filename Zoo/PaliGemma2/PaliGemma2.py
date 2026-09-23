@@ -1,6 +1,6 @@
 """PaliGemma 2 Multimodal Conditional Generation Model."""
 
-from typing import Optional
+from typing import Optional, Union
 import torch
 from torch import nn
 
@@ -8,8 +8,7 @@ from Zoo.PaliGemma2.configs import PaliGemma2Config
 from Zoo.PaliGemma2.modules.SigLip import SigLipVisionModel
 from Zoo.PaliGemma2.modules.Gemma2 import Gemma2ForCausalLM
 from Zoo.Common.KV_Cache import KVCache
-from Zoo.Common.vision_utils import replace_image_tokens
-from Zoo.Common.attention_utils import create_causal_mask
+from Zoo.Common.multimodality_utils import replace_image_tokens
 
 
 class PaliGemmaMultiModalProjector(nn.Module):
@@ -52,6 +51,7 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
         kv_cache: Optional[KVCache] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, slice] = 1,
     ) -> dict:
         """Forward pass for multimodal prefill and autoregressive decode.
 
@@ -104,4 +104,5 @@ class PaliGemma2ForConditionalGeneration(nn.Module):
             position_ids=pos_ids,
             attention_mask=causal_mask,
             past_key_values=kv_cache,
+            logits_to_keep=logits_to_keep,
         )

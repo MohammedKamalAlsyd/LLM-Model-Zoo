@@ -1,6 +1,6 @@
 """Compact Gemma 2 language model preserving exact Hugging Face weight compatibility."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -198,8 +198,15 @@ class Gemma2ForCausalLM(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[KVCache] = None,
+        logits_to_keep: Union[int, slice] = 1,
     ) -> dict:
         hidden = self.model(inputs_embeds, position_ids, attention_mask, past_key_values)
+        
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            hidden = hidden[:, -logits_to_keep:, :]
+        elif isinstance(logits_to_keep, slice):
+            hidden = hidden[:, logits_to_keep, :]
+        
         logits = self.lm_head(hidden)
         if self.cfg.final_logit_softcapping is not None:
             logits = torch.tanh(logits / self.cfg.final_logit_softcapping) * self.cfg.final_logit_softcapping

@@ -7,7 +7,7 @@ the 3D M-RoPE Language Backbone, and the Master Multimodal Wrapper.
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 
 @dataclass

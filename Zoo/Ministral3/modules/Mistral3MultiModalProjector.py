@@ -4,10 +4,9 @@ Normalizes, merges adjacent 2x2 vision patches, and projects visual representati
 into the text hidden embedding space.
 """
 
-from typing import Iterable, List
+from typing import Iterable
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from Zoo.Ministral3.configs import Ministral3MultimodalConfig
 

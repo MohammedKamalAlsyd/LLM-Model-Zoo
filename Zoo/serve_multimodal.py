@@ -268,6 +268,7 @@ def infer_paligemma(model, preprocessor, postprocessor, image, prompt, max_token
         pixel_values=pixel_values,
         attention_mask=attention_mask,
         kv_cache=kv_cache,
+        logits_to_keep=1,
     )
     next_logits = outputs["logits"][:, -1, :]
     eos_ids = set(model.config.eos_token_ids) | {108, 13}
@@ -291,6 +292,7 @@ def infer_paligemma(model, preprocessor, postprocessor, image, prompt, max_token
             pixel_values=None,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
+            logits_to_keep=1,
         )
         next_logits = outputs["logits"][:, -1, :]
 

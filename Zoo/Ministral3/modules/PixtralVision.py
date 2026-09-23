@@ -1,6 +1,6 @@
 """Compact, High-Performance Pixtral Vision Encoder with SDPA and 2D Axial RoPE."""
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

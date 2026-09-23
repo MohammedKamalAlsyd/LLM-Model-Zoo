@@ -13,7 +13,7 @@ from Zoo.Ministral3.modules.Ministral3 import Ministral3ForCausalLM
 from Zoo.Ministral3.modules.Mistral3MultiModalProjector import Mistral3MultiModalProjector
 from Zoo.Ministral3.modules.PixtralVision import PixtralVisionModel
 from Zoo.Common.KV_Cache import KVCache
-from Zoo.Common.vision_utils import replace_image_tokens
+from Zoo.Common.multimodality_utils import replace_image_tokens
 
 
 class Mistral3ForConditionalGeneration(nn.Module):

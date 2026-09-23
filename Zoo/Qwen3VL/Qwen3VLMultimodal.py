@@ -4,16 +4,15 @@ Unifies Dynamic-Resolution Vision with DeepStack, 3D M-RoPE coordinate schedulin
 and the Qwen3 language model backbone with 1:1 Hugging Face weight parity.
 """
 
-import itertools
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 
 from Zoo.Common.KV_Cache import KVCache
-from Zoo.Common.vision_utils import replace_image_tokens
 from Zoo.Qwen3VL.configs import Qwen3VLConfig
 from Zoo.Qwen3VL.modules.Text import Qwen3VLTextModel
 from Zoo.Qwen3VL.modules.Vision import Qwen3VLVisionModel
+from Zoo.Common.multimodality_utils import build_3d_position_ids, replace_image_tokens
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
@@ -39,67 +38,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def tie_weights(self) -> None:
         """Ties LM head weights to word embeddings."""
         self.lm_head.weight = self.language_model.embed_tokens.weight
-
-    def get_vision_position_ids(
-        self,
-        start_pos: int,
-        grid_thw: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Constructs 3D [T, H, W] coordinate grids for visual tokens."""
-        sms = int(self.config.vision_config.spatial_merge_size)
-        t = int(grid_thw[0].item())
-        h = int(grid_thw[1].item()) // sms
-        w = int(grid_thw[2].item()) // sms
-
-        pos_t = torch.zeros(t, device=device, dtype=torch.long)
-        pos_h = torch.arange(h, device=device, dtype=torch.long) + start_pos
-        pos_w = torch.arange(w, device=device, dtype=torch.long) + start_pos
-
-        t_grid, h_grid, w_grid = torch.meshgrid(pos_t, pos_h, pos_w, indexing="ij")
-        return torch.stack([t_grid, h_grid, w_grid], dim=0).reshape(3, -1) + start_pos
-
-    def build_3d_position_ids(
-        self,
-        input_ids: torch.Tensor,
-        mm_token_type_ids: torch.Tensor,
-        image_grid_thw: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Builds 3D M-RoPE position coordinates across mixed text and image sequences."""
-        bs, seq_len = input_ids.shape
-        device = input_ids.device
-        sms = int(self.config.vision_config.spatial_merge_size)
-        pos_ids = torch.zeros(3, bs, seq_len, dtype=torch.long, device=device)
-        rope_deltas: List[int] = []
-
-        img_iter = iter(image_grid_thw) if image_grid_thw is not None else None
-
-        for b in range(bs):
-            token_types = mm_token_type_ids[b].tolist()
-            groups = [(modality, len(list(group))) for modality, group in itertools.groupby(token_types)]
-            cur_pos: int = 0
-            b_positions: List[torch.Tensor] = []
-
-            for modality, length in groups:
-                if modality == 0:  # Text Span
-                    text_pos = torch.arange(length, device=device, dtype=torch.long).view(1, -1).expand(3, -1) + cur_pos
-                    b_positions.append(text_pos)
-                    cur_pos += length
-                else:  # Image / Video Span
-                    if img_iter is None:
-                        raise ValueError("image_grid_thw must be provided when multimodal tokens exist.")
-                    grid = next(img_iter)
-                    v_pos = self.get_vision_position_ids(cur_pos, grid, device=device)
-                    b_positions.append(v_pos)
-                    step = int(max(int(grid[1].item()), int(grid[2].item()))) // sms
-                    cur_pos += step
-
-            all_pos = torch.cat(b_positions, dim=1)
-            pos_ids[:, b] = all_pos
-            rope_deltas.append(int(all_pos.max().item()) + 1 - seq_len)
-
-        deltas = torch.tensor(rope_deltas, device=device).unsqueeze(1)
-        return pos_ids, deltas
 
     def forward(
         self,
@@ -143,7 +81,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 2. Derive 3D M-RoPE Positions
         if position_ids is None:
             if mm_token_type_ids is not None and image_grid_thw is not None:
-                position_ids, self.rope_deltas = self.build_3d_position_ids(
+                position_ids, self.rope_deltas = build_3d_position_ids(
                     input_ids, mm_token_type_ids, image_grid_thw
                 )
             else:
