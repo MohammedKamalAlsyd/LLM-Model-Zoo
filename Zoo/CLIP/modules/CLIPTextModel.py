@@ -17,7 +17,7 @@ class CLIPTextEmbeddings(nn.Module):
         self.register_buffer(
             "position_ids",
             torch.arange(cfg.max_position_embeddings).expand((1, -1)),
-            persistent=True,
+            persistent=False,
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:

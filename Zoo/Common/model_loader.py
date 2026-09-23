@@ -115,6 +115,11 @@ def load_hf_model_weights(
         for idx, shard_file in enumerate(safetensors_files):
             print(f"  Streaming shard {idx + 1}/{len(safetensors_files)}: {shard_file.name}...")
             shard_dict = load_file(str(shard_file), device="cpu")
+            
+            # Discard serialized position_ids so persistent=False never fails strict check ---
+            for k in list(shard_dict.keys()):
+                if k.endswith("position_ids"):
+                    del shard_dict[k]
 
             shard_keys = set(shard_dict.keys())
             unexpected_keys.update(shard_keys - all_model_keys)
@@ -135,6 +140,10 @@ def load_hf_model_weights(
             loaded = torch.load(shard_file, map_location="cpu", weights_only=True)
             if isinstance(loaded, dict) and "model" in loaded:
                 loaded = loaded["model"]
+                
+            for k in list(loaded.keys()):
+                if k.endswith("position_ids"):
+                    del loaded[k]
 
             shard_keys = set(loaded.keys())
             unexpected_keys.update(shard_keys - all_model_keys)

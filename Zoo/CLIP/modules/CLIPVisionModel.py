@@ -30,7 +30,7 @@ class CLIPVisionEmbeddings(nn.Module):
         self.register_buffer(
             "position_ids",
             torch.arange(self.num_positions).expand((1, -1)),
-            persistent=True,
+            persistent=False,
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
