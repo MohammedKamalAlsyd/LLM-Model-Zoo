@@ -1,0 +1,39 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef clipStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef latentStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef unetStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef vaeStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Inputs [Stage 1: Multimodal Inputs]
+        P[Prompt]:::inputStyle
+        NP[Negative Prompt]:::inputStyle
+        Img[Input Image Optional]:::inputStyle
+    end
+
+    subgraph Conditioning [Stage 2: Text Tower CLIP]
+        CLIPText[CLIPTextTransformer<br/>Hidden Size: 768]:::clipStyle
+        Context[Context Embeddings<br/>Cond + Uncond]:::clipStyle
+    end
+
+    subgraph LatentInit [Stage 3: Latent Seed Initialization]
+        VAEEnc[VAE Encoder<br/>down.0 to down.3]:::vaeStyle
+        Noise[DDPM Noise Injection]:::latentStyle
+        Latents[Latent State: 1 x 4 x 64 x 64]:::latentStyle
+    end
+
+    subgraph DenoiseLoop [Stage 4: Latent Denoising UNet]
+        UNet[Latent UNet 2D<br/>Cross-Attention + ResBlocks]:::unetStyle
+        DDPM[DDPM Sampler Step]:::latentStyle
+    end
+
+    subgraph PixelReconstruction [Stage 5: VAE Reconstruction]
+        VAEDec[VAE Decoder<br/>up.3 to up.0]:::vaeStyle
+        RGB[Final RGB Image<br/>512 x 512]:::inputStyle
+    end
+
+    P & NP --> CLIPText --> Context
+    Img --> VAEEnc --> Noise --> Latents
+    Latents <-->|50 Steps| UNet
+    Context --> UNet
+    UNet --> DDPM --> VAEDec --> RGB

@@ -1,0 +1,56 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+
+    %% STAGE 1: TEXT CONDITIONING
+    subgraph S1 [CLIP Text Encoding]
+        InpIDs[input_ids: 2 x 77]:::tensor --> CLIPTok[CLIPTextEmbeddings]:::op
+        CLIPTok --> CLIPEnc[12x Causal Transformer Blocks]:::attn
+        CLIPEnc --> CLIPNorm[LayerNorm eps=1e-5]:::norm
+        CLIPNorm --> Ctx[context: 2 x 77 x 768]:::tensor
+    end
+
+    %% STAGE 2: LATENTS INITIALIZATION
+    subgraph S2 [Latent Initialization]
+        direction TB
+        RawImg[pixel_values: 1 x 3 x 512 x 512]:::tensor --> VAE_In[conv_in + 4x DownBlock]:::op
+        VAE_In --> QuantConv[quant_conv: 8 channels]:::op
+        QuantConv --> Reparam[Reparameterization * 0.18215]:::op
+        Reparam --> ImgLat[Clean Latents z0: 1 x 4 x 64 x 64]:::tensor
+        ImgLat --> NoiseAdd[add_noise with timestep t0]:::op
+        RandLat[torch.randn: 1 x 4 x 64 x 64]:::tensor
+        NoiseAdd & RandLat --> LatentT[Latents z_t: 1 x 4 x 64 x 64]:::tensor
+    end
+
+    %% STAGE 3: UNET DENOISING LOOP
+    subgraph S3 [UNet Noise Estimation Core]
+        direction TB
+        LatentT --> CFG_Dup[Duplicate Latents for CFG: 2 x 4 x 64 x 64]:::tensor
+        TimeInt[Timestep t: integer]:::tensor --> SinTime[Sinusoidal Time Embedding: 320]:::op
+        SinTime --> TimeMLP[Linear -> SiLU -> Linear: 1280]:::op
+
+        CFG_Dup & TimeMLP & Ctx --> InBlocks[12x input_blocks: ResBlocks + SpatialTransformers]:::attn
+        InBlocks --> MidBlock[middle_block: Bottleneck SpatialTransformer]:::attn
+        MidBlock & InBlocks --> OutBlocks[12x output_blocks with Skips: ResBlocks + Upsample]:::attn
+        OutBlocks --> OutHead[GroupNorm + SiLU + conv_out: 4 channels]:::op
+        OutHead --> NoisePred[model_output: 2 x 4 x 64 x 64]:::tensor
+
+        NoisePred --> CFG_Math[uncond + cfg_scale * cond - uncond]:::op
+        CFG_Math --> StepMath[DDPM Ancestral Step Tweedie x0 -> z_t-1]:::op
+        StepMath --> LatentNext[Updated Latents z_t-1]:::tensor
+    end
+
+    %% STAGE 4: VAE DECODING
+    subgraph S4 [Image Reconstruction]
+        LatentFinal[Denoised Latents z0: 1 x 4 x 64 x 64]:::tensor --> PostQuant[post_quant_conv / 0.18215]:::op
+        PostQuant --> DecBlocks[VAE Decoder: conv_in + mid + 4x UpBlock + conv_out]:::op
+        DecBlocks --> ClampRGB[Rescale -1..1 to 0..255 uint8]:::op
+        ClampRGB --> OutImg([Generated RGB Image: 512 x 512])
+    end
+
+    S1 --> S3
+    S2 --> S3
+    LatentNext -.->|Loop t down to 0| S3
+    LatentNext --> S4
