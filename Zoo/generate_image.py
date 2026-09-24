@@ -13,6 +13,33 @@ from Zoo.StableDiffusion.pipeline.StableDiffusionPipeline import StableDiffusion
 ACTIVE_MODEL_NAME: Optional[str] = None
 CURRENT_PIPELINE: Union[StableDiffusionPipeline, FluxPipeline, None] = None
 
+PRESET_PROMPTS = {
+    "Custom": {
+        "prompt": "",
+        "negative_prompt": "blurry, bad anatomy, low quality, artifacts",
+    },
+    "Cinematic Portrait": {
+        "prompt": "A cinematic dramatic portrait of an elderly sea captain with a weathered face, wearing a yellow raincoat, moody side lighting, highly detailed, 8k resolution",
+        "negative_prompt": "blurry, low quality, distorted face, extra limbs, bad anatomy, flat lighting, oversaturated",
+    },
+    "Cyberpunk Cityscape": {
+        "prompt": "A futuristic cyberpunk metropolis at night, vibrant neon signs, towering skyscrapers, wet asphalt reflecting holographic advertisements, ultra-detailed 8k",
+        "negative_prompt": "blurry, low quality, oversaturated, messy, bad composition, noisy, pixelated",
+    },
+    "Fantasy Forest": {
+        "prompt": "Enchanted ancient forest with glowing flora, mystical atmosphere, mossy stone ruins, ethereal sunlight filtering through canopy, digital art style",
+        "negative_prompt": "blurry, bad quality, realistic photo, text, watermark, signature, ugly",
+    },
+    "Anime / Studio Ghibli Style": {
+        "prompt": "A serene countryside cottage surrounded by vibrant wildflower fields, soft fluffy summer clouds in a bright blue sky, Studio Ghibli style, detailed anime background",
+        "negative_prompt": "blurry, 3d render, photo, photorealistic, ugly, dark, depressing, low effort",
+    },
+    "Photorealistic Product": {
+        "prompt": "Studio product photograph of a luxury glass perfume bottle resting on a reflective dark marble surface, elegant diffuse lighting, ultra-sharp focus",
+        "negative_prompt": "blurry, low quality, dust, scratches, glare, bad reflections, distortion",
+    },
+}
+
 
 def get_pipeline(model_choice: str) -> Union[StableDiffusionPipeline, FluxPipeline]:
     """Dynamically loads the requested pipeline while evicting the inactive model to prevent OOM."""
@@ -95,7 +122,16 @@ def launch_unified_studio() -> None:
                     value="FLUX.1 [schnell]",
                     label="Generative Architecture",
                 )
-                prompt = gr.Textbox(label="Prompt", placeholder="Describe your image...", lines=3)
+                preset_dropdown = gr.Dropdown(
+                    choices=list(PRESET_PROMPTS.keys()),
+                    value="Custom",
+                    label="Preset Prompts (Select a preset or customize freely)",
+                )
+                prompt = gr.Textbox(
+                    label="Prompt",
+                    placeholder="Describe your image or choose a preset above...",
+                    lines=3,
+                )
                 negative_prompt = gr.Textbox(
                     label="Negative Prompt (SD v1.5 only)",
                     value="blurry, bad anatomy, low quality, artifacts",
@@ -117,11 +153,21 @@ def launch_unified_studio() -> None:
             with gr.Column(scale=1):
                 output_image = gr.Image(label="Synthesized Output", type="pil")
 
+        def update_preset_fields(preset_name: str):
+            preset = PRESET_PROMPTS.get(preset_name, PRESET_PROMPTS["Custom"])
+            return preset["prompt"], preset["negative_prompt"]
+
         def update_ui_defaults(choice: str):
             if choice == "FLUX.1 [schnell]":
                 return 1024, 1024, 4, gr.update(interactive=False), gr.update(interactive=False)
             else:
                 return 512, 512, 50, gr.update(interactive=True), gr.update(interactive=True)
+
+        preset_dropdown.change(
+            fn=update_preset_fields,
+            inputs=[preset_dropdown],
+            outputs=[prompt, negative_prompt],
+        )
 
         model_choice.change(
             fn=update_ui_defaults,
