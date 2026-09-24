@@ -1,0 +1,52 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+
+    %% STAGE 1: DUAL TEXT CONDITIONING
+    subgraph S1 ["Stage 1: Dual Text Encoders"]
+        P["Prompt"] --> CLIP["CLIP-L: Pooler Output"]:::op
+        CLIP --> Pool["pooled_projections: 1 x 768"]:::tensor
+        P --> T5["T5-XXL: Encoder Stack"]:::attn
+        T5 --> T5Tokens["prompt_embeds: 1 x 256 x 4096"]:::tensor
+        T5Tokens --> TxtIDs["txt_ids: zeros 256 x 3"]:::tensor
+    end
+
+    %% STAGE 2: 2D LATENT PACKING
+    subgraph S2 ["Stage 2: Latent Sampling & Patch Aggregation"]
+        Rand["torch.randn: 1 x 16 x 128 x 128"]:::tensor --> Pack["pack_latents_2d 2x2 pooling"]:::op
+        Pack --> Latents["latents: 1 x 4096 x 64"]:::tensor
+        Grid["prepare_multiaxis_coordinate_grid"]:::op --> ImgIDs["img_ids: 4096 x 3"]:::tensor
+    end
+
+    %% STAGE 3: MMDiT CORE
+    subgraph S3 ["Stage 3: 12B Flow Matching Transformer"]
+        Latents --> InProj["x_embedder: Linear to 3072"]:::op
+        T5Tokens --> CtxProj["context_embedder: Linear to 3072"]:::op
+        Time["Timestep t"] --> TimestepEmbed["CombinedTimestepTextProjEmbeddings 3072"]:::op
+        Pool --> TimestepEmbed
+        TxtIDs --> RoPE["FluxPosEmbed: 3D RoPE"]:::op
+        ImgIDs --> RoPE
+
+        InProj --> Dual["19x FluxTransformerBlock: Dual Stream MMDiT"]:::attn
+        CtxProj --> Dual
+        TimestepEmbed --> Dual
+        RoPE --> Dual
+
+        Dual --> Single["38x FluxSingleTransformerBlock: Single Stream DiT"]:::attn
+        Single --> OutNorm["AdaLayerNormContinuous + proj_out"]:::norm
+        OutNorm --> Velo["Velocity Prediction: 1 x 4096 x 64"]:::tensor
+        Velo --> Euler["Euler Discrete Step: dt * v"]:::op
+    end
+
+    %% STAGE 4: VAE DECODING
+    subgraph S4 ["Stage 4: Autoencoder Reconstruction"]
+        Euler --> Unpack["unpack_latents_2d: 1 x 16 x 128 x 128"]:::op
+        Unpack --> Unscale["unscale_latents: z / 0.3611 + 0.1159"]:::op
+        Unscale --> VAEDec["16-Channel VAE Decoder"]:::op
+        VAEDec --> RGB["1024 x 1024 RGB Output Image"]:::tensor
+    end
+
+    %% FIXED INTER-STAGE CONNECTIONS
+    Euler -.->|"4 Steps Euler Trajectory"| InProj

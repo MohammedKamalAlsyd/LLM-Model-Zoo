@@ -7,9 +7,9 @@ import gc
 import json
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import load_file
 
 
@@ -191,3 +191,109 @@ def load_hf_model_weights(
     model.eval()
     print(f"✓ Model successfully loaded onto {resolved_device.upper()} in {resolved_dtype}.")
     return cache_dir
+
+
+def purge_memory() -> None:
+    """Aggressively purges system RAM and GPU VRAM cached memory blocks.
+
+    Invokes Python garbage collection, followed by backend-specific cache
+    deallocation (CUDA cache and IPC collection, or Apple Silicon MPS cache).
+    Essential between stages in multi-gigabyte sequential pipelines (e.g. FLUX).
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def set_submodule_tensor(module: torch.nn.Module, subkey: str, tensor: torch.Tensor) -> None:
+    """Copies tensor data directly into an existing submodule parameter in-place.
+
+    Traverses hierarchical parameter names (including numeric indices for ModuleList
+    and Sequential containers) and updates the target parameter's underlying buffer
+    without reallocating parameter objects.
+
+    Args:
+        module: Root PyTorch module containing the target parameter.
+        subkey: Dot-separated relative key path (e.g., 'transformer_blocks.0.attn.to_q.weight').
+        tensor: Source tensor whose values will be copied into the destination parameter.
+
+    Raises:
+        AttributeError: If any intermediate submodule or leaf parameter cannot be found.
+    """
+    parts = subkey.split(".")
+    curr: Any = module
+    for part in parts[:-1]:
+        if part.isdigit():
+            curr = curr[int(part)]
+        else:
+            curr = getattr(curr, part)
+    leaf = parts[-1]
+    param = getattr(curr, leaf)
+    param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+
+
+def get_safetensors_shards(repo_id: str, subfolder: str = "") -> List[str]:
+    """Discovers and downloads all single or sharded safetensors files for a model subfolder.
+
+    First checks for standard monolithic weights, then attempts to parse the index
+    JSON weight map, and finally falls back to sequential shard naming discovery.
+    Downloads files to the local cache without loading tensor bytes into system RAM.
+
+    Args:
+        repo_id: Hugging Face repository identifier (e.g., 'black-forest-labs/FLUX.1-schnell').
+        subfolder: Subdirectory inside the repository (e.g., 'transformer', 'text_encoder_2').
+
+    Returns:
+        Sorted list of absolute local filesystem paths to downloaded safetensors shards.
+
+    Raises:
+        FileNotFoundError: If no matching safetensors checkpoint files can be located.
+    """
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+
+    # 1. Single-file check
+    for single_name in ["diffusion_pytorch_model.safetensors", "model.safetensors"]:
+        try:
+            return [hf_hub_download(repo_id=repo_id, filename=single_name, subfolder=subfolder, token=token)]
+        except Exception:
+            pass
+
+    # 2. Sharded index JSON check
+    for index_name in ["diffusion_pytorch_model.safetensors.index.json", "model.safetensors.index.json"]:
+        try:
+            index_path = hf_hub_download(repo_id=repo_id, filename=index_name, subfolder=subfolder, token=token)
+            with open(index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            shard_filenames = sorted(list(set(data["weight_map"].values())))
+            return [
+                hf_hub_download(repo_id=repo_id, filename=fname, subfolder=subfolder, token=token)
+                for fname in shard_filenames
+            ]
+        except Exception:
+            pass
+
+    # 3. Fallback sequential pattern discovery (up to 15 shards)
+    found_paths: List[str] = []
+    for i in range(1, 16):
+        shard_found = False
+        for prefix in ["diffusion_pytorch_model", "model"]:
+            for total in [2, 3, 4, 5, 6, 7, 8]:
+                fname = f"{prefix}-{i:05d}-of-{total:05d}.safetensors"
+                try:
+                    p = hf_hub_download(repo_id=repo_id, filename=fname, subfolder=subfolder, token=token)
+                    found_paths.append(p)
+                    shard_found = True
+                    break
+                except Exception:
+                    continue
+            if shard_found:
+                break
+        if not shard_found and found_paths:
+            break
+
+    if not found_paths:
+        raise FileNotFoundError(f"Could not locate safetensors weights for '{subfolder}' in '{repo_id}'")
+    return sorted(list(set(found_paths)))

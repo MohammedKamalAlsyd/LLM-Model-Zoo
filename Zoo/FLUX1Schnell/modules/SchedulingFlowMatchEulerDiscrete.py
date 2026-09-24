@@ -1,51 +1,38 @@
-import math
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+"""Euler Discrete Scheduler for Flow-Matching architectures with dynamic time shifting."""
 
+from dataclasses import dataclass
+import math
+from typing import Optional, Tuple, Union
 import numpy as np
 import torch
+
+from Zoo.FLUX1Schnell.configs import FluxSchedulerConfig
 
 
 @dataclass
 class FlowMatchEulerDiscreteSchedulerOutput:
-    """Output class for FlowMatchEulerDiscreteScheduler step function."""
+    """Output container for the FlowMatch scheduler step."""
     prev_sample: torch.Tensor
 
 
 class FlowMatchEulerDiscreteScheduler:
-    """
-    Euler Discrete Scheduler for Flow-Matching models (e.g., FLUX.1 [schnell]).
-    Propagates the sample along the predicted velocity vector field.
-    """
-    
-    def __init__(
-        self,
-        num_train_timesteps: int = 1000,
-        shift: float = 1.0,
-        use_dynamic_shifting: bool = False,
-        base_shift: float = 0.5,
-        max_shift: float = 1.15,
-        base_image_seq_len: int = 256,
-        max_image_seq_len: int = 4096,
-        time_shift_type: str = "exponential",
-    ):
-        self.num_train_timesteps = num_train_timesteps
-        self.shift = shift
-        self.use_dynamic_shifting = use_dynamic_shifting
-        self.base_shift = base_shift
-        self.max_shift = max_shift
-        self.base_image_seq_len = base_image_seq_len
-        self.max_image_seq_len = max_image_seq_len
-        self.time_shift_type = time_shift_type
+    """Discrete Flow-Matching scheduler propagating states along predicted velocity fields."""
 
-        # Default initial linspace schedule
-        timesteps = np.linspace(1, num_train_timesteps, num_train_timesteps, dtype=np.float32)[::-1].copy()
-        sigmas = timesteps / num_train_timesteps
-        if not use_dynamic_shifting:
-            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+    def __init__(self, config: Optional[FluxSchedulerConfig] = None) -> None:
+        self.config = config or FluxSchedulerConfig()
+        self.num_train_timesteps = self.config.num_train_timesteps
+        self.shift = self.config.shift
+        self.use_dynamic_shifting = self.config.use_dynamic_shifting
+        self.time_shift_type = self.config.time_shift_type
+
+        # Base linspace schedule
+        timesteps = np.linspace(1, self.num_train_timesteps, self.num_train_timesteps, dtype=np.float32)[::-1].copy()
+        sigmas = timesteps / self.num_train_timesteps
+        if not self.use_dynamic_shifting:
+            sigmas = self.shift * sigmas / (1.0 + (self.shift - 1.0) * sigmas)
 
         self.sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
-        self.timesteps = self.sigmas * num_train_timesteps
+        self.timesteps = self.sigmas * self.num_train_timesteps
 
         self.num_inference_steps: Optional[int] = None
         self._step_index: Optional[int] = None
@@ -83,13 +70,16 @@ class FlowMatchEulerDiscreteScheduler:
         mu: Optional[float] = None,
         sigmas: Optional[np.ndarray] = None,
     ) -> None:
-        """
-        Sets the discrete timesteps for the generation trajectory.
-        For FLUX [schnell], num_inference_steps is typically 4.
+        """Configures discrete evaluation timesteps along the Flow Matching trajectory.
+
+        Args:
+            num_inference_steps: Number of integration intervals (typically 4 for Schnell).
+            device: Target device for allocated scheduling tensors.
+            mu: Sequence-dependent dynamic shift coefficient.
+            sigmas: Optional explicit sigma schedule.
         """
         self.num_inference_steps = num_inference_steps
 
-        # 1. Base linear sigmas from 1.0 down to 1/num_train_timesteps
         if sigmas is None:
             timesteps = np.linspace(
                 self.num_train_timesteps,
@@ -101,27 +91,23 @@ class FlowMatchEulerDiscreteScheduler:
         else:
             sigmas = np.array(sigmas, dtype=np.float32)
 
-        # 2. Dynamic or static shifting
         if self.use_dynamic_shifting or mu is not None:
             if mu is None:
-                raise ValueError("`mu` must be provided when dynamic shifting is enabled.")
+                raise ValueError("Dynamic shifting requires precalculated 'mu' parameter.")
             sigmas = self.time_shift(mu, 1.0, sigmas)
         else:
             sigmas = self.shift * sigmas / (1.0 + (self.shift - 1.0) * sigmas)
 
-        # 3. Convert to tensor and append terminal sigma (0.0)
         sigmas_tensor = torch.from_numpy(sigmas).to(dtype=torch.float32, device=device)
         terminal_sigma = torch.zeros(1, dtype=torch.float32, device=sigmas_tensor.device)
         self.sigmas = torch.cat([sigmas_tensor, terminal_sigma])
 
-        # Timesteps associated with each sigma
         self.timesteps = self.sigmas[:-1] * self.num_train_timesteps
         self._step_index = None
 
     def index_for_timestep(self, timestep: Union[float, torch.Tensor]) -> int:
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.item()
-        # Find the closest matching index in timesteps
         dists = torch.abs(self.timesteps - timestep)
         return int(torch.argmin(dists).item())
 
@@ -138,9 +124,20 @@ class FlowMatchEulerDiscreteScheduler:
         sample: torch.Tensor,
         return_dict: bool = True,
     ) -> Union[FlowMatchEulerDiscreteSchedulerOutput, Tuple[torch.Tensor]]:
-        """
-        Euler forward step along the predicted velocity vector field:
-        x_{t - dt} = x_t + dt * v_theta
+        """Executes a first-order Euler integration step along the predicted velocity field.
+
+        Formula:
+            x_{t - dt} = x_t + dt * v_theta
+            where dt = sigma_{t+1} - sigma_t (dt < 0)
+
+        Args:
+            model_output: Predicted velocity field tensor of shape (B, C, ...).
+            timestep: Discrete evaluation timestep index.
+            sample: Current noisy sample tensor x_t.
+            return_dict: Whether to wrap output in dataclass.
+
+        Returns:
+            Denoised sample at next time boundary.
         """
         if self.step_index is None:
             self._init_step_index(timestep)
@@ -150,11 +147,9 @@ class FlowMatchEulerDiscreteScheduler:
 
         sigma = self.sigmas[step_idx].to(device=sample.device)
         sigma_next = self.sigmas[step_idx + 1].to(device=sample.device)
-
-        # dt is negative because we are stepping from noise (sigma=1) to clean image (sigma=0)
         dt = sigma_next - sigma
 
-        # Upcast to float32 to prevent numerical instability during Euler step
+        # Maintain float32 precision during Euler update to eliminate drift
         prev_sample = sample.to(torch.float32) + dt * model_output.to(torch.float32)
         prev_sample = prev_sample.to(model_output.dtype)
 
@@ -171,10 +166,7 @@ class FlowMatchEulerDiscreteScheduler:
         timestep: Union[float, torch.Tensor],
         noise: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Flow-matching forward process:
-        x_t = sigma * noise + (1 - sigma) * sample
-        """
+        """Forward Flow-Matching corruption: x_t = (1 - sigma) * sample + sigma * noise."""
         step_idx = self.index_for_timestep(timestep)
         sigma = self.sigmas[step_idx].to(device=sample.device, dtype=sample.dtype)
         return sigma * noise + (1.0 - sigma) * sample

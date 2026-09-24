@@ -1,55 +1,25 @@
+"""T5-v1.1-XXL text encoder implementation for contextual prompt representation in FLUX."""
+
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from Zoo.FLUX1Schnell.configs import T5Config
 
-# ==============================================================================
-# Model Outputs & Configurations
-# ==============================================================================
 
 @dataclass
 class T5EncoderOutput:
+    """Output container for the T5 encoder stack."""
     last_hidden_state: torch.Tensor
 
-
-class T5Config:
-    """Configuration for Google's t5-v1_1-xxl encoder."""
-
-    def __init__(
-        self,
-        vocab_size: int = 32128,
-        d_model: int = 4096,
-        d_kv: int = 64,
-        d_ff: int = 10240,
-        num_layers: int = 24,
-        num_heads: int = 64,
-        relative_attention_num_buckets: int = 32,
-        relative_attention_max_distance: int = 128,
-        layer_norm_epsilon: float = 1e-6,
-    ):
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.d_kv = d_kv
-        self.d_ff = d_ff
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.relative_attention_num_buckets = relative_attention_num_buckets
-        self.relative_attention_max_distance = relative_attention_max_distance
-        self.layer_norm_epsilon = layer_norm_epsilon
-
-
-# ==============================================================================
-# Layer Norm & Feed Forward (Gated GELU)
-# ==============================================================================
 
 class T5LayerNorm(nn.Module):
     """RMSNorm without bias and mean subtraction."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -63,37 +33,34 @@ class T5LayerNorm(nn.Module):
 class T5DenseGatedActDense(nn.Module):
     """Gated GELU Feed-Forward Network."""
 
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config) -> None:
         super().__init__()
         self.wi_0 = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wi_1 = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # F.gelu with 'tanh' is mathematically identical to HF's gelu_new
         hidden_gelu = F.gelu(self.wi_0(x), approximate="tanh")
         hidden_linear = self.wi_1(x)
         return self.wo(hidden_gelu * hidden_linear)
 
 
 class T5LayerFF(nn.Module):
-    def __init__(self, config: T5Config):
+    """Feed-Forward layer with pre-LayerNorm and residual connection."""
+
+    def __init__(self, config: T5Config) -> None:
         super().__init__()
         self.DenseReluDense = T5DenseGatedActDense(config)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        forwarded = self.layer_norm(x)
-        forwarded = self.DenseReluDense(forwarded)
-        return x + forwarded
+        return x + self.DenseReluDense(self.layer_norm(x))
 
-
-# ==============================================================================
-# Relative Attention
-# ==============================================================================
 
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False):
+    """Multi-Head Self-Attention with learned relative position bias."""
+
+    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False) -> None:
         super().__init__()
         self.d_model = config.d_model
         self.key_value_proj_dim = config.d_kv
@@ -148,8 +115,8 @@ class T5Attention(nn.Module):
             max_distance=self.relative_attention_max_distance,
         )
         assert self.has_relative_attention_bias, "relative_attention_bias is not defined on this layer"
-        values = self.relative_attention_bias(relative_position_bucket)  # [q_len, k_len, n_heads]
-        return values.permute(2, 0, 1).unsqueeze(0)  # [1, n_heads, q_len, k_len]
+        values = self.relative_attention_bias(relative_position_bucket)
+        return values.permute(2, 0, 1).unsqueeze(0)
 
     def forward(
         self,
@@ -163,7 +130,8 @@ class T5Attention(nn.Module):
         k = self.k(x).view(batch_size, seq_length, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
         v = self.v(x).view(batch_size, seq_length, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(2, 3))  # T5 does NOT divide by sqrt(d_k)
+        # Standard T5 Attention does not divide scores by sqrt(d_k)
+        scores = torch.matmul(q, k.transpose(2, 3))
 
         if position_bias is None and self.has_relative_attention_bias:
             position_bias = self.compute_bias(seq_length, seq_length, device=x.device)
@@ -175,13 +143,13 @@ class T5Attention(nn.Module):
             scores = scores + mask
 
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
-        attn_output = torch.matmul(attn_weights, v)  # [B, n_heads, seq_len, d_kv]
+        attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.inner_dim)
         return self.o(attn_output), position_bias
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False):
+    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False) -> None:
         super().__init__()
         self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -198,7 +166,7 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False):
+    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False) -> None:
         super().__init__()
         self.layer = nn.ModuleList([
             T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias),
@@ -216,12 +184,8 @@ class T5Block(nn.Module):
         return x, position_bias
 
 
-# ==============================================================================
-# T5 Encoder Stack & Model
-# ==============================================================================
-
 class T5Stack(nn.Module):
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.block = nn.ModuleList([
@@ -238,12 +202,10 @@ class T5Stack(nn.Module):
     ) -> T5EncoderOutput:
         if inputs_embeds is None:
             if input_ids is None:
-                raise ValueError("You must specify either input_ids or inputs_embeds")
+                raise ValueError("Must provide either input_ids or inputs_embeds")
             inputs_embeds = self.embed_tokens(input_ids)
-
         assert inputs_embeds is not None
 
-        # Create extended attention mask for broadcast addition: [B, 1, 1, seq_len]
         extended_attention_mask = None
         if attention_mask is not None:
             extended_attention_mask = (1.0 - attention_mask.to(inputs_embeds.dtype)) * -1e9
@@ -262,11 +224,9 @@ class T5Stack(nn.Module):
 
 
 class T5EncoderModel(nn.Module):
-    """
-    T5-v1.1-XXL Encoder used in FLUX for extracting sequence prompt embeddings.
-    """
+    """Standalone T5-XXL Encoder module for prompt sequence representation."""
 
-    def __init__(self, config: Optional[T5Config] = None):
+    def __init__(self, config: Optional[T5Config] = None) -> None:
         super().__init__()
         self.config = config or T5Config()
         self.shared = nn.Embedding(self.config.vocab_size, self.config.d_model)
@@ -284,12 +244,6 @@ class T5EncoderModel(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
-    def load_hf_weights(self, state_dict: dict):
-        """Loads weights from HuggingFace safetensors state_dict cleanly."""
-        # Tie shared and encoder.embed_tokens if necessary
-        if "shared.weight" in state_dict and "encoder.embed_tokens.weight" not in state_dict:
-            state_dict["encoder.embed_tokens.weight"] = state_dict["shared.weight"]
-        elif "encoder.embed_tokens.weight" in state_dict and "shared.weight" not in state_dict:
-            state_dict["shared.weight"] = state_dict["encoder.embed_tokens.weight"]
-
-        self.load_state_dict(state_dict, strict=False)
+    def tie_weights(self) -> None:
+        """Ties shared token embedding weights with encoder embedding weights."""
+        self.encoder.embed_tokens.weight = self.shared.weight

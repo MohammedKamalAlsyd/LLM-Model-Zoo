@@ -186,3 +186,82 @@ def get_vision_interpolation_indices_and_weights(
     indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, 4)
     weights = (h_weights[:, :, None] * w_weights[:, None, :]).reshape(-1, 4)
     return indices, weights
+
+
+def pack_latents_2d(latents: torch.Tensor, patch_size: int = 2) -> torch.Tensor:
+    """Packs 2D spatial latents into 2x2 flattened patch token sequences.
+
+    Used by FLUX and MMDiT backbones:
+    [B, C, H, W] -> [B, (H // patch_size) * (W // patch_size), C * patch_size * patch_size]
+
+    Args:
+        latents: Spatial tensor of shape (batch_size, channels, height, width).
+        patch_size: Spatial patch aggregation window (default: 2).
+
+    Returns:
+        Tensor of shape (batch_size, num_patches, channels * patch_size^2).
+    """
+    b, c, h, w = latents.shape
+    p = patch_size
+    latents = latents.view(b, c, h // p, p, w // p, p)
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    return latents.reshape(b, (h // p) * (w // p), c * p * p)
+
+
+def unpack_latents_2d(
+    latents: torch.Tensor,
+    height: int,
+    width: int,
+    vae_scale_factor: int = 8,
+    patch_size: int = 2,
+) -> torch.Tensor:
+    """Unpacks flattened patch tokens back into a 2D spatial feature map.
+
+    [B, (H // patch_size) * (W // patch_size), C * patch_size^2] -> [B, C, H, W]
+
+    Args:
+        latents: Packed patch tokens of shape (batch_size, num_patches, packed_dim).
+        height: Target pixel image height.
+        width: Target pixel image width.
+        vae_scale_factor: Spatial compression ratio of the VAE (default: 8).
+        patch_size: Patch de-aggregation window (default: 2).
+
+    Returns:
+        Tensor of shape (batch_size, channels, latent_height, latent_width).
+    """
+    b, _, packed_channels = latents.shape
+    p = patch_size
+    latent_h = 2 * (int(height) // (vae_scale_factor * 2))
+    latent_w = 2 * (int(width) // (vae_scale_factor * 2))
+    channels = packed_channels // (p * p)
+
+    latents = latents.view(b, latent_h // p, latent_w // p, channels, p, p)
+    latents = latents.permute(0, 3, 1, 4, 2, 5)
+    return latents.reshape(b, channels, latent_h, latent_w)
+
+
+def prepare_multiaxis_coordinate_grid(
+    height_patches: int,
+    width_patches: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Generates 3D spatial-temporal positional coordinates for DiT RoPE: [H * W, 3].
+
+    Column 0: Time/Batch axis (zeros for static images).
+    Column 1: Height index coordinates.
+    Column 2: Width index coordinates.
+
+    Args:
+        height_patches: Number of vertical patch tokens.
+        width_patches: Number of horizontal patch tokens.
+        device: Target execution device.
+        dtype: Output coordinate data type.
+
+    Returns:
+        Tensor of shape (height_patches * width_patches, 3).
+    """
+    grid = torch.zeros(height_patches, width_patches, 3, device=device, dtype=dtype)
+    grid[..., 1] += torch.arange(height_patches, device=device, dtype=dtype)[:, None]
+    grid[..., 2] += torch.arange(width_patches, device=device, dtype=dtype)[None, :]
+    return grid.reshape(height_patches * width_patches, 3)

@@ -1,0 +1,20 @@
+graph TD
+    subgraph S1 ["Stage 1: Text Encoding (~9.5 GB peak)"]
+        CLIP[CLIP-L] --> EncCLIP[Encode Pooled] --> DelCLIP[Purge CLIP]
+        T5[T5-XXL] --> EncT5[Encode Sequence] --> DelT5[Purge T5-XXL]
+    end
+
+    subgraph S2 ["Stage 2: Sequential Block Streaming (< 1.2 GB peak)"]
+        MMAP[Memory-Mapped Safetensors Handles]
+        Static[Load Static Input/Output Projections: < 100 MB]
+        T_Dual[1x Reusable Dual-Stream Template]
+        T_Single[1x Reusable Single-Stream Template]
+        MMAP -->|Stream Block i Weights| T_Dual
+        MMAP -->|Stream Block j Weights| T_Single
+    end
+
+    subgraph S3 ["Stage 3: Autoencoder Reconstruction (~350 MB peak)"]
+        VAE[Load VAE] --> Dec[Decode Latents to RGB] --> DelVAE[Purge VAE]
+    end
+
+    S1 --> S2 --> S3
