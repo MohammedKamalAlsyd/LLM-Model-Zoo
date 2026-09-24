@@ -14,6 +14,10 @@ class Transformer2DModelOutput(NamedTuple):
     sample: torch.Tensor
 
 
+# ==============================================================================
+# Normalization Layers (AdaLN)
+# ==============================================================================
+
 class AdaLayerNormZero(nn.Module):
     """Adaptive Layer Normalization Zero for Dual-Stream MMDiT Blocks."""
 
@@ -63,15 +67,21 @@ class AdaLayerNormContinuous(nn.Module):
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 
 
+# ==============================================================================
+# Timestep & Text Projections (Strictly Matching Checkpoint Keys)
+# ==============================================================================
+
 def get_timestep_embedding(
     timesteps: torch.Tensor,
     embedding_dim: int,
     flip_sin_to_cos: bool = True,
+    downscale_freq_shift: float = 0,
     scale: float = 1.0,
     max_period: int = 10000,
 ) -> torch.Tensor:
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device) / half_dim
+    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = exponent / (half_dim - downscale_freq_shift)
     emb = torch.exp(exponent)
     emb = timesteps[:, None].float() * emb[None, :] * scale
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
@@ -84,28 +94,67 @@ def get_timestep_embedding(
     return emb
 
 
+class Timesteps(nn.Module):
+    def __init__(self, num_channels: int = 256, flip_sin_to_cos: bool = True, downscale_freq_shift: float = 0) -> None:
+        super().__init__()
+        self.num_channels = num_channels
+        self.flip_sin_to_cos = flip_sin_to_cos
+        self.downscale_freq_shift = downscale_freq_shift
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        return get_timestep_embedding(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+        )
+
+
+class TimestepEmbedding(nn.Module):
+    """Matches 'timestep_embedder.linear_1' and 'timestep_embedder.linear_2' keys."""
+
+    def __init__(self, in_channels: int, time_embed_dim: int) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, bias=True)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=True)
+
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
+        return self.linear_2(self.act(self.linear_1(sample)))
+
+
+class PixArtAlphaTextProjection(nn.Module):
+    """Matches 'text_embedder.linear_1' and 'text_embedder.linear_2' keys."""
+
+    def __init__(self, in_features: int, hidden_size: int) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(in_features, hidden_size, bias=True)
+        self.act_1 = nn.SiLU()
+        self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+        return self.linear_2(self.act_1(self.linear_1(caption)))
+
+
 class CombinedTimestepTextProjEmbeddings(nn.Module):
     """Combines sinusoidal diffusion timesteps with pooled prompt projections."""
 
     def __init__(self, embedding_dim: int, pooled_projection_dim: int) -> None:
         super().__init__()
-        self.time_embedder = nn.Sequential(
-            nn.Linear(256, embedding_dim),
-            nn.SiLU(),
-            nn.Linear(embedding_dim, embedding_dim),
-        )
-        self.text_embedder = nn.Sequential(
-            nn.Linear(pooled_projection_dim, embedding_dim),
-            nn.SiLU(),
-            nn.Linear(embedding_dim, embedding_dim),
-        )
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim, embedding_dim)
 
     def forward(self, timestep: torch.Tensor, pooled_projection: torch.Tensor) -> torch.Tensor:
-        time_proj = get_timestep_embedding(timestep, 256, flip_sin_to_cos=True)
-        time_emb = self.time_embedder(time_proj.to(dtype=pooled_projection.dtype))
-        pooled_emb = self.text_embedder(pooled_projection)
-        return time_emb + pooled_emb
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
+        pooled_projections = self.text_embedder(pooled_projection)
+        return timesteps_emb + pooled_projections
 
+
+# ==============================================================================
+# Multi-Axis 3D Rotary Position Embeddings (RoPE)
+# ==============================================================================
 
 def get_1d_rotary_pos_embed(
     dim: int,
@@ -157,22 +206,38 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
-class FeedForward(nn.Module):
-    """FeedForward layer matching `ff.net.0.proj` and `ff.net.2` weights."""
+# ==============================================================================
+# Attention & FeedForward (Strictly Matching Checkpoint Keys)
+# ==============================================================================
 
-    def __init__(self, dim: int, dim_out: Optional[int] = None, mult: int = 4) -> None:
+class GELUApproximate(nn.Module):
+    """Matches checkpoint 'ff.net.0.proj' weight hierarchy."""
+
+    def __init__(self, dim_in: int, dim_out: int, bias: bool = True) -> None:
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.proj(x), approximate="tanh")
+
+
+class FeedForward(nn.Module):
+    """Matches 'ff.net.0.proj' and 'ff.net.2' weight paths."""
+
+    def __init__(self, dim: int, dim_out: Optional[int] = None, mult: int = 4, bias: bool = True) -> None:
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out or dim
-        self.net = nn.Sequential(
-            nn.Linear(dim, inner_dim),
-            nn.GELU(approximate="tanh"),
+        self.net = nn.ModuleList([
+            GELUApproximate(dim, inner_dim, bias=bias),
             nn.Dropout(0.0),
-            nn.Linear(inner_dim, dim_out),
-        )
+            nn.Linear(inner_dim, dim_out, bias=bias),
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        for module in self.net:
+            x = module(x)
+        return x
 
 
 class FluxAttention(nn.Module):
@@ -183,6 +248,7 @@ class FluxAttention(nn.Module):
         query_dim: int,
         dim_head: int = 128,
         heads: int = 24,
+        bias: bool = True,
         added_kv_proj_dim: Optional[int] = None,
         eps: float = 1e-6,
         pre_only: bool = False,
@@ -196,23 +262,24 @@ class FluxAttention(nn.Module):
 
         self.norm_q = nn.RMSNorm(dim_head, eps=eps)
         self.norm_k = nn.RMSNorm(dim_head, eps=eps)
-        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=True)
-        self.to_k = nn.Linear(query_dim, self.inner_dim, bias=True)
-        self.to_v = nn.Linear(query_dim, self.inner_dim, bias=True)
+        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = nn.Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_v = nn.Linear(query_dim, self.inner_dim, bias=bias)
 
         if not self.pre_only:
-            self.to_out = nn.Sequential(
-                nn.Linear(self.inner_dim, query_dim, bias=True),
+            # Matches 'to_out.0' key
+            self.to_out = nn.ModuleList([
+                nn.Linear(self.inner_dim, query_dim, bias=bias),
                 nn.Dropout(0.0),
-            )
+            ])
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = nn.RMSNorm(dim_head, eps=eps)
             self.norm_added_k = nn.RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=True)
-            self.add_k_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=True)
-            self.add_v_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=True)
-            self.to_add_out = nn.Linear(self.inner_dim, query_dim, bias=True)
+            self.add_q_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
+            self.add_k_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
+            self.add_v_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
+            self.to_add_out = nn.Linear(self.inner_dim, query_dim, bias=bias)
 
     def forward(
         self,
@@ -254,12 +321,17 @@ class FluxAttention(nn.Module):
         if encoder_hidden_states is not None:
             enc_len = encoder_hidden_states.shape[1]
             enc_out, hidden_out = out[:, :enc_len], out[:, enc_len:]
-            hidden_out = self.to_out(hidden_out.contiguous())
+            hidden_out = self.to_out[0](hidden_out.contiguous())
+            hidden_out = self.to_out[1](hidden_out)
             enc_out = self.to_add_out(enc_out.contiguous())
             return hidden_out, enc_out
 
         return out
 
+
+# ==============================================================================
+# Dual-Stream & Single-Stream Transformer Blocks
+# ==============================================================================
 
 class FluxTransformerBlock(nn.Module):
     """Dual-Stream MMDiT Block for joint image and text contextual processing."""
@@ -349,6 +421,10 @@ class FluxSingleTransformerBlock(nn.Module):
         return x[:, :text_seq_len], x[:, text_seq_len:]
 
 
+# ==============================================================================
+# Monolithic Container Model Definition
+# ==============================================================================
+
 class FluxTransformer2DModel(nn.Module):
     """12B-parameter FLUX Transformer combining Dual-stream and Single-stream DiT blocks."""
 
@@ -398,10 +474,8 @@ class FluxTransformer2DModel(nn.Module):
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        # Scale timestep to [0, 1000] continuous boundary
         temb = self.time_text_embed(timestep * 1000.0, pooled_projections)
 
-        # 3D RoPE concatenation
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
         if img_ids.ndim == 3:
@@ -409,7 +483,6 @@ class FluxTransformer2DModel(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=0)
         image_rotary_emb = self.pos_embed(ids)
 
-        # 19 Dual-Stream Blocks
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -418,7 +491,6 @@ class FluxTransformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
             )
 
-        # 38 Single-Stream Blocks
         for block in self.single_transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -427,7 +499,6 @@ class FluxTransformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
             )
 
-        # Output projection
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
