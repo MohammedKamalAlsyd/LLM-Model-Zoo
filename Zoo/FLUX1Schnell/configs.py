@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, Union
 import json
 from pathlib import Path
+from Zoo.CLIP.configs import CLIPTextConfig
 
 
 @dataclass
@@ -99,6 +100,17 @@ class FluxConfig:
     scheduler_config: FluxSchedulerConfig = field(default_factory=FluxSchedulerConfig)
     t5_config: T5Config = field(default_factory=T5Config)
     clip_model_name: str = "openai/clip-vit-large-patch14"
+    clip_text_config: CLIPTextConfig = field(
+        default_factory=lambda: CLIPTextConfig(
+            vocab_size=49408,
+            hidden_size=768,
+            intermediate_size=3072,
+            num_attention_heads=12,
+            num_hidden_layers=12,
+            max_position_embeddings=77,
+            projection_dim=768,
+        )
+    )
     repo_id: str = "black-forest-labs/FLUX.1-schnell"
     default_image_size: int = 1024
     default_num_inference_steps: int = 4
@@ -109,7 +121,7 @@ class FluxConfig:
         transformer_dict = config_dict.get("transformer_config", {})
         scheduler_dict = config_dict.get("scheduler_config", {})
         t5_dict = config_dict.get("t5_config", {})
-
+        clip_text_dict = config_dict.get("clip_text_config", {})
         return cls(
             vae_config=FluxVAEConfig.from_dict(vae_dict) if isinstance(vae_dict, dict) else vae_dict,
             transformer_config=(
@@ -123,6 +135,7 @@ class FluxConfig:
                 else scheduler_dict
             ),
             t5_config=T5Config.from_dict(t5_dict) if isinstance(t5_dict, dict) else t5_dict,
+            clip_text_config=CLIPTextConfig.from_dict(clip_text_dict) if isinstance(clip_text_dict, dict) else clip_text_dict,
             clip_model_name=config_dict.get("clip_model_name", "openai/clip-vit-large-patch14"),
             repo_id=config_dict.get("repo_id", "black-forest-labs/FLUX.1-schnell"),
             default_image_size=config_dict.get("default_image_size", 1024),

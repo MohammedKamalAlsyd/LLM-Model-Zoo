@@ -6,7 +6,10 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer
+from transformers import AutoTokenizer, CLIPTokenizer
+from Zoo.CLIP.modules.CLIPTextModel import CLIPTextModel
+from safetensors.torch import load_file
+from huggingface_hub import hf_hub_download
 
 from Zoo.Common.model_loader import get_safetensors_shards, purge_memory, set_submodule_tensor
 from Zoo.Common.vision_utils import pack_latents_2d, prepare_multiaxis_coordinate_grid, unpack_latents_2d
@@ -86,11 +89,21 @@ class FluxPipeline:
 
         # 1. CLIP-L Pooled Projection (~250 MB)
         tokenizer = CLIPTokenizer.from_pretrained(self.repo_id, subfolder="tokenizer")
-        clip_cls: Any = CLIPTextModel
-        text_encoder = cast(
-            nn.Module,
-            clip_cls.from_pretrained(self.repo_id, subfolder="text_encoder", torch_dtype=self.dtype),
-        ).to(self.device)
+        clip_model = CLIPTextModel(self.config.clip_text_config).to(self.device, dtype=self.dtype)
+        
+        # Load official safetensors weights directly into the clean-room model
+        clip_weights_path = hf_hub_download(self.repo_id, filename="model.safetensors", subfolder="text_encoder")
+        clip_state_dict = load_file(clip_weights_path, device=str(self.device))
+        
+        # Strip non-persistent buffers if present
+        clip_state_dict.pop("text_model.embeddings.position_ids", None)
+        
+        # Strict state dict loading
+        clip_model.load_state_dict(
+            {k: v.to(dtype=self.dtype) for k, v in clip_state_dict.items()},
+            strict=True
+        )
+        clip_model.eval()
 
         clip_inputs = tokenizer(
             [prompt],
@@ -99,12 +112,17 @@ class FluxPipeline:
             truncation=True,
             return_tensors="pt",
         )
-        clip_out = text_encoder(clip_inputs["input_ids"].to(self.device))
-        pooled = getattr(clip_out, "pooler_output", clip_out[1])
-        pooled_prompt_embeds = pooled.to(dtype=self.dtype, device=self.device)
+        
+        # return_pooled=True directly extracts the EOS summary token (Shape: [1, 768])
+        pooled_prompt_embeds = clip_model(
+            clip_inputs["input_ids"].to(self.device),
+            return_pooled=True
+        ).to(dtype=self.dtype)
 
-        del text_encoder, tokenizer, clip_out
+        # Immediately purge CLIP from memory
+        del clip_model, tokenizer, clip_state_dict
         purge_memory()
+        print("  ✓ Clean-room CLIP-L pooled features extracted. Memory purged.")
 
         # 2. T5-XXL Token Sequence (~9.5 GB)
         tokenizer_2 = AutoTokenizer.from_pretrained(self.repo_id, subfolder="tokenizer_2")
