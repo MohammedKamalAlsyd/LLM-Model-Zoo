@@ -136,7 +136,7 @@ def launch_unified_studio() -> None:
                     label="Negative Prompt (SD v1.5 only)",
                     value="blurry, bad anatomy, low quality, artifacts",
                     lines=2,
-                    interactive=False,
+                    visible=False,  # Hidden by default for FLUX
                 )
 
                 with gr.Row():
@@ -145,7 +145,7 @@ def launch_unified_studio() -> None:
 
                 with gr.Row():
                     steps = gr.Slider(1, 100, value=4, step=1, label="Steps (FLUX: 4, SD: 50)")
-                    cfg_scale = gr.Slider(1.0, 20.0, value=7.5, step=0.5, label="CFG Scale (SD only)", interactive=False)
+                    cfg_scale = gr.Slider(1.0, 20.0, value=7.5, step=0.5, label="CFG Scale (SD only)", visible=False)  # Hidden by default for FLUX
 
                 seed = gr.Number(label="Random Seed (-1 for stochastic)", value=-1, precision=0)
                 submit_btn = gr.Button("🎨 Synthesize Image", variant="primary", size="lg")
@@ -159,9 +159,9 @@ def launch_unified_studio() -> None:
 
         def update_ui_defaults(choice: str):
             if choice == "FLUX.1 [schnell]":
-                return 1024, 1024, 4, gr.update(interactive=False), gr.update(interactive=False)
+                return 1024, 1024, 4, gr.update(visible=False), gr.update(visible=False)
             else:
-                return 512, 512, 50, gr.update(interactive=True), gr.update(interactive=True)
+                return 512, 512, 50, gr.update(visible=True), gr.update(visible=True)
 
         preset_dropdown.change(
             fn=update_preset_fields,
