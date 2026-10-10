@@ -108,5 +108,5 @@ graph TD
 ### Launch the Unified Studio
 
 ```bash
-python Zoo/serve_multimodal.py
+python -m Zoo.serve_multimodal.py
 ```

@@ -62,7 +62,7 @@ Instead of maintaining a separate copy of CLIP inside Stable Diffusion, the mode
 ### Launch Web Studio
 
 ```bash
-python Zoo/image_generation.py
+python -m Zoo.image_generation.py
 ```
 
 ### Programmatic Python Usage

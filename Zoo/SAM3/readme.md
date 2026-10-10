@@ -47,5 +47,5 @@ graph TD
 ## 🚀 Quickstart
 
 ```bash
-python Zoo/serve_sam3.py
+python -m Zoo.serve_visual_grounding
 ```

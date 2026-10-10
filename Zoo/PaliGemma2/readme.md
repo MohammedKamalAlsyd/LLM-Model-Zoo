@@ -120,5 +120,5 @@ PaliGemma 2 uses specialized prompt prefixes for downstream tasks:
 ### Launch the Unified Studio
 
 ```bash
-python Zoo/serve_multimodal.py
+python -m Zoo.serve_multimodal.py
 ```

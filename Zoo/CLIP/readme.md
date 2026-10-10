@@ -44,5 +44,5 @@ graph TD
 ## 🚀 Quickstart
 
 ```bash
-python Zoo/serve_zero_shot.py
+python -m Zoo.serve_zero_shot.py
 ```

@@ -47,7 +47,7 @@ graph LR
 Run the unified interface to switch between Stable Diffusion and FLUX:
 
 ```bash
-python Zoo/generate_image.py
+python -m Zoo.generate_image.py
 ```
 
 ### Programmatic Python Usage

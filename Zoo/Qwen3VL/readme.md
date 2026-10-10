@@ -107,5 +107,5 @@ Before computing attention scores, Query and Key projections are normalized indi
 Run all three models under the unified Gradio server with lazy loading:
 
 ```powershell
-python Zoo/serve_multimodal.py
+python -m Zoo.serve_multimodal.py
 ```
