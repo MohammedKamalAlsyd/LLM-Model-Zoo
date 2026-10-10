@@ -51,10 +51,10 @@ class FlowMatchEulerDiscreteScheduler:
 
     def _time_shift_exponential(self, mu: float, sigma_power: float, t: np.ndarray) -> np.ndarray:
         exp_mu = math.exp(mu)
-        return exp_mu / (exp_mu + (1.0 / t - 1.0) ** sigma_power)
+        return exp_mu / (exp_mu + (1.0 / t - 1.0) ** sigma_power) # type: ignore
 
     def _time_shift_linear(self, mu: float, sigma_power: float, t: np.ndarray) -> np.ndarray:
-        return mu / (mu + (1.0 / t - 1.0) ** sigma_power)
+        return mu / (mu + (1.0 / t - 1.0) ** sigma_power) # type: ignore
 
     def time_shift(self, mu: float, sigma: float, t: np.ndarray) -> np.ndarray:
         if self.time_shift_type == "exponential":
