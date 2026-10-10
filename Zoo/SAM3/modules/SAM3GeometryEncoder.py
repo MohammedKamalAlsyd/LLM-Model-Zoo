@@ -1,16 +1,42 @@
+"""Geometry Prompt Encoder for bounding boxes with RoI-Align and coordinate embeddings."""
+
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
-import torchvision
-from Zoo.SAM3.SubModels.SAM3Common import (
+import torchvision.ops
+
+from Zoo.Common.vision_utils import box_cxcywh_to_xyxy
+from Zoo.SAM3.modules.SAM3Common import (
     Sam3Attention,
     Sam3MLP,
-    Sam3SinePositionEmbedding,
-    box_cxcywh_to_xyxy,
     concat_padded_sequences,
 )
 
+
+class Sam3GeometrySineEmbedding(nn.Module):
+    """Coordinate-specific sine-cosine positional encoder for bounding box prompt geometry."""
+
+    def __init__(self, num_position_features: int = 128, temperature: float = 10000.0) -> None:
+        super().__init__()
+        self.num_pos_feats = num_position_features
+        self.temperature = temperature
+        self.scale = 2.0 * torch.pi
+
+    def encode_1d_positions(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        dim_t = torch.arange(self.num_pos_feats, device=x.device, dtype=x.dtype)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        pos_x = (x * self.scale)[:, None] / dim_t
+        pos_y = (y * self.scale)[:, None] / dim_t
+        px = torch.stack((pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2).flatten(1)
+        py = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
+        return px, py
+
+
 class Sam3GeometryEncoderLayer(nn.Module):
-    def __init__(self, hidden_size: int = 256, intermediate_size: int = 2048, num_heads: int = 8, dropout: float = 0.1):
+    """Self-attention across prompts followed by cross-attention to visual feature maps."""
+
+    def __init__(self, hidden_size: int = 256, intermediate_size: int = 2048, num_heads: int = 8, dropout: float = 0.1) -> None:
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(hidden_size)
         self.self_attn = Sam3Attention(hidden_size, num_heads)
@@ -27,33 +53,28 @@ class Sam3GeometryEncoderLayer(nn.Module):
         prompt_feats: torch.Tensor,
         vision_feats: torch.Tensor,
         vision_pos_encoding: torch.Tensor,
-        prompt_mask: torch.Tensor | None = None,
+        prompt_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # 1. Self Attention across prompts
+        # 1. Prompt Self-Attention
         residual = prompt_feats
         h = self.layer_norm1(prompt_feats)
         h, _ = self.self_attn(h, h, h, attention_mask=prompt_mask)
         prompt_feats = residual + self.dropout(h)
 
-        # 2. Cross Attention to vision features
+        # 2. Vision Cross-Attention
         residual = prompt_feats
         h = self.layer_norm2(prompt_feats)
         key = vision_feats + vision_pos_encoding
         h, _ = self.cross_attn(h, key, vision_feats)
         prompt_feats = residual + self.dropout(h)
 
-        # 3. Feed Forward MLP
-        residual = prompt_feats
-        h = self.layer_norm3(prompt_feats)
-        h = self.mlp(h)
-        return residual + self.dropout(h)
+        # 3. FFN Residual
+        return prompt_feats + self.dropout(self.mlp(self.layer_norm3(prompt_feats)))
 
 
 class Sam3GeometryEncoder(nn.Module):
-    """
-    Encodes geometric box prompts using ROI-align feature pooling, direct coordinate 
-    projection, and sine position embeddings.
-    """
+    """Processes box prompts into high-dimensional tokens injected into DETR."""
+
     def __init__(
         self,
         hidden_size: int = 256,
@@ -61,12 +82,12 @@ class Sam3GeometryEncoder(nn.Module):
         num_layers: int = 3,
         num_heads: int = 8,
         roi_size: int = 7,
-    ):
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.roi_size = roi_size
 
-        self.position_encoding = Sam3SinePositionEmbedding(num_position_features=hidden_size // 2, normalize=True)
+        self.position_encoding = Sam3GeometrySineEmbedding(num_position_features=hidden_size // 2)
         self.label_embed = nn.Embedding(2, hidden_size)
         self.cls_embed = nn.Embedding(1, hidden_size)
 
@@ -91,14 +112,14 @@ class Sam3GeometryEncoder(nn.Module):
         box_mask: torch.Tensor,
         box_labels: torch.Tensor,
         vision_features: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_boxes = boxes.shape[:2]
         height, width = vision_features.shape[-2:]
 
         # Direct coordinate embedding
         boxes_embed = self.boxes_direct_project(boxes)
 
-        # ROI Align pooling over vision features
+        # RoI Align pooling over fine vision features
         boxes_xyxy = box_cxcywh_to_xyxy(boxes)
         scale = torch.tensor([width, height, width, height], dtype=boxes_xyxy.dtype, device=boxes_xyxy.device).view(1, 1, 4)
         boxes_xyxy_scaled = boxes_xyxy * scale
@@ -113,14 +134,13 @@ class Sam3GeometryEncoder(nn.Module):
         pooled_proj = self.boxes_pool_project(sampled_features).view(batch_size, num_boxes, self.hidden_size)
         boxes_embed = boxes_embed + pooled_proj
 
-        # Center positional encoding + spatial dimension deltas
+        # Center sine-encoding + box dimensions
         cx, cy, bw, bh = boxes.unbind(-1)
         pos_x, pos_y = self.position_encoding.encode_1d_positions(cx.flatten(), cy.flatten())
         pos_enc = torch.cat([pos_y, pos_x, bh.flatten()[:, None], bw.flatten()[:, None]], dim=1)
-        pos_enc = pos_enc.view(batch_size, num_boxes, -1)
-        boxes_embed = boxes_embed + self.boxes_pos_enc_project(pos_enc)
+        boxes_embed = boxes_embed + self.boxes_pos_enc_project(pos_enc.view(batch_size, num_boxes, -1))
 
-        # Label embeddings (positive vs negative clicks/boxes)
+        # Positive / negative label embeddings
         boxes_embed = boxes_embed + self.label_embed(box_labels.long())
         return boxes_embed, box_mask
 
@@ -129,9 +149,9 @@ class Sam3GeometryEncoder(nn.Module):
         box_embeddings: torch.Tensor,
         box_mask: torch.Tensor,
         box_labels: torch.Tensor,
-        img_feats: tuple[torch.Tensor, ...],
-        img_pos_embeds: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_feats: Tuple[torch.Tensor, ...],
+        img_pos_embeds: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = box_embeddings.shape[0]
 
         vision_feats = img_feats[-1]
@@ -141,10 +161,9 @@ class Sam3GeometryEncoder(nn.Module):
         vision_pos_flat = vision_pos.flatten(2).transpose(1, 2)
 
         norm_img_feats = self.vision_layer_norm(vision_feats.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
         prompt_embeds, prompt_mask = self._encode_boxes(box_embeddings, box_mask, box_labels, norm_img_feats)
 
-        # Prepend global CLS prompt token
+        # Prepend global CLS token
         cls_embed = self.cls_embed.weight.view(1, 1, self.hidden_size).expand(batch_size, -1, -1)
         cls_mask = torch.ones(batch_size, 1, dtype=prompt_mask.dtype, device=prompt_mask.device)
         prompt_embeds, prompt_mask = concat_padded_sequences(prompt_embeds, prompt_mask, cls_embed, cls_mask)

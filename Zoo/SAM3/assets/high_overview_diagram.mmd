@@ -1,0 +1,38 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef visionStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef promptStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef detrStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef outputStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Inputs [Stage 1: Inputs]
+        Img[Image / Video Frames]:::inputStyle
+        Txt[Text Queries]:::inputStyle
+        Box[Geometric Box Prompts]:::inputStyle
+    end
+
+    subgraph FeatureEncoders [Stage 2: Feature Encoding]
+        ViT[ViT-H Backbone + RoPE]:::visionStyle
+        FPN[Multi-Scale FPN Neck]:::visionStyle
+        CLIPText[CLIP Text Encoder]:::promptStyle
+        GeoEnc[RoI-Align Box Encoder]:::promptStyle
+    end
+
+    subgraph DETREngine [Stage 3: Multimodal DETR Engine]
+        DEnc[DETR Encoder: Vision x Prompt Attn]:::detrStyle
+        DDec[DETR Decoder: 200 Queries + RPB]:::detrStyle
+        Score[Dot-Product Scoring Head]:::detrStyle
+    end
+
+    subgraph Decoders [Stage 4: Prediction Heads]
+        MaskDec[Top-Down Pixel Decoder]:::outputStyle
+        Tracker[Video Memory Engine]:::outputStyle
+    end
+
+    Img --> ViT --> FPN --> DEnc
+    Txt --> CLIPText --> DEnc
+    Box --> GeoEnc --> DEnc
+    DEnc --> DDec
+    DDec --> Score --> OutputClass[Classification Logits]:::outputStyle
+    DDec --> MaskDec --> OutputMask[Binary / Semantic Masks]:::outputStyle
+    FPN & MaskDec --> Tracker --> TemporalTrack[Propagated Video Masks]:::outputStyle

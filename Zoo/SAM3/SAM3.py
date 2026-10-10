@@ -1,53 +1,79 @@
+"""Master SAM3 Architecture integrating detection, multi-scale necks, and video tracking."""
+
+from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
-from Zoo.SAM3.SubModels.SAM3VisionModel import Sam3VisionModel, Sam3VisionNeck
-from Zoo.SAM3.SubModels.SAM3TextModel import Sam3TextEncoder
-from Zoo.SAM3.SubModels.SAM3GeometryEncoder import Sam3GeometryEncoder
-from Zoo.SAM3.SubModels.SAM3DETR import Sam3DetrEncoder, Sam3DetrDecoder, Sam3DotProductScoring
-from Zoo.SAM3.SubModels.SAM3MaskDecoder import Sam3MaskDecoder
-from Zoo.SAM3.SubModels.SAM3TrackerModel import Sam3TrackerModel
-from Zoo.SAM3.SubModels.SAM3Common import box_cxcywh_to_xyxy, inverse_sigmoid
+
+from Zoo.Common.vision_utils import (
+    box_cxcywh_to_xyxy,
+    inverse_sigmoid,
+)
+from Zoo.SAM3.configs import SAM3Config
+from Zoo.SAM3.modules.SAM3DETR import (
+    Sam3DetrDecoder,
+    Sam3DetrEncoder,
+    Sam3DotProductScoring,
+)
+from Zoo.SAM3.modules.SAM3GeometryEncoder import Sam3GeometryEncoder
+from Zoo.SAM3.modules.SAM3MaskDecoder import Sam3MaskDecoder
+from Zoo.SAM3.modules.SAM3TextModel import Sam3TextEncoder
+from Zoo.SAM3.modules.SAM3TrackerModel import Sam3TrackerModel
+from Zoo.SAM3.modules.SAM3VisionModel import Sam3VisionModel, Sam3VisionNeck
+
 
 class Sam3DetectorModel(nn.Module):
-    """
-    Submodule matching all `detector_model.*` checkpoint keys.
-    """
-    def __init__(self):
+    """Submodule matching all `detector_model.*` checkpoint keys."""
+
+    def __init__(self, cfg: Optional[SAM3Config] = None) -> None:
         super().__init__()
-        # 1. Vision Backbone (ViT + FPN Neck)
-        self.vision_encoder = Sam3VisionModel()
+        config = cfg or SAM3Config()
 
-        # 2. Text Backbone (CLIP)
-        self.text_encoder = Sam3TextEncoder(hidden_size=1024, projection_dim=512)
+        self.vision_encoder = Sam3VisionModel(config.vision_config)
+        self.text_encoder = Sam3TextEncoder(config.text_config)
+        self.text_projection = nn.Linear(config.text_config.hidden_size, config.text_config.detr_proj_dim)
 
-        # 3. Text Dimension Projection: 1024 -> 256
-        self.text_projection = nn.Linear(1024, 256)
+        self.geometry_encoder = Sam3GeometryEncoder(
+            hidden_size=config.detr_config.hidden_size,
+            intermediate_size=config.detr_config.intermediate_size,
+            num_layers=3,
+            num_heads=config.detr_config.num_heads,
+        )
 
-        # 4. Geometry & Prompt Encoder
-        self.geometry_encoder = Sam3GeometryEncoder(hidden_size=256, intermediate_size=2048, num_layers=3, num_heads=8)
+        self.detr_encoder = Sam3DetrEncoder(
+            hidden_size=config.detr_config.hidden_size,
+            intermediate_size=config.detr_config.intermediate_size,
+            num_layers=config.detr_config.num_encoder_layers,
+            num_heads=config.detr_config.num_heads,
+        )
+        self.detr_decoder = Sam3DetrDecoder(
+            hidden_size=config.detr_config.hidden_size,
+            intermediate_size=config.detr_config.intermediate_size,
+            num_layers=config.detr_config.num_decoder_layers,
+            num_queries=config.detr_config.num_queries,
+            num_heads=config.detr_config.num_heads,
+        )
 
-        # 5. DETR Modules
-        self.detr_encoder = Sam3DetrEncoder(hidden_size=256, intermediate_size=2048, num_layers=6, num_heads=8)
-        self.detr_decoder = Sam3DetrDecoder(hidden_size=256, intermediate_size=2048, num_layers=6, num_queries=200, num_heads=8)
-
-        # 6. Scoring Head
-        self.dot_product_scoring = Sam3DotProductScoring(hidden_size=256, intermediate_size=2048)
-
-        # 7. Mask Decoder
-        self.mask_decoder = Sam3MaskDecoder(hidden_size=256, num_heads=8)
+        self.dot_product_scoring = Sam3DotProductScoring(
+            hidden_size=config.detr_config.hidden_size,
+            intermediate_size=config.detr_config.intermediate_size,
+        )
+        self.mask_decoder = Sam3MaskDecoder(
+            hidden_size=config.detr_config.hidden_size,
+            num_heads=config.detr_config.num_heads,
+        )
 
     def forward(
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        input_boxes: torch.Tensor | None = None,
-        input_boxes_labels: torch.Tensor | None = None,
-    ):
+        attention_mask: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        input_boxes_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
         batch_size = pixel_values.shape[0]
         device = pixel_values.device
 
-        # 1. Vision Features
+        # 1. Vision Features (ViT + FPN)
         fpn_features, fpn_positions = self.vision_encoder(pixel_values)
         fpn_features_detr = fpn_features[:-1]
         fpn_positions_detr = fpn_positions[:-1]
@@ -57,7 +83,7 @@ class Sam3DetectorModel(nn.Module):
         text_features = self.text_projection(text_seq)
         text_mask = attention_mask.bool() if attention_mask is not None else None
 
-        # 3. Geometric Prompts
+        # 3. Geometric Box Prompts
         if input_boxes is not None and input_boxes.numel() > 0:
             if input_boxes_labels is None:
                 input_boxes_labels = torch.ones_like(input_boxes[..., 0], dtype=torch.long)
@@ -76,7 +102,7 @@ class Sam3DetectorModel(nn.Module):
             combined_prompts = text_features
             combined_mask = text_mask
 
-        # 4. DETR Encoder
+        # 4. Multimodal DETR Encoder
         enc_hidden, enc_pos, _, spatial_shapes = self.detr_encoder(
             vision_features=[fpn_features_detr[-1]],
             text_features=combined_prompts,
@@ -93,7 +119,7 @@ class Sam3DetectorModel(nn.Module):
             spatial_shapes=spatial_shapes,
         )
 
-        # 6. Refinement & Scoring
+        # 6. Coordinate Refinement & Scoring
         delta_boxes = self.detr_decoder.box_head(inter_outputs)
         pred_boxes_cxcywh = (inverse_sigmoid(inter_boxes) + delta_boxes).sigmoid()
         pred_boxes = box_cxcywh_to_xyxy(pred_boxes_cxcywh[-1])
@@ -107,7 +133,7 @@ class Sam3DetectorModel(nn.Module):
         presence_logits = inter_presence[-1]
         last_queries = inter_outputs[-1]
 
-        # 7. Masks
+        # 7. Dense Mask Generation
         pred_masks, semantic_seg = self.mask_decoder(
             decoder_queries=last_queries,
             backbone_features=list(fpn_features_detr),
@@ -126,23 +152,25 @@ class Sam3DetectorModel(nn.Module):
 
 
 class Sam3Model(nn.Module):
+    """Unified SAM3 Architecture matching official checkpoints 1:1.
+
+    Hierarchy:
+      - `detector_model.*`: Open-vocabulary detector and segmenter.
+      - `tracker_neck.*`: Multi-scale neck for temporal tracking.
+      - `tracker_model.*`: SAM2/SAM3 temporal memory and attention engine.
     """
-    Complete SAM3 Architecture matching official weights 1:1.
-      - detector_model.*
-      - tracker_neck.*
-      - tracker_model.*
-    """
-    def __init__(self):
+
+    def __init__(self, config: Optional[SAM3Config] = None) -> None:
         super().__init__()
-        # 1. Detector Module (Vision + DETR + Text + Masks)
-        self.detector_model = Sam3DetectorModel()
+        self.config = config or SAM3Config()
 
-        # 2. Tracking Feature Neck (Identical FPN topology for tracker features)
-        self.tracker_neck = Sam3VisionNeck(in_channels=1024, fpn_dim=256)
+        self.detector_model = Sam3DetectorModel(self.config)
+        self.tracker_neck = Sam3VisionNeck(
+            in_channels=self.config.vision_config.hidden_size,
+            fpn_dim=self.config.vision_config.fpn_dim,
+        )
+        self.tracker_model = Sam3TrackerModel(hidden_size=self.config.tracker_config.hidden_size)
 
-        # 3. Video Tracking Memory Module (SAM2 Video Engine)
-        self.tracker_model = Sam3TrackerModel(hidden_size=256)
-
-    def forward(self, *args, **kwargs):
-        # Forward directly delegates to the detector for segmentation & detection
+    def forward(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Routes default invocation directly to the detector model."""
         return self.detector_model(*args, **kwargs)

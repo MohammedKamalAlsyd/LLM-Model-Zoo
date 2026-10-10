@@ -1,4 +1,5 @@
-from typing import List, Tuple
+import math
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -265,3 +266,61 @@ def prepare_multiaxis_coordinate_grid(
     grid[..., 1] += torch.arange(height_patches, device=device, dtype=dtype)[:, None]
     grid[..., 2] += torch.arange(width_patches, device=device, dtype=dtype)[None, :]
     return grid.reshape(height_patches * width_patches, 3)
+
+
+def box_cxcywh_to_xyxy(x: torch.Tensor) -> torch.Tensor:
+    """Converts bounding boxes from center format [cx, cy, w, h] to corner format [x0, y0, x1, y1]."""
+    x_c, y_c, w, h = x.unbind(-1)
+    return torch.stack([(x_c - 0.5 * w), (y_c - 0.5 * h), (x_c + 0.5 * w), (y_c + 0.5 * h)], dim=-1)
+
+
+def box_xyxy_to_cxcywh(x: torch.Tensor) -> torch.Tensor:
+    """Converts bounding boxes from corner format [x0, y0, x1, y1] to center format [cx, cy, w, h]."""
+    x0, y0, x1, y1 = x.unbind(-1)
+    return torch.stack([(x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0), (y1 - y0)], dim=-1)
+
+
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Computes numerical-stable inverse sigmoid (logit function)."""
+    x = x.clamp(min=0.0, max=1.0)
+    x1 = x.clamp(min=eps)
+    x2 = (1.0 - x).clamp(min=eps)
+    return torch.log(x1 / x2)
+
+
+class PositionEmbeddingSine2D(torch.nn.Module):
+    """Sinusoidal 2D spatial coordinate position embeddings matching DETR/SAM standards."""
+
+    def __init__(self, num_pos_feats: int = 128, temperature: float = 10000.0, normalize: bool = True, scale: Optional[float] = None) -> None:
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        self.scale = 2.0 * math.pi if scale is None else scale
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        """Args:
+
+            mask: Boolean or float tensor of shape (batch_size, height, width) with False for valid pixels.
+
+        Returns:
+            Tensor of shape (batch_size, 2 * num_pos_feats, height, width).
+        """
+        not_mask = ~mask if mask.dtype == torch.bool else (1.0 - mask)
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+
+        if self.normalize:
+            eps = 1e-6
+            y_embed = (y_embed / (y_embed[:, -1:, :] + eps)) * self.scale
+            x_embed = (x_embed / (x_embed[:, :, -1:] + eps)) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=mask.device)
+        dim_t = self.temperature ** (2.0 * torch.div(dim_t, 2, rounding_mode="floor") / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        return torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
