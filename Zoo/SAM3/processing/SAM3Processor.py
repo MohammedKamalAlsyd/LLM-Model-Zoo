@@ -190,7 +190,7 @@ class SAM3Processor:
     ) -> np.ndarray:
         """Renders dense semantic probability map as a smooth color heatmap overlay."""
         img_np = np.array(image.convert("RGB"))
-        prob_np = semantic_prob.squeeze().numpy()
+        prob_np = semantic_prob.squeeze().cpu().numpy()
         prob_norm = np.clip((prob_np - prob_np.min()) / (prob_np.max() - prob_np.min() + 1e-6), 0.0, 1.0)
         heatmap_gray = (prob_norm * 255.0).astype(np.uint8)
         heatmap_color = cv2.applyColorMap(heatmap_gray, colormap)
