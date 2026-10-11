@@ -176,11 +176,18 @@ MANAGER = VisualGroundingManager()
 
 
 def draw_overlay(image: Image.Image, masks: torch.Tensor) -> np.ndarray:
-    """Applies semi-transparent high-contrast masks onto a PIL image."""
+    """Applies semi-transparent high-contrast masks onto a PIL image safely handling 2D or 3D masks."""
     img_np = np.array(image.convert("RGB")).astype(np.float32)
 
-    for i in range(min(len(masks), 25)):
-        mask = masks[i].numpy()
+    # Guard: Ensure masks is always 3D [N, H, W]
+    if masks.ndim == 2:
+        masks = masks.unsqueeze(0)
+    elif masks.ndim == 4:
+        masks = masks.squeeze(0)
+
+    num_instances = masks.shape[0]
+    for i in range(min(num_instances, 25)):
+        mask = masks[i].numpy().astype(bool)
         if not mask.any():
             continue
         color = np.array(PALETTE[i % len(PALETTE)], dtype=np.float32)
@@ -229,7 +236,7 @@ def ground_image(
     if filtered_masks.shape[0] == 0:
         return np.array(image), semantic_overlay, f"No instances found matching '{prompt}' (threshold: {threshold:.2f})."
 
-    binary_masks = processor.post_process_masks(filtered_masks.unsqueeze(0), orig_size=orig_size)[0]
+    binary_masks = processor.post_process_masks(filtered_masks, orig_size=orig_size)
     instance_overlay = draw_overlay(image, binary_masks)
 
     return (

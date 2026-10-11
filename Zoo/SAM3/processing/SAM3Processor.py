@@ -164,10 +164,18 @@ class SAM3Processor:
     ) -> torch.Tensor:
         """Interpolates mask logits back to native image dimensions and binarizes."""
         orig_h, orig_w = orig_size
-        if pred_masks.ndim == 3:
-            pred_masks = pred_masks.unsqueeze(1)
-        upscaled = F.interpolate(pred_masks, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-        return (upscaled.squeeze(1) > threshold).cpu()
+        
+        # Ensure 4D tensor [B, N, H, W]
+        if pred_masks.ndim == 2:
+            pred_masks = pred_masks.unsqueeze(0).unsqueeze(0)
+        elif pred_masks.ndim == 3:
+            pred_masks = pred_masks.unsqueeze(0)
+
+        upscaled = F.interpolate(pred_masks.float(), size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        binary = (upscaled > threshold).cpu()
+        
+        # Always return [N, H, W] for a single batch item
+        return binary.squeeze(0)
 
     @staticmethod
     def post_process_semantic_seg(
