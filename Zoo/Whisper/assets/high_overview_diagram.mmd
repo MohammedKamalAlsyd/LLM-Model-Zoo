@@ -1,0 +1,39 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef audioStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef encoderStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef decoderStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef outputStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Inputs ["Stage 1: Audio & Task Inputs"]
+        Audio["Raw Audio: File or Live Mic (16kHz)"]:::inputStyle
+        Prompt["Target Language & Task (Transcribe / Translate)"]:::inputStyle
+    end
+
+    subgraph SignalProcessing ["Stage 2: Audio Preprocessing"]
+        Chunker["Sliding Window Chunking (30s Window, 25s Stride)"]:::audioStyle
+        Spectrogram["128-Channel Log-Mel Spectrogram (STFT)"]:::audioStyle
+    end
+
+    subgraph AudioEncoder ["Stage 3: Speech Representation Encoder"]
+        Conv["Strided 1D Convolutions (Time Downsampling 2x)"]:::encoderStyle
+        Enc["32-Layer Transformer Encoder (1280 Hidden Dim)"]:::encoderStyle
+    end
+
+    subgraph TextDecoder ["Stage 4: Turbo Text Generation Engine"]
+        Dec["4-Layer Transformer Decoder (large-v3-turbo)"]:::decoderStyle
+        KVCache["Fast Key-Value Cache (O(N) Complexity)"]:::decoderStyle
+        CrossAttn["Audio-to-Text Cross-Attention"]:::decoderStyle
+    end
+
+    subgraph Outputs ["Stage 5: Output Generation"]
+        LMHead["Tied Language Modeling Head (51,866 Vocab)"]:::outputStyle
+        Result["Timestamped Text Transcription / Translation"]:::outputStyle
+    end
+
+    Audio --> Chunker --> Spectrogram --> Conv --> Enc
+    Enc --> CrossAttn
+    Prompt --> Dec
+    CrossAttn --> Dec
+    KVCache <--> Dec
+    Dec --> LMHead --> Result
