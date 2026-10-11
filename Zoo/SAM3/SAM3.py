@@ -1,6 +1,6 @@
 """Master SAM3 Architecture integrating detection, multi-scale necks, and video tracking."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
@@ -133,7 +133,7 @@ class Sam3DetectorModel(nn.Module):
         presence_logits = inter_presence[-1]
         last_queries = inter_outputs[-1]
 
-        # 7. Dense Mask Generation
+        # 7. Dense Mask Generation & Semantic Segmentation
         pred_masks, semantic_seg = self.mask_decoder(
             decoder_queries=last_queries,
             backbone_features=list(fpn_features_detr),
@@ -148,17 +148,12 @@ class Sam3DetectorModel(nn.Module):
             "pred_logits": pred_logits,
             "presence_logits": presence_logits,
             "semantic_seg": semantic_seg,
+            "fpn_features": fpn_features,
         }
 
 
 class Sam3Model(nn.Module):
-    """Unified SAM3 Architecture matching official checkpoints 1:1.
-
-    Hierarchy:
-      - `detector_model.*`: Open-vocabulary detector and segmenter.
-      - `tracker_neck.*`: Multi-scale neck for temporal tracking.
-      - `tracker_model.*`: SAM2/SAM3 temporal memory and attention engine.
-    """
+    """Unified SAM3 Architecture matching official checkpoints 1:1."""
 
     def __init__(self, config: Optional[SAM3Config] = None) -> None:
         super().__init__()
@@ -174,3 +169,100 @@ class Sam3Model(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Routes default invocation directly to the detector model."""
         return self.detector_model(*args, **kwargs)
+
+    def init_tracking(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        confidence_threshold: float = 0.35,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Grounds target concept on the initial frame and registers tracking memory state."""
+        out = self.detector_model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        scores = out["pred_logits"][0].sigmoid()
+        if out["presence_logits"] is not None:
+            scores = scores * out["presence_logits"][0].sigmoid()
+
+        keep = scores > confidence_threshold
+        has_detection = keep.any().item()
+
+        tracker_fpn, _ = self.tracker_neck(
+            self.detector_model.vision_encoder.backbone(pixel_values).view(
+                pixel_values.shape[0],
+                pixel_values.shape[-2] // 14,
+                pixel_values.shape[-1] // 14,
+                -1,
+            ).permute(0, 3, 1, 2)
+        )
+
+        memory_bank: List[torch.Tensor] = []
+        best_mask = torch.zeros((1, 1, 252, 252), device=pixel_values.device, dtype=pixel_values.dtype)
+
+        if has_detection:
+            filtered_indices = torch.where(keep)[0]
+            top_idx = filtered_indices[scores[keep].argmax()]
+            best_mask = out["pred_masks"][0, top_idx:top_idx + 1].unsqueeze(0)
+            mem = self.tracker_model.encode_memory(tracker_fpn[-2], best_mask)
+            memory_bank.append(mem)
+
+        state = {
+            "memory_bank": memory_bank,
+            "has_detection": has_detection,
+            "tracker_fpn": tracker_fpn,
+            "last_mask": best_mask,
+        }
+        return out, state
+
+    def step_tracking(
+        self,
+        pixel_values: torch.Tensor,
+        tracking_state: Dict[str, Any],
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Propagates visual concept temporally using the SAM3 video memory engine.
+
+        Returns:
+            Tuple of:
+                - tracked_mask: [1, 1, H, W]
+                - track_score: scalar tensor
+                - semantic_seg: [1, 1, H, W] dense semantic logit map
+        """
+        tracker_fpn, _ = self.tracker_neck(
+            self.detector_model.vision_encoder.backbone(pixel_values).view(
+                pixel_values.shape[0],
+                pixel_values.shape[-2] // 14,
+                pixel_values.shape[-1] // 14,
+                -1,
+            ).permute(0, 3, 1, 2)
+        )
+
+        memory_bank: List[torch.Tensor] = tracking_state.get("memory_bank", [])
+        deep_feat = tracker_fpn[-2]
+        high_res = [tracker_fpn[0], tracker_fpn[1]]
+
+        tracked_mask, obj_score = self.tracker_model.track_step(
+            curr_feat=deep_feat,
+            high_res_features=high_res,
+            memory_bank=memory_bank,
+        )
+
+        new_mem = self.tracker_model.encode_memory(deep_feat, tracked_mask)
+        memory_bank.append(new_mem)
+        if len(memory_bank) > 7:
+            memory_bank.pop(0)
+        tracking_state["memory_bank"] = memory_bank
+        tracking_state["last_mask"] = tracked_mask
+
+        # Compute current frame dense semantic segmentation
+        with torch.no_grad():
+            f_detr = tracker_fpn[:-1]
+            pixel_embed = self.detector_model.mask_decoder.pixel_decoder(list(f_detr))
+            semantic_seg = self.detector_model.mask_decoder.semantic_projection(pixel_embed)
+
+        return tracked_mask, obj_score.sigmoid().squeeze(), semantic_seg

@@ -1,13 +1,14 @@
 """Multimodal Image, Video, and Prompt Preprocessing Pipeline for SAM3."""
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import cv2
+import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import functional as TF
 from transformers import AutoTokenizer
 
-from Zoo.Common.multimodality_utils import sample_video_frames
 from Zoo.Common.vision_utils import box_xyxy_to_cxcywh
 from Zoo.SAM3.configs import SAM3ProcessorConfig
 
@@ -59,16 +60,16 @@ class SAM3Processor:
     def process_video(
         self,
         video_path: str,
-        max_frames: int = 16,
+        max_frames: Optional[int] = None,
         sample_fps: Optional[float] = None,
         device: Union[str, torch.device] = "cpu",
-    ) -> Tuple[torch.Tensor, List[Image.Image], Tuple[int, int], List[float]]:
-        """Extracts and standardizes video frames for temporal tracking.
+    ) -> Tuple[torch.Tensor, List[Image.Image], Tuple[int, int], List[float], float]:
+        """Extracts and standardizes video frames without mandatory downsampling.
 
         Args:
             video_path: Path to MP4/AVI/MKV video file.
-            max_frames: Upper bound on extracted frames.
-            sample_fps: Target frame rate sampling.
+            max_frames: Optional upper bound on frames. If None, processes all frames.
+            sample_fps: Target frame rate sampling. If None, preserves native frame rate.
             device: Target execution device.
 
         Returns:
@@ -77,8 +78,32 @@ class SAM3Processor:
                 - pil_frames: List of raw PIL Images for downstream rendering.
                 - orig_size: (height, width) of the raw video stream.
                 - timestamps: Frame timestamp floats in seconds.
+                - native_fps: Native video frame rate.
         """
-        pil_frames, timestamps = sample_video_frames(video_path, max_frames=max_frames, sample_fps=sample_fps)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
+
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        frame_interval = 1 if not sample_fps else max(1, int(round(native_fps / sample_fps)))
+
+        pil_frames: List[Image.Image] = []
+        timestamps: List[float] = []
+        frame_idx = 0
+
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            if frame_idx % frame_interval == 0:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                pil_frames.append(Image.fromarray(frame_rgb))
+                timestamps.append(frame_idx / native_fps)
+                if max_frames is not None and len(pil_frames) >= max_frames:
+                    break
+            frame_idx += 1
+        cap.release()
+
         if not pil_frames:
             raise ValueError(f"No frames could be extracted from: {video_path}")
 
@@ -93,7 +118,7 @@ class SAM3Processor:
             tensors.append(TF.normalize(t, mean=list(self.config.image_mean), std=list(self.config.image_std)))
 
         batched_pixels = torch.stack(tensors, dim=0).to(device)
-        return batched_pixels, pil_frames, (orig_h, orig_w), timestamps
+        return batched_pixels, pil_frames, (orig_h, orig_w), timestamps, native_fps
 
     def process_text(
         self,
@@ -139,8 +164,39 @@ class SAM3Processor:
     ) -> torch.Tensor:
         """Interpolates mask logits back to native image dimensions and binarizes."""
         orig_h, orig_w = orig_size
+        if pred_masks.ndim == 3:
+            pred_masks = pred_masks.unsqueeze(1)
         upscaled = F.interpolate(pred_masks, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-        return (upscaled > threshold).cpu()
+        return (upscaled.squeeze(1) > threshold).cpu()
+
+    @staticmethod
+    def post_process_semantic_seg(
+        semantic_seg: torch.Tensor,
+        orig_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Upscales continuous semantic segmentation logits to native dimensions as normalized probabilities."""
+        orig_h, orig_w = orig_size
+        if semantic_seg.ndim == 3:
+            semantic_seg = semantic_seg.unsqueeze(1)
+        upscaled = F.interpolate(semantic_seg, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        return upscaled.squeeze(1).sigmoid().cpu()
+
+    @staticmethod
+    def render_semantic_heatmap(
+        image: Image.Image,
+        semantic_prob: torch.Tensor,
+        colormap: int = cv2.COLORMAP_VIRIDIS,
+        alpha: float = 0.55,
+    ) -> np.ndarray:
+        """Renders dense semantic probability map as a smooth color heatmap overlay."""
+        img_np = np.array(image.convert("RGB"))
+        prob_np = semantic_prob.squeeze().numpy()
+        prob_norm = np.clip((prob_np - prob_np.min()) / (prob_np.max() - prob_np.min() + 1e-6), 0.0, 1.0)
+        heatmap_gray = (prob_norm * 255.0).astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_gray, colormap)
+        heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+        blended = (img_np * (1.0 - alpha) + heatmap_color * alpha).clip(0, 255).astype(np.uint8)
+        return blended
 
     @staticmethod
     def post_process_detections(
