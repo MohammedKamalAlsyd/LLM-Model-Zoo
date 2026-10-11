@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from Zoo.Whisper.configs import WhisperDecoderConfig
-from Zoo.Whisper.SubModels.Transformer import WhisperDecoderLayer
+from Zoo.Whisper.modules.Transformer import WhisperDecoderLayer
 
 
 class WhisperDecoder(nn.Module):
@@ -61,7 +61,7 @@ class WhisperDecoder(nn.Module):
         # Embed Tokens and add Learned Positional Embeddings
         x = self.embed_tokens(input_ids) + self.embed_positions(positions)
 
-        next_key_values = [] if use_cache else None
+        next_key_values: List[Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = []
 
         # Pass through Decoder Layers
         for i, layer in enumerate(self.layers):
@@ -80,4 +80,4 @@ class WhisperDecoder(nn.Module):
                 next_key_values.append((present_self, present_cross))
 
         x = self.layer_norm(x)
-        return x, next_key_values
+        return x, next_key_values if use_cache else None

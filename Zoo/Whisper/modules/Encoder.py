@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Zoo.Whisper.configs import WhisperEncoderConfig
-from Zoo.Whisper.SubModels.Transformer import WhisperEncoderLayer
+from Zoo.Whisper.modules.Transformer import WhisperEncoderLayer
 
 
 class WhisperEncoder(nn.Module):
