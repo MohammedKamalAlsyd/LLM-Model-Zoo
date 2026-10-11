@@ -178,7 +178,7 @@ class SAM3Processor:
         orig_h, orig_w = orig_size
         if semantic_seg.ndim == 3:
             semantic_seg = semantic_seg.unsqueeze(1)
-        upscaled = F.interpolate(semantic_seg, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        upscaled = F.interpolate(semantic_seg.float(), size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         return upscaled.squeeze(1).sigmoid().cpu()
 
     @staticmethod
@@ -190,7 +190,7 @@ class SAM3Processor:
     ) -> np.ndarray:
         """Renders dense semantic probability map as a smooth color heatmap overlay."""
         img_np = np.array(image.convert("RGB"))
-        prob_np = semantic_prob.squeeze().cpu().numpy()
+        prob_np = semantic_prob.squeeze().float().cpu().numpy()
         prob_norm = np.clip((prob_np - prob_np.min()) / (prob_np.max() - prob_np.min() + 1e-6), 0.0, 1.0)
         heatmap_gray = (prob_norm * 255.0).astype(np.uint8)
         heatmap_color = cv2.applyColorMap(heatmap_gray, colormap)
