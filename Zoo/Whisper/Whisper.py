@@ -3,10 +3,25 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from Zoo.Whisper.configs import WhisperConfig
 from Zoo.Whisper.modules.Decoder import WhisperDecoder
 from Zoo.Whisper.modules.Encoder import WhisperEncoder
+
+
+class TiedLinear:
+    """Functional linear projection sharing weights with an Embedding without creating a duplicate state_dict parameter."""
+
+    def __init__(self, embedding: nn.Embedding) -> None:
+        self._embedding = embedding
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self._embedding.weight
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self._embedding.weight)
 
 
 class WhisperModel(nn.Module):
@@ -44,12 +59,8 @@ class WhisperForConditionalGeneration(nn.Module):
         self.model = WhisperModel(self.config)
 
         # LM Head tied directly to the decoder embedding weights
-        self.proj_out = nn.Linear(
-            self.config.decoder_config.d_model,
-            self.config.decoder_config.vocab_size,
-            bias=False,
-        )
-        self.proj_out.weight = self.model.decoder.embed_tokens.weight
+        # Uses TiedLinear so 'proj_out.weight' is not expected as an independent key in state_dict
+        self.proj_out = TiedLinear(self.model.decoder.embed_tokens)
 
     def forward(
         self,
