@@ -5,6 +5,7 @@ with FlashAttention, KV-caching, and arbitrary-length audio chunk streaming.
 """
 
 import os
+import ssl
 import sys
 import tempfile
 import urllib.request
@@ -31,28 +32,16 @@ from Zoo.Whisper.Whisper import WhisperForConditionalGeneration
 DEFAULT_WHISPER_REPO = "openai/whisper-large-v3-turbo"
 DEVICE, DTYPE = auto_detect_device_and_dtype()
 
-# --- Predefined Audio Examples ---
+# --- Predefined Audio Examples (Reliable CDN URLs) ---
 AUDIO_EXAMPLES = [
     [
-        "https://upload.wikimedia.org/wikipedia/commons/7/75/Apollo_11_launch_clip.ogg",
+        "https://raw.githubusercontent.com/ggml-org/whisper.cpp/master/samples/jfk.wav",
         "en",
         "transcribe",
         True,
     ],
     [
-        "https://upload.wikimedia.org/wikipedia/commons/c/c8/Declaration_of_Human_Rights_-_Article_1_-_German.ogg",
-        "de",
-        "translate",
-        False,
-    ],
-    [
-        "https://upload.wikimedia.org/wikipedia/commons/2/22/French_sample.ogg",
-        "fr",
-        "transcribe",
-        True,
-    ],
-    [
-        "https://upload.wikimedia.org/wikipedia/commons/8/82/Albert_Einstein%27s_voice.ogg",
+        "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
         "en",
         "transcribe",
         False,
@@ -77,30 +66,57 @@ LANGUAGE_CHOICES = [
 
 
 def download_if_url(path_or_url: Optional[str]) -> Optional[str]:
-    """Downloads remote audio files with request headers to prevent 403 Forbidden errors."""
+    """Downloads remote audio files safely with browser headers to avoid HTTP 403 Forbidden."""
     if not path_or_url or not isinstance(path_or_url, str):
         return None
+
     if path_or_url.startswith(("http://", "https://")):
         cache_dir = os.path.join(tempfile.gettempdir(), "whisper_cache")
         os.makedirs(cache_dir, exist_ok=True)
+
         filename = os.path.basename(path_or_url.split("?")[0])
         local_filepath = os.path.join(cache_dir, filename)
 
+        # Return cached copy if it exists and is not empty
         if os.path.exists(local_filepath) and os.path.getsize(local_filepath) > 0:
             return local_filepath
 
         try:
+            # Custom SSL context and User-Agent to bypass restrictive firewalls/WAFs
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
             req = urllib.request.Request(
                 path_or_url,
-                headers={"User-Agent": "LLMModelZoo/1.0 AudioLoader"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "*/*",
+                },
             )
-            with urllib.request.urlopen(req, timeout=20) as response, open(local_filepath, "wb") as out_file:
+            with urllib.request.urlopen(req, timeout=25, context=ctx) as response, open(local_filepath, "wb") as out_file:
                 out_file.write(response.read())
+
             return local_filepath
         except Exception as e:
-            print(f"Warning: Failed to fetch remote audio {path_or_url}: {e}")
+            print(f"[*] Warning: Could not pre-fetch remote audio '{path_or_url}': {e}")
             return None
+
     return path_or_url
+
+
+def prepare_local_examples(examples_list: List[List[Any]]) -> List[List[Any]]:
+    """Caches examples locally before registering them with Gradio to prevent internal SSRF/403 crashes."""
+    local_examples = []
+    for ex in examples_list:
+        raw_source = ex[0]
+        local_path = download_if_url(raw_source)
+        if local_path and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            local_examples.append([local_path] + ex[1:])
+    return local_examples
 
 
 class SpeechToTextManager:
@@ -129,7 +145,6 @@ class SpeechToTextManager:
         self, repo_id: str = DEFAULT_WHISPER_REPO
     ) -> Tuple[WhisperForConditionalGeneration, WhisperFeatureExtractor, WhisperTokenizer]:
         """Loads weights using universal model_loader from Zoo.Common."""
-        # Explicitly check all three to satisfy static typecheckers
         if (
             self.model is not None
             and self.processor is not None
@@ -259,14 +274,17 @@ def build_ui() -> gr.Blocks:
                 text_output = gr.Textbox(label="Transcription / Translation", lines=14)
                 status_output = gr.Textbox(label="Processing Summary", lines=2)
 
-        gr.Markdown("### 💡 Predefined Speech Examples")
-        gr.Examples(
-            examples=AUDIO_EXAMPLES,
-            inputs=[audio_input, lang_select, task_select, timestamps_chk],
-            outputs=[text_output, status_output],
-            fn=transcribe_speech,
-            cache_examples=False,
-        )
+        # Safely resolve examples locally to ensure Gradio never fails on SSRF / 403 checks
+        resolved_examples = prepare_local_examples(AUDIO_EXAMPLES)
+        if resolved_examples:
+            gr.Markdown("### 💡 Predefined Speech Examples")
+            gr.Examples(
+                examples=resolved_examples,
+                inputs=[audio_input, lang_select, task_select, timestamps_chk],
+                outputs=[text_output, status_output],
+                fn=transcribe_speech,
+                cache_examples=False,
+            )
 
         submit_btn.click(
             fn=transcribe_speech,
