@@ -20,7 +20,6 @@ class CausalConv3d(nn.Conv3d):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Explicitly extract integer padding values to ensure type safety
         pad_d = int(self.padding[0]) if isinstance(self.padding, tuple) else 0
         pad_h = int(self.padding[1]) if isinstance(self.padding, tuple) else 0
         pad_w = int(self.padding[2]) if isinstance(self.padding, tuple) else 0
@@ -453,19 +452,17 @@ class WanVAE_(nn.Module):
 
         assert out is not None, "Encoding failed to produce valid feature maps."
         mu, _ = self.conv1(out).chunk(2, dim=1)
-        if isinstance(scale[0], torch.Tensor):
-            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(1, self.z_dim, 1, 1, 1)
-        else:
-            mu = (mu - scale[0]) * scale[1]
+        s0 = scale[0].to(device=mu.device, dtype=mu.dtype)
+        s1 = scale[1].to(device=mu.device, dtype=mu.dtype)
+        mu = (mu - s0.view(1, self.z_dim, 1, 1, 1)) * s1.view(1, self.z_dim, 1, 1, 1)
         self.clear_cache()
         return mu
 
     def decode(self, z: torch.Tensor, scale: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         self.clear_cache()
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
-        else:
-            z = z / scale[1] + scale[0]
+        s0 = scale[0].to(device=z.device, dtype=z.dtype)
+        s1 = scale[1].to(device=z.device, dtype=z.dtype)
+        z = z / s1.view(1, self.z_dim, 1, 1, 1) + s0.view(1, self.z_dim, 1, 1, 1)
 
         iter_ = z.shape[2]
         x = self.conv2(z)
@@ -512,12 +509,21 @@ class WanVAE:
         if vae_pth is not None and os.path.exists(vae_pth):
             self.load_checkpoint(vae_pth)
 
+    def to(self, device: Union[str, torch.device]) -> "WanVAE":
+        """Synchronizes model, internal mean, and std scaling tensors to target device."""
+        self.device = torch.device(device)
+        self.model = self.model.to(self.device)
+        self.mean = self.mean.to(self.device)
+        self.std = self.std.to(self.device)
+        self.scale = (self.mean, 1.0 / self.std)
+        return self
+
     def load_checkpoint(self, path: str) -> None:
         logger.info(f"Loading VAE weights from {path}")
         state = torch.load(path, map_location="cpu")
         if "state_dict" in state:
             state = state["state_dict"]
-        self.model.load_state_dict(state, assign=True)
+        self.model.load_state_dict(state, strict=False)
 
     @classmethod
     def from_pretrained(cls, pretrained_path: str, device: str = "cuda", dtype: torch.dtype = torch.float32) -> "WanVAE":
@@ -526,16 +532,20 @@ class WanVAE:
 
     def encode(self, videos: List[torch.Tensor]) -> List[torch.Tensor]:
         """Encodes list of [3, F, H, W] video tensors into [16, F_lat, H_lat, W_lat]."""
+        dev = next(self.model.parameters()).device
+        scale = (self.mean.to(dev), (1.0 / self.std).to(dev))
         with torch.amp.autocast("cuda", enabled=False):
             return [
-                self.model.encode(u.unsqueeze(0).to(self.device, dtype=torch.float32), self.scale).float().squeeze(0)
+                self.model.encode(u.unsqueeze(0).to(dev, dtype=torch.float32), scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Decodes list of [16, F_lat, H_lat, W_lat] latents into [3, F, H, W] RGB video tensors."""
+        dev = next(self.model.parameters()).device
+        scale = (self.mean.to(dev), (1.0 / self.std).to(dev))
         with torch.amp.autocast("cuda", enabled=False):
             return [
-                self.model.decode(u.unsqueeze(0).to(self.device, dtype=torch.float32), self.scale).float().clamp_(-1, 1).squeeze(0)
+                self.model.decode(u.unsqueeze(0).to(dev, dtype=torch.float32), scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]

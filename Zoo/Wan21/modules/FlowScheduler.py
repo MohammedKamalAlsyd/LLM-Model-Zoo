@@ -1,6 +1,6 @@
 """Continuous Flow-Matching ODE Solvers for Wan2.1."""
 
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -71,8 +71,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         timesteps = sigmas * self.num_train_timesteps
         sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
 
-        self.sigmas = torch.from_numpy(sigmas).to(device="cpu")
-        self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        self.sigmas = torch.from_numpy(sigmas).to(device=dev, dtype=torch.float32)
+        self.timesteps = torch.from_numpy(timesteps).to(device=dev, dtype=torch.int64)
         self.model_outputs = [None] * self.solver_order
         self.timestep_list = [None] * self.solver_order
         self.lower_order_nums = 0
@@ -88,8 +89,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         generator: Optional[torch.Generator] = None,
     ) -> Union[SchedulerOutput, Tuple]:
         assert self._step_index is not None
-        sigma_t = self.sigmas[self._step_index]
-        sigma_next = self.sigmas[self._step_index + 1]
+        sigma_t = self.sigmas[self._step_index].to(device=sample.device, dtype=sample.dtype)
+        sigma_next = self.sigmas[self._step_index + 1].to(device=sample.device, dtype=sample.dtype)
 
         # Flow Matching velocity to x0 data prediction
         x0_pred = sample - sigma_t * model_output
@@ -111,7 +112,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
     order = 1
 
     @register_to_config
-    def __init__(self, num_train_timesteps: int = 1000, solver_order: int = 2, shift: float = 1.0, **kwargs) -> None:
+    def __init__(self, num_train_timesteps: int = 1000, solver_order: int = 2, shift: float = 1.0, **kwargs: Any) -> None:
         self.shift = shift
         self.num_train_timesteps = num_train_timesteps
         self.solver_order = solver_order
@@ -131,8 +132,10 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             sigmas = np.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
             sigmas = s * sigmas / (1 + (s - 1) * sigmas)
         sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
-        self.sigmas = torch.from_numpy(sigmas)
-        self.timesteps = (self.sigmas[:-1] * self.num_train_timesteps).to(device=device, dtype=torch.int64)
+
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        self.sigmas = torch.from_numpy(sigmas).to(device=dev, dtype=torch.float32)
+        self.timesteps = (self.sigmas[:-1] * self.num_train_timesteps).to(device=dev, dtype=torch.int64)
         self._step_index = 0
 
     def step(
@@ -141,10 +144,10 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         timestep: Union[int, torch.Tensor],
         sample: torch.Tensor,
         return_dict: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> Union[SchedulerOutput, Tuple]:
-        sigma_t = self.sigmas[self._step_index]
-        sigma_next = self.sigmas[self._step_index + 1]
+        sigma_t = self.sigmas[self._step_index].to(device=sample.device, dtype=sample.dtype)
+        sigma_next = self.sigmas[self._step_index + 1].to(device=sample.device, dtype=sample.dtype)
         dt = sigma_next - sigma_t
         prev_sample = sample + dt * model_output
         self._step_index += 1

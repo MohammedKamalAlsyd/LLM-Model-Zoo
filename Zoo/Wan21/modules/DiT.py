@@ -5,15 +5,11 @@ conditioning modulation, per-head QK-RMSNorm, and Chunked SDPA for memory-constr
 """
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
-
-from Zoo.Wan21.configs import WanDiTConfig
 
 __all__ = ["WanModel", "VaceWanModel", "WanAttentionBlock", "Head", "MLPProj"]
 
@@ -46,6 +42,7 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Ten
 def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Applies factorized 3D RoPE across Frame (T), Height (H), and Width (W) dimensions."""
     n, c = x.size(2), x.size(3) // 2
+    freqs = freqs.to(device=x.device)
     freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     output = []
@@ -60,10 +57,11 @@ def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -
             ],
             dim=-1,
         ).reshape(seq_len, 1, -1)
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2).type_as(x)
+        if x.size(1) > seq_len:
+            x_i = torch.cat([x_i, x[i, seq_len:]], dim=0)
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).type_as(x)
 
 
 def chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
@@ -236,14 +234,17 @@ class WanAttentionBlock(nn.Module):
         freqs: torch.Tensor,
         context: torch.Tensor,
         context_lens: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         e_mod = (self.modulation + e).chunk(6, dim=1)
 
-        y = self.self_attn(self.norm1(x).float() * (1 + e_mod[1]) + e_mod[0], seq_lens, grid_sizes, freqs)
+        norm1_x = (self.norm1(x).float() * (1 + e_mod[1]) + e_mod[0]).type_as(x)
+        y = self.self_attn(norm1_x, seq_lens, grid_sizes, freqs)
         x = x + y * e_mod[2]
 
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
-        y = self.ffn(self.norm2(x).float() * (1 + e_mod[4]) + e_mod[3])
+        norm2_x = (self.norm2(x).float() * (1 + e_mod[4]) + e_mod[3]).type_as(x)
+        y = self.ffn(norm2_x)
         x = x + y * e_mod[5]
         return x
 
@@ -262,7 +263,8 @@ class Head(nn.Module):
 
     def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         e_mod = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-        return self.head(self.norm(x) * (1 + e_mod[1]) + e_mod[0])
+        mod_x = (self.norm(x).float() * (1 + e_mod[1]) + e_mod[0]).type_as(x)
+        return self.head(mod_x)
 
 
 class MLPProj(nn.Module):
@@ -307,7 +309,9 @@ class WanModel(nn.Module):
         qk_norm: bool = True,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        rope_theta: float = 10000.0,
         chunk_size: int = 1024,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.model_type = model_type
@@ -344,9 +348,9 @@ class WanModel(nn.Module):
         d = dim // num_heads
         self.freqs = torch.cat(
             [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, d - 4 * (d // 6), theta=rope_theta),
+                rope_params(1024, 2 * (d // 6), theta=rope_theta),
+                rope_params(1024, 2 * (d // 6), theta=rope_theta),
             ],
             dim=1,
         )
@@ -374,10 +378,9 @@ class WanModel(nn.Module):
         flattened = [u.flatten(2).transpose(1, 2) for u in embedded]
         seq_lens = torch.tensor([u.size(1) for u in flattened], dtype=torch.long)
 
-        # Disambiguate type: padded_x is Tensor, avoiding reassignment of x: List[Tensor]
         padded_x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in flattened])
 
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(device=device))
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
         context_padded = self.text_embedding(
@@ -417,10 +420,51 @@ class WanModel(nn.Module):
         return out
 
 
+class BaseWanAttentionBlock(WanAttentionBlock):
+    """Base block accepting control hints from VACE blocks."""
+
+    def __init__(self, *args: Any, block_id: Optional[int] = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.block_id = block_id
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hints: Optional[List[torch.Tensor]] = None,
+        context_scale: float = 1.0,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        x = super().forward(x, **kwargs)
+        if self.block_id is not None and hints is not None and self.block_id < len(hints):
+            x = x + hints[self.block_id] * context_scale
+        return x
+
+
+class VaceWanAttentionBlock(WanAttentionBlock):
+    """VACE extension block for video inpainting/control."""
+
+    def __init__(self, *args: Any, block_id: int = 0, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.block_id = block_id
+        if block_id == 0:
+            self.before_proj = nn.Linear(self.dim, self.dim)
+            nn.init.zeros_(self.before_proj.weight)
+            nn.init.zeros_(self.before_proj.bias)
+        self.after_proj = nn.Linear(self.dim, self.dim)
+        nn.init.zeros_(self.after_proj.weight)
+        nn.init.zeros_(self.after_proj.bias)
+
+    def forward(self, c: torch.Tensor, x: torch.Tensor, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.block_id == 0:
+            c = self.before_proj(c) + x
+        c = super().forward(c, **kwargs)
+        return c, self.after_proj(c)
+
+
 class VaceWanModel(WanModel):
     """WanModel supporting Video Control / Inpainting through VACE layers."""
 
-    def __init__(self, *args, vace_layers: Optional[List[int]] = None, vace_in_dim: Optional[int] = None, **kwargs) -> None:
+    def __init__(self, *args: Any, vace_layers: Optional[List[int]] = None, vace_in_dim: Optional[int] = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.vace_layers = [i for i in range(0, len(self.blocks), 2)] if vace_layers is None else vace_layers
         self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
@@ -449,38 +493,3 @@ class VaceWanModel(WanModel):
         self.vace_patch_embedding = nn.Conv3d(
             vace_in_dim or 16, self.dim, kernel_size=self.patch_size, stride=self.patch_size
         )
-
-
-class VaceWanAttentionBlock(WanAttentionBlock):
-    """VACE extension block for video inpainting/control."""
-
-    def __init__(self, *args, block_id: int = 0, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.block_id = block_id
-        if block_id == 0:
-            self.before_proj = nn.Linear(self.dim, self.dim)
-            nn.init.zeros_(self.before_proj.weight)
-            nn.init.zeros_(self.before_proj.bias)
-        self.after_proj = nn.Linear(self.dim, self.dim)
-        nn.init.zeros_(self.after_proj.weight)
-        nn.init.zeros_(self.after_proj.bias)
-
-    def forward(self, c: torch.Tensor, x: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.block_id == 0:
-            c = self.before_proj(c) + x
-        c = super().forward(c, **kwargs)
-        return c, self.after_proj(c)
-
-
-class BaseWanAttentionBlock(WanAttentionBlock):
-    """Base block accepting control hints from VACE blocks."""
-
-    def __init__(self, *args, block_id: Optional[int] = None, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.block_id = block_id
-
-    def forward(self, x: torch.Tensor, hints: List[torch.Tensor], context_scale: float = 1.0, **kwargs) -> torch.Tensor:
-        x = super().forward(x, **kwargs)
-        if self.block_id is not None:
-            x = x + hints[self.block_id] * context_scale
-        return x
