@@ -1,0 +1,38 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef t3Style fill:#ede7f6,stroke:#512da8,stroke-width:2px;
+    classDef flowStyle fill:#e0f2f1,stroke:#00695c,stroke-width:2px;
+    classDef vocStyle fill:#fbe9e7,stroke:#d84315,stroke-width:2px;
+
+    subgraph Inputs [Stage 1: Multimodal Conditioning]
+        Txt[Text Prompt + Language Tag]:::inputStyle
+        Wav[Reference Audio Sample]:::inputStyle
+        VE[VoiceEncoder: 256-d d-vector]:::inputStyle
+        S3Tok[S3Tokenizer: 25Hz Prompt Codes]:::inputStyle
+    end
+
+    subgraph Stage2 [Stage 2: Autoregressive Sequence Model]
+        Perceiver[Perceiver Latent Resampler: 32 Tokens]:::t3Style
+        T3Backbone[LLaMA-520M AR Backbone]:::t3Style
+        SpeechTokens[Discrete Speech Tokens: Vocab 6561]:::t3Style
+    end
+
+    subgraph Stage3 [Stage 3: Acoustic Flow Matching]
+        Conformer[Conformer 2x Upsampler]:::flowStyle
+        CFM[Causal 1D U-Net Velocity Estimator]:::flowStyle
+        Mel[80-Bin Mel Spectrogram: 24 kHz]:::flowStyle
+    end
+
+    subgraph Stage4 [Stage 4: Neural Waveform Synthesis]
+        NSF[Neural Source Filter Pitch / SineGen]:::vocStyle
+        HiFT[HiFT-Net Inverse STFT Synthesis]:::vocStyle
+        Audio[24 kHz Continuous Waveform]:::vocStyle
+    end
+
+    Txt --> T3Backbone
+    Wav --> VE --> T3Backbone
+    Wav --> S3Tok --> Perceiver --> T3Backbone
+    T3Backbone --> SpeechTokens
+    SpeechTokens --> Conformer --> CFM --> Mel
+    Wav --> CFM
+    Mel --> NSF --> HiFT --> Audio

@@ -1,0 +1,47 @@
+flowchart TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef tfmr fill:#ede7f6,stroke:#512da8,stroke-width:2px;
+    classDef flow fill:#e0f2f1,stroke:#00695c,stroke-width:2px;
+
+    subgraph Conditioning [Conditioning Extraction]
+        Wav16[ref_16k: 16 kHz Mono Audio]:::tensor --> VE[VoiceEncoder 3-Layer LSTM]:::op
+        VE --> SpkEmb[speaker_emb: 1 x 256]:::tensor
+        Wav16 --> S3T[S3Tokenizer: Mel + Quantizer]:::op
+        S3T --> PromptCodes[prompt_tokens: 1 x 150]:::tensor
+        PromptCodes --> Perceiver[Perceiver Cross-Attention]:::op
+        Perceiver --> LatentTokens[latent_prompt: 1 x 32 x 1024]:::tensor
+        Emo[emotion_adv: Scalar 0.5]:::tensor --> EmoProj[Linear: 1 -> 1024]:::op
+        EmoProj --> EmoToken[emo_token: 1 x 1 x 1024]:::tensor
+    end
+
+    subgraph Autoregression [T3 Autoregressive Prediction]
+        TxtIn[Normalized Text String]:::tensor --> BPE[MTLTokenizer BPE + Cangjie]:::op
+        BPE --> TextIDs[text_tokens: 1 x N]:::tensor
+        TextIDs --> TextEmb[Token + Pos Embeddings]:::op
+        SpkEmb --> SpkProj[Linear: 256 -> 1024]:::op
+        SpkProj & LatentTokens & EmoToken & TextEmb --> CatPrefix[torch.cat along Seq Dim]:::op
+        CatPrefix --> LLaMA[LLaMA-520M: 30 Layers, 16 Heads, RoPE]:::tfmr
+        LLaMA --> CFG[Classifier-Free Guidance Extrapolation]:::op
+        CFG --> Sample[Repetition Penalty + Min-P + Top-P]:::op
+        Sample --> SpeechIDs[speech_tokens: 1 x M codes]:::tensor
+    end
+
+    subgraph AcousticFlow [S3Flow: Flow Matching Decoder]
+        Wav24[ref_24k: 24 kHz Audio]:::tensor --> CAMP[CAMPPlus Dense TDNN]:::op
+        CAMP --> XVec[x_vector: 192-d]:::tensor
+        SpeechIDs --> ConfUp[Conformer 2x Upsampling Stack]:::op
+        ConfUp --> Mu[mu: 80 x T Continuous Acoustic Field]:::tensor
+        Noise[Gaussian Noise: 80 x T]:::tensor & Mu & XVec --> UNet[1D Causal U-Net: 12 Mid Blocks]:::flow
+        UNet --> Euler[Euler ODE Solver: 10 Steps]:::flow
+        Euler --> MelOut[Clean 80-Bin Mel-Spectrogram]:::tensor
+    end
+
+    subgraph Synthesis [S3Vocoder: HiFT-Net Synthesis]
+        MelOut --> F0Pred[ConvRNN F0 Predictor]:::op
+        F0Pred --> Harmonics[SourceModuleHnNSF SineGen]:::op
+        MelOut & Harmonics --> MRF[Multi-Receptive Field ResBlocks + Snake Act]:::op
+        MRF --> ISTFT[Inverse Short-Time Fourier Transform]:::op
+        ISTFT --> Fade[Drop EOS Token + Cosine Onset Fade]:::op
+        Fade --> FinalWav[Final 24 kHz Speech Waveform]:::tensor
+    end
