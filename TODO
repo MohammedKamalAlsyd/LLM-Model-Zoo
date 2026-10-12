@@ -1,3 +1,4 @@
-# TODO: use F.scaled_dot_product_attention instead of dot product to leverage flash scaled_dot_product_attention
-# TODO: organize the files and remove duplication at the last
-# TODO: remove processing in the code and use AutoProcessor instead
+# TODO: Reuse Zoo/CLIP in SAM3
+# TODO: Consolidate AutoencoderKL (VAE) (for SD + FLUX)
+# TODO: Consolidate T5 Model
+# TODO: Centralize RMSNorm
