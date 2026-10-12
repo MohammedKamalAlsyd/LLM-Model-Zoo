@@ -30,8 +30,8 @@ class S3Tokenizer(S3TokenizerV2):
         super().__init__(name)
         self.n_fft = 400
         mel_basis = librosa.filters.mel(sr=S3_SR, n_fft=self.n_fft, n_mels=cfg.n_mels)
-        self.register_buffer("_mel_filters", torch.from_numpy(mel_basis).float(), persistent=False)
-        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+        self.register_buffer("_mel_filters", torch.from_numpy(mel_basis).float(), persistent=True)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=True)
 
     def pad(self, wavs: List[Union[np.ndarray, torch.Tensor]], sr: int) -> List[torch.Tensor]:
         """Pads arbitrary waveforms to the nearest 40 ms boundary (1 token = 40 ms at 25 Hz)."""

@@ -161,11 +161,6 @@ class S3Gen(S3Token2Mel):
         self.register_buffer("trim_fade", trim_fade, persistent=False)
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> Any:
-        # Dynamically inject persistent FFT window buffers if absent in state dictionary
-        keys_to_ignore = ["tokenizer._mel_filters", "tokenizer.window"]
-        for k in keys_to_ignore:
-            if k not in state_dict and hasattr(self, "tokenizer"):
-                state_dict[k] = getattr(self.tokenizer, k.split(".")[-1])
         return super().load_state_dict(state_dict, strict=strict)
 
     @torch.inference_mode()
