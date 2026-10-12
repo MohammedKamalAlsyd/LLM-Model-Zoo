@@ -26,7 +26,8 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
         pos_float,
         torch.pow(10000, -torch.arange(half, device=position.device).to(pos_float).div(half)),
     )
-    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    # Compute in float64 for precision, return float32 to prevent Double tensor propagation
+    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1).float()
 
 
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
@@ -368,6 +369,8 @@ class WanModel(nn.Module):
         y: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         device = self.patch_embedding.weight.device
+        dtype = self.patch_embedding.weight.dtype
+
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
@@ -378,17 +381,27 @@ class WanModel(nn.Module):
         flattened = [u.flatten(2).transpose(1, 2) for u in embedded]
         seq_lens = torch.tensor([u.size(1) for u in flattened], dtype=torch.long)
 
-        padded_x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in flattened])
+        # Ensure non-negative sequence padding
+        padded_x_list = []
+        for u in flattened:
+            pad_s = max(0, seq_len - u.size(1))
+            padded_u = torch.cat([u, u.new_zeros(1, pad_s, u.size(2))], dim=1) if pad_s > 0 else u[:, :seq_len]
+            padded_x_list.append(padded_u)
+        padded_x = torch.cat(padded_x_list, dim=0)
 
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(device=device))
+        # Convert sinusoidal frequencies directly into layer weight dtype
+        time_freqs = sinusoidal_embedding_1d(self.freq_dim, t).to(device=device, dtype=dtype)
+        e = self.time_embedding(time_freqs)
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
-        context_padded = self.text_embedding(
-            torch.stack([
-                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ])
-        )
+        context_padded_list = []
+        for u in context:
+            u_cut = u[: self.text_len]
+            pad_len = max(0, self.text_len - u_cut.size(0))
+            padded_c = torch.cat([u_cut, u_cut.new_zeros(pad_len, u_cut.size(1))], dim=0) if pad_len > 0 else u_cut
+            context_padded_list.append(padded_c)
+
+        context_padded = self.text_embedding(torch.stack(context_padded_list))
 
         if clip_fea is not None and hasattr(self, "img_emb"):
             context_clip = self.img_emb(clip_fea)
@@ -407,7 +420,8 @@ class WanModel(nn.Module):
             padded_x = block(padded_x, **kwargs)
 
         head_out = self.head(padded_x, e)
-        return [u.float() for u in self.unpatchify(head_out, grid_sizes)]
+        # Keep native backbone dtype to prevent step-to-step precision promotion
+        return [u.to(dtype=dtype) for u in self.unpatchify(head_out, grid_sizes)]
 
     def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor) -> List[torch.Tensor]:
         c = self.out_dim

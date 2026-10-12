@@ -92,12 +92,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         sigma_t = self.sigmas[self._step_index].to(device=sample.device, dtype=sample.dtype)
         sigma_next = self.sigmas[self._step_index + 1].to(device=sample.device, dtype=sample.dtype)
 
-        # Flow Matching velocity to x0 data prediction
-        x0_pred = sample - sigma_t * model_output
-
-        # UniPC 1st-order forward ODE update
+        # Flow Matching Euler/UniPC forward update
         dt = sigma_next - sigma_t
-        prev_sample = sample + dt * model_output
+        prev_sample = (sample + dt * model_output.to(dtype=sample.dtype)).to(dtype=sample.dtype)
 
         self._step_index += 1
 
