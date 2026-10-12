@@ -1,0 +1,84 @@
+graph TD
+    classDef inputStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef textStyle fill:#ede7f6,stroke:#4527a0,stroke-width:2px;
+    classDef visionStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef ditStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef vaeStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+    classDef audioStyle fill:#e0f2f1,stroke:#00897b,stroke-width:2px;
+    classDef outputStyle fill:#f5f5f5,stroke:#424242,stroke-width:2px;
+
+    %% -------------------------------------------------------------
+    %% STAGE 1: INPUT CONDITIONING
+    %% -------------------------------------------------------------
+    subgraph S1 [Stage 1: Multimodal Conditioning]
+        direction TB
+        Prompt[Text Prompt & Negative Prompt]:::inputStyle
+        AnchorImg[Optional Anchor Image / Frames]:::inputStyle
+
+        UMT5[UMT5-XXL Text Encoder<br/>Offloaded to System RAM / CPU]:::textStyle
+        CLIPEnc[XLM-RoBERTa ViT-H/14<br/>Penultimate Layer 31 Visual Features]:::visionStyle
+        VAEEnc[Wan 3D Causal VAE Encoder<br/>Latent Conditioning & Video Masking]:::vaeStyle
+
+        Prompt -->|Tokenize 512 Tokens| UMT5
+        AnchorImg -->|224x224 Bicubic| CLIPEnc
+        AnchorImg -->|Native Aspect Video Tensor| VAEEnc
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 2: CONTINUOUS FLOW-MATCHING & 3D DiT
+    %% -------------------------------------------------------------
+    subgraph S2 [Stage 2: Flow Matching ODE Trajectory]
+        direction TB
+        NoiseInit[Initial Gaussian Noise<br/>x_1 ~ N 0, I <br/>16 x F_lat x H_lat x W_lat]:::ditStyle
+        FlowSched[FlowUniPC / FlowDPM++ Scheduler<br/>Time-Shifted Trajectory: sigma_t -> sigma_t-1]:::ditStyle
+
+        subgraph DiT_Core [Wan2.1 3D DiT Denoising Core]
+            direction TB
+            Patchify3D[Patch Embedding: 3D Conv 1x2x2]:::ditStyle
+            FactorizedRoPE[3D Factorized Continuous RoPE<br/>Temporal, Height, Width]:::ditStyle
+            AdaLNMod[Timestep Embedding + AdaLN Modulation]:::ditStyle
+            SelfAttn[Self-Attention + QK RMSNorm<br/>Chunked SDPA for 16GB VRAM]:::ditStyle
+            CrossAttn[Dual Cross-Attention<br/>Text Context + CLIP Visual Context]:::ditStyle
+            FFNBlock[SwiGLU / Gated-GELU FFN]:::ditStyle
+
+            Patchify3D --> SelfAttn
+            FactorizedRoPE --> SelfAttn
+            AdaLNMod --> SelfAttn
+            SelfAttn --> CrossAttn
+            CrossAttn --> FFNBlock
+        end
+
+        NoiseInit --> DiT_Core
+        UMT5 -->|Text Embeddings: 512 x 4096| CrossAttn
+        CLIPEnc -->|Visual Tokens: 257 x 1280| CrossAttn
+        VAEEnc -->|Padded Latent + Temporal Mask| Patchify3D
+
+        DiT_Core -->|Velocity Prediction v_theta| CFG[Classifier-Free Guidance<br/>v = v_uncond + s * v_cond - v_uncond]:::ditStyle
+        CFG --> FlowSched
+        FlowSched -->|Iterative Step: t = T ... 0| DiT_Core
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 3: TEMPORAL CAUSAL DECODING & AUDIO
+    %% -------------------------------------------------------------
+    subgraph S3 [Stage 3: Video Decoding & Foley Audio Synthesis]
+        direction TB
+        CleanLatent[Denoised Clean Latents x_0]:::ditStyle
+        VAEDec[Wan 3D Causal VAE Decoder<br/>FP32 Streaming Cache: CACHE_T=2<br/>Spatial-Temporal Decompression: 4x8x8]:::vaeStyle
+        SilentMP4[Rendered Silent MP4 Video]:::outputStyle
+
+        FoleyEngine[FoleyCrafter / AudioLDM V2A Engine<br/>Motion-to-Acoustic Cross-Attention]:::audioStyle
+        DSPChain[Studio DSP Mastering<br/>40Hz High-Pass + Windowing + Peak Norm]:::audioStyle
+        FFmpegMux[FFmpeg H.264 + AAC Multiplexer]:::outputStyle
+
+        CleanLatent --> VAEDec
+        VAEDec --> SilentMP4
+        SilentMP4 --> FoleyEngine
+        Prompt -->|Derive Acoustic Foley Prompt| FoleyEngine
+        FoleyEngine --> DSPChain
+        DSPChain -->|Studio WAV Track| FFmpegMux
+        SilentMP4 --> FFmpegMux
+    end
+
+    FinalVideo([Final Rendered MP4 Video with Synchronized Foley Audio]):::outputStyle
+    FFmpegMux --> FinalVideo

@@ -1,0 +1,135 @@
+graph TD
+    classDef tensor fill:#f5f5f5,stroke:#616161,stroke-width:1px;
+    classDef op fill:#ffffff,stroke:#1e88e5,stroke-width:2px;
+    classDef norm fill:#fff8e1,stroke:#fbc02d,stroke-width:2px;
+    classDef attn fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+    classDef cache fill:#e0f2f1,stroke:#00897b,stroke-width:2px;
+
+    %% -------------------------------------------------------------
+    %% STAGE 1: CONDITIONING & EMBEDDINGS
+    %% -------------------------------------------------------------
+    subgraph Stage1 [Detailed Stage 1: Conditioning & Spatial-Temporal Setup]
+        direction TB
+        TxtInp([Prompt & Negative Prompt]) --> T5Tok[UMT5 Tokenizer: max_length=512]:::op
+        T5Tok --> T5Enc[UMT5-XXL 24 Blocks: Shared Pos=False]:::op
+        T5Enc --> T5Ctx[context: B x 512 x 4096]:::tensor
+
+        ImgInp([Conditional Image: H x W x 3]) --> BicubicResize[Bicubic Resize: 224 x 224]:::op
+        BicubicResize --> CLIPVit[XLM-RoBERTa ViT-H/14: 32 Blocks]:::op
+        CLIPVit --> Slice31[Extract Penultimate Block 31 Output]:::op
+        Slice31 --> CLIPFeat[clip_fea: B x 257 x 1280]:::tensor
+
+        ImgInp --> VAEPrep[Broadcast to F_frames Video Tensor]:::op
+        VAEPrep --> VAEEncModel[WanVAE Encoder: 3D Causal Conv]:::op
+        VAEEncModel --> VAELat[y_img Latents: 16 x F_lat x H_lat x W_lat]:::tensor
+        VAEPrep --> MaskGen[Generate Binary Conditioning Mask]:::op
+        MaskGen --> MaskLat[msk: 4 x F_lat x H_lat x W_lat]:::tensor
+        VAELat & MaskLat --> CatCond[Concat y = cat msk, y_img: 20 Channels]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 2: 3D DiT BLOCK INTERNALS
+    %% -------------------------------------------------------------
+    subgraph Stage2 [Detailed Stage 2: Wan2.1 3D DiT Backbone Block]
+        direction TB
+        LatentIn[Latent x_t: 16 x F_lat x H_lat x W_lat]:::tensor
+        CatCond -.->|I2V: Cat Latents & Mask| Latent36[x_t + y: 36 x F_lat x H_lat x W_lat]:::tensor
+        LatentIn -->|T2V: Raw Latents| Latent16[x_t: 16 x F_lat x H_lat x W_lat]:::tensor
+
+        Latent36 & Latent16 --> PatchConv3D[Conv3d: k=1x2x2, s=1x2x2, out=dim]:::op
+        PatchConv3D --> FlattenLat[Flatten Spatial-Temporal: B x S x dim]:::tensor
+
+        TimeInp([Timestep t]) --> Sinusoidal[Sinusoidal Embedding: freq_dim=256]:::op
+        Sinusoidal --> TimeMLP[Linear -> SiLU -> Linear: dim]:::op
+        TimeMLP --> TimeProj[Linear -> 6 * dim AdaLN Modulation]:::op
+        TimeProj --> ModChunk[Chunk into e0, e1, e2, e3, e4, e5]:::tensor
+
+        FlattenLat --> Res1((+))
+        Res1 --> LN1[WanLayerNorm eps=1e-6]:::norm
+        LN1 --> Mod1[Modulate: LN1_x * 1 + e1 + e0]:::op
+
+        subgraph Factorized3DRoPE [Factorized 3D Axial RoPE]
+            direction TB
+            GridDim[Extract grid_sizes: f, h, w]:::op
+            FreqSplit[Split head_dim into: d_t, d_h, d_w]:::op
+            RoPE_T[Complex Polar Rotary Table for Frame f]:::op
+            RoPE_H[Complex Polar Rotary Table for Height h]:::op
+            RoPE_W[Complex Polar Rotary Table for Width w]:::op
+            GridDim --> FreqSplit --> RoPE_T & RoPE_H & RoPE_W
+        end
+
+        Mod1 --> QKVGen[Linear Projections: Q, K, V]:::op
+        QKVGen --> QKNorm[WanRMSNorm on Q and K]:::norm
+        Factorized3DRoPE & QKNorm --> ApplyRoPE[Apply Factorized 3D RoPE to Q and K]:::op
+        ApplyRoPE --> ChunkSDPA[Chunked SDPA: chunk_size=1024 for 16GB GPUs]:::attn
+        ChunkSDPA --> OProj[o_proj: dim -> dim]:::op
+        OProj --> Scale1[Scale by e2]:::op
+        Scale1 --> Res1
+
+        Res1 --> CrossNorm[WanLayerNorm eps=1e-6]:::norm
+        CrossNorm --> CrossAttnCore[Dual Cross-Attention Engine]:::attn
+        T5Ctx -->|Text Context| CrossAttnCore
+        CLIPFeat -->|MLPProj: 1280 -> dim| CrossAttnCore
+        CrossAttnCore --> Res2((+))
+        Res1 --> Res2
+
+        Res2 --> LN2[WanLayerNorm eps=1e-6]:::norm
+        LN2 --> Mod2[Modulate: LN2_x * 1 + e4 + e3]:::op
+        Mod2 --> SwiGLU[Gated Feed-Forward: dim -> ffn_dim -> dim]:::op
+        SwiGLU --> Scale2[Scale by e5]:::op
+        Scale2 --> Res3((+))
+        Res2 --> Res3
+
+        Res3 --> FinalHead[Head: WanLayerNorm + Linear -> unpatchify]:::op
+        FinalHead --> OutVelo[Velocity Tensor v_theta: 16 x F_lat x H_lat x W_lat]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 3: CAUSAL 3D VAE DECODING
+    %% -------------------------------------------------------------
+    subgraph Stage3 [Detailed Stage 3: Streaming Causal 3D VAE Decoder]
+        direction TB
+        OutVelo --> FlowStep[FlowUniPC Multistep ODE Integration]:::op
+        FlowStep --> CleanZ[Denoised Clean Latent x_0: 16 x F_lat x H_lat x W_lat]:::tensor
+        CleanZ --> UnscaleVAE[De-standardize: z * STD + MEAN in FP32]:::op
+        UnscaleVAE --> CausalConvIn[conv2: CausalConv3d 1x1]:::op
+
+        subgraph StreamingCausalDecode [Frame-by-Frame Causal Convolution Buffer]
+            direction TB
+            CausalBuffer[(CACHE_T=2 Temporal State Buffer)]:::cache
+            ResBlock3D[ResidualBlock3D + Temporal Causal Conv]:::op
+            AttnBlock2D[Spatial 2D Self-Attention per Frame]:::attn
+            Resample3D[Resample: 2D Spatial + Causal 3D Temporal Upsample]:::op
+            CausalConvIn --> ResBlock3D
+            CausalBuffer <--> ResBlock3D
+            ResBlock3D --> AttnBlock2D --> Resample3D
+        end
+
+        StreamingCausalDecode --> OutRGB[CausalConv3d Head -> RGB Video: 3 x F x H x W]:::tensor
+    end
+
+    %% -------------------------------------------------------------
+    %% STAGE 4: AUDIO PIPELINE
+    %% -------------------------------------------------------------
+    subgraph Stage4 [Detailed Stage 4: FoleyCrafter V2A & Mastering]
+        direction TB
+        OutRGB --> MP4Enc[imageio / libx264 Video Encoder]:::op
+        MP4Enc --> SilentVideoPath[Temp File: wan_silent.mp4]:::tensor
+
+        SilentVideoPath --> FoleyPipe[FoleyCrafter Cross-Attention V2A Pipeline]:::op
+        TxtInp --> DerivAudio[Sanitize Acoustic Descriptors]:::op
+        DerivAudio --> FoleyPipe
+        FoleyPipe --> RawAudio[Raw Audio Tensor: 16kHz]:::tensor
+
+        RawAudio --> ButterFilter[40Hz 4th-order Butterworth High-Pass Filter]:::op
+        ButterFilter --> CosineEdge[50ms Cosine Fade-In / Fade-Out Window]:::op
+        CosineEdge --> PeakNorm[Peak Normalization to -1.0 dBFS Ceiling]:::op
+        PeakNorm --> AudioWAV[PCM 16-Bit WAV File]:::tensor
+
+        SilentVideoPath & AudioWAV --> FFmpegExec[FFmpeg Muxer: -c:v copy -c:a aac -b:a 192k]:::op
+        FFmpegExec --> FinalMP4([Final Synchronized Video: wan_video_with_audio.mp4])
+    end
+
+    Stage1 --> Stage2
+    Stage2 --> Stage3
+    Stage3 --> Stage4
