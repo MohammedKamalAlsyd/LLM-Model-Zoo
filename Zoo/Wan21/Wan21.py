@@ -68,35 +68,64 @@ class FoleyCrafterAudioEngine:
         if self.pipe is not None or self._load_failed:
             return
 
-        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        # Audio synthesis pipelines (AudioLDM, FoleyCrafter) run safely in float32.
+        # This completely suppresses the 7 Diffusers float16 CPU warnings
+        # and eliminates vocoder phase collapse / static hiss.
+        audio_dtype = torch.float32
 
+        # 1. FoleyCrafter
         try:
             fc_module = importlib.import_module("foleycrafter.pipelines.dymctrl_pipeline")
             DymctrlPipeline = getattr(fc_module, "DymctrlPipeline")
             logger.info("Initializing FoleyCrafter ('ymq22/FoleyCrafter')...")
-            self.pipe = DymctrlPipeline.from_pretrained("ymq22/FoleyCrafter", torch_dtype=torch_dtype).to(self.device)
+            self.pipe = DymctrlPipeline.from_pretrained(
+                "ymq22/FoleyCrafter",
+                torch_dtype=audio_dtype,
+            ).to(self.device)
             self.engine_type = "foleycrafter"
             return
         except Exception:
             logger.warning("FoleyCrafter unavailable; engaging AudioLDM fallback...")
 
+        # 2. AudioLDM-2
         try:
-            lm = GPT2LMHeadModel.from_pretrained("cvssp/audioldm2", subfolder="language_model", torch_dtype=torch_dtype)
+            logger.info("Initializing AudioLDM-2 fallback ('cvssp/audioldm2')...")
+            lm = GPT2LMHeadModel.from_pretrained(
+                "cvssp/audioldm2",
+                subfolder="language_model",
+                torch_dtype=audio_dtype,
+            )
             if AudioLDM2Pipeline is not None:
-                self.pipe = AudioLDM2Pipeline.from_pretrained("cvssp/audioldm2", language_model=lm, torch_dtype=torch_dtype)
+                self.pipe = AudioLDM2Pipeline.from_pretrained(
+                    "cvssp/audioldm2",
+                    language_model=lm,
+                    torch_dtype=audio_dtype,
+                )
                 if DPMSolverMultistepScheduler is not None:
                     self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                        self.pipe.scheduler.config, algorithm_type="sde-dpmsolver++", use_karras_sigmas=True
+                        self.pipe.scheduler.config,
+                        algorithm_type="sde-dpmsolver++",
+                        use_karras_sigmas=True,
                     )
                 self.pipe = self.pipe.to(self.device)
                 self.engine_type = "audioldm2"
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"AudioLDM-2 fallback unavailable: {e}. Trying AudioLDM-Medium...")
 
+        # 3. AudioLDM-Medium
         try:
             if AudioLDMPipeline is not None:
-                self.pipe = AudioLDMPipeline.from_pretrained("cvssp/audioldm-m-full", torch_dtype=torch_dtype)
+                logger.info("Loading baseline fallback: 'cvssp/audioldm-m-full'...")
+                self.pipe = AudioLDMPipeline.from_pretrained(
+                    "cvssp/audioldm-m-full",
+                    torch_dtype=audio_dtype,
+                )
+                if DPMSolverMultistepScheduler is not None:
+                    self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                        self.pipe.scheduler.config,
+                        algorithm_type="sde-dpmsolver++",
+                    )
                 self.pipe = self.pipe.to(self.device)
                 self.engine_type = "audioldm"
                 return
@@ -109,6 +138,9 @@ class FoleyCrafterAudioEngine:
             audio = raw_audio.detach().cpu().float().numpy()
         else:
             audio = np.asarray(raw_audio, dtype=np.float32)
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0) if audio.shape[0] < audio.shape[1] else audio.mean(axis=-1)
 
         sos = signal.butter(4, 40, "hp", fs=sample_rate, output="sos")
         filt_result = signal.sosfilt(sos, audio)
@@ -157,6 +189,7 @@ class FoleyCrafterAudioEngine:
             audio_int16 = (processed_audio * 32767).clip(-32768, 32767).astype(np.int16)
             wavfile.write(output_wav_path, rate=sample_rate, data=audio_int16)
 
+            # Move safely to CPU in float32 without triggering Diffusers warnings
             if hasattr(self.pipe, "to"):
                 self.pipe.to("cpu")
             purge_memory()
