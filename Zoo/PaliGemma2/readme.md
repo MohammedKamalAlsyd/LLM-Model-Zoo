@@ -97,8 +97,7 @@ PaliGemma 2 uses specialized prompt prefixes for downstream tasks:
 | **Segmentation**     | `segment cat`                       | `<loc0234><loc0120><loc0890><loc0540><seg012>...<seg099> cat` |
 
 - **Coordinates**: Four `<loc####>` tokens define normalized bounding boxes in $[0, 1024]$:
-  $$y_{\text{pixel}} = \left\lfloor \frac{\text{loc\_id}}{1024.0} \times H \right\rfloor, \quad x_{\text{pixel}} = \left\lfloor \frac{\text{loc\_id}}{1024.0} \times W \right\rfloor$$
-
+    $$y_{\text{pixel}} = \left\lfloor \frac{\text{loc}_{\text{id}}}{1024.0} \times H \right\rfloor, \quad x_{\text{pixel}} = \left\lfloor \frac{\text{loc}_{\text{id}}}{1024.0} \times W \right\rfloor$$
 ---
 
 ## ⚖️ Architectural Triad Comparison
